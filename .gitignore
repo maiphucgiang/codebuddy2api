@@ -21,6 +21,9 @@ Thumbs.db
 *.token
 *.key
 secrets.*
+.env
+.env.*
+!.env.example
 
 
 # 自管凭证目录与凭据文件（敏感，绝不提交）

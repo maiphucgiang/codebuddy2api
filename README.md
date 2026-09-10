@@ -9,7 +9,7 @@ Use your **WorkBuddy / CodeBuddy (Tencent)** subscription as local **OpenAI- and
 - Serves `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, `GET /v1/models` from your logged-in accounts, with native tools / tool_calls and streaming SSE
 - **Seamless login**: add an account by scanning a QR code in your browser — the desktop client is **not** required
 - Multi-account pool: per-session sticky routing, least-expiring-credit first, automatic cooldown on 401/429
-- Automatic token refresh + daily keepalive, so credentials never die from expiry
+- Automatic token refresh and daily keepalive
 - Optional credit balance via OpenAI billing endpoints (`/v1/dashboard/billing/*`)
 
 ## Quick start
@@ -51,7 +51,6 @@ curl "http://127.0.0.1:8787/admin/oauth/poll?login_id=oa_..."
 - Use `POST /admin/oauth/start?site=intl` for the international site (workbuddy.ai).
 - If the WorkBuddy / CodeBuddy desktop client is already logged in on this machine, its credential is imported automatically on first start.
 - You can also drop any `*.info` credential file into `auth/` — it is hot-loaded.
-- All import channels validate the account uid and the issuer site; foreign or malformed files are rejected.
 
 ### 4. Verify
 
@@ -126,11 +125,9 @@ Admin endpoints require `--api-key` when it is set. Use `/admin/credentials` for
 
 ### Credential imports
 
-`POST /admin/credentials` keeps the `{"path":"account.info"}` format. The file must be a direct child of the server-side `CODEBUDDY_IMPORT_DIR` (default: `imports/` inside the managed auth directory). Create that directory and place the source file there before importing; a bare filename or its absolute path is accepted. Arbitrary server paths, subdirectories, symlinks and non-`.info` files are rejected; the limit is 1 MiB.
+Place `.info` files in `auth/imports/`, or the server-side directory configured by `CODEBUDDY_IMPORT_DIR`. Only regular files directly inside that directory are accepted; symlinks, subdirectories and files over 1 MiB are rejected.
 
-The file is read once, checked for credential structure and an allowed origin (not token authenticity), then atomically saved with private permissions. Same-name updates remain supported; the same UID under another filename returns 409. Bad input/read failures return 400 and save failures return 500 without internal error details. For existing automation, move source files into this directory or configure an explicit import directory before restarting.
-
-Session keys and conversation IDs now use SHA-256, with a 128-bit session key. IDs change after upgrading and restarting; sticky bindings are memory-only.
+Send `POST /admin/credentials` with `{"path":"account.info"}` or the file's absolute path. The same filename updates an existing credential; the same UID under a different filename returns 409.
 
 ## Options
 
@@ -153,29 +150,28 @@ Environment variables: `CODEBUDDY_AUTH_DIR` (credential dir), `CODEBUDDY_IMPORT_
 
 ## Docker
 
-Current version: **1.0.0**, read from `VERSION` by the API and checked by CI. After the first tagged release, the prebuilt image will be `ghcr.io/maiphucgiang/codebuddy2api:1.0.0` (`linux/amd64` and `linux/arm64`, selected automatically when pulled). Replace the image name in the local-build example below to use it.
+Image: `ghcr.io/maiphucgiang/codebuddy2api:1.0.0` for `linux/amd64` and `linux/arm64`. Use a version tag to pin a release, `latest` for the stable release, or `edge` for `main`.
+
+### Docker Compose
 
 ```bash
-docker build -t codebuddy2api .
-docker run -d --name codebuddy2api -p 8787:8787 \
-  -v /path/to/auth:/data/auth \
-  -e CODEBUDDY_AUTH_DIR=/data/auth \
-  codebuddy2api
+docker compose pull
+docker compose up -d
 ```
 
-Any directory with `*.info` files works for the mount — add accounts afterwards via seamless login if you have none. `docker compose up -d --build` also works; edit the mount path in `docker-compose.yml` first.
+Credentials and caches persist in `./auth`, mounted read-write at `/data/auth`. Set `CODEBUDDY2API_KEY` in your environment or `.env` to enable authentication. To change versions, edit the `image` tag in `docker-compose.yml` and run the two commands above.
 
-### Image publishing workflow
+### Docker CLI
 
-`.github/workflows/docker.yml` runs all regression tests before building both platforms with Buildx/QEMU. Actions are pinned to commit SHAs; only the image job requests `packages: write`, using the repository's `GITHUB_TOKEN` (no extra registry secret). Published images include build provenance and an SBOM; `.dockerignore` only allows runtime files into the build context.
+```bash
+docker run -d --name codebuddy2api -p 8787:8787 \
+  -v "$PWD/auth:/data/auth" \
+  -e CODEBUDDY_AUTH_DIR=/data/auth \
+  -e CODEBUDDY2API_KEY \
+  ghcr.io/maiphucgiang/codebuddy2api:1.0.0
+```
 
-| Trigger | Image tags |
-|------|------|
-| Pull request to `main` | Build only, no login or push |
-| Push to `main` | `edge`, `sha-<commit>` |
-| Push `v1.0.0` | `1.0.0`, `1.0`, `1`, `latest`, `sha-<commit>` |
-
-Manual runs publish only when selecting `main` or a version tag. Release tags must match `VERSION`; development builds never move `latest`. To publish later, commit the changes to `main`, then create and push `v1.0.0`. A tag alone does not create a GitHub Release. For anonymous pulls, check that the GHCR package is public and grants this repository Actions access after the first publish.
+For a local image, run `docker build -t codebuddy2api:local .` and use `codebuddy2api:local` as the image name.
 
 ## Models
 
@@ -203,3 +199,7 @@ For personal learning only — no commercial use. Not affiliated with Tencent, W
 [MIT](./LICENSE)
 
 <sub>Keywords: codebuddy to openai · codebuddy2api · workbuddy api proxy · workbuddy openai adapter · codex cli workbuddy · claude code workbuddy · tencent code assistant openai compatible api</sub>
+
+## Community
+
+Thanks to the [LINUX DO](https://linux.do) community for providing an open and friendly platform for technical discussions.

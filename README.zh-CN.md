@@ -9,7 +9,7 @@
 - 用你已登录的账号对外提供 `POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`、`GET /v1/models`，支持原生 tools / tool_calls 与流式 SSE
 - **无感登录**：浏览器扫码即可添加账号，**无需安装桌面端**
 - 多账号凭证池：会话黏绑、快过期积分优先调度、401/429 自动熔断换绑
-- token 自动刷新 + 每日保活，凭证不会因过期失效
+- token 自动刷新与每日保活
 - 可选积分余额折算，经 OpenAI billing 端点（`/v1/dashboard/billing/*`）输出
 
 ## 快速上手
@@ -51,7 +51,6 @@ curl "http://127.0.0.1:8787/admin/oauth/poll?login_id=oa_..."
 - 国际站（workbuddy.ai）用 `POST /admin/oauth/start?site=intl`。
 - 本机桌面端已登录的话，首次启动会自动导入其凭据。
 - 也可以直接把其他机器/账号的 `*.info` 文件放进 `auth/` 目录，即热加载入池。
-- 所有入库渠道都会校验账号 uid 与签发站点，异站或损坏文件会被拒收。
 
 ### 4. 自检
 
@@ -126,11 +125,9 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 
 ### 凭据文件导入
 
-`POST /admin/credentials` 保留 `{"path":"account.info"}` 格式。源文件必须是服务端 `CODEBUDDY_IMPORT_DIR`（默认自管凭据目录下的 `imports/`）的直接子级；请先创建目录并放入源文件，再用文件名或该文件的绝对路径导入。不再接受任意服务器路径、子目录、符号链接或非 `.info` 文件，文件上限 1 MiB。
+将 `.info` 文件放入 `auth/imports/`，或服务端 `CODEBUDDY_IMPORT_DIR` 指定的目录。仅接受该目录的直接子级普通文件，不接受符号链接、子目录或超过 1 MiB 的文件。
 
-文件只读取一次，校验凭据结构及允许站点（不验证 token 真伪），再以私有权限原子保存。同名更新保持兼容，同 UID 异名返回 409。输入/读取失败返回 400，保存失败返回 500，不返回内部异常详情。已有自动化需将源文件移入该目录，或在重启前显式配置导入目录。
-
-会话键与 Conversation ID 改用 SHA-256，会话键为 128 位；升级重启后 ID 会变化，黏绑表原本就只保存在内存。
+向 `POST /admin/credentials` 发送 `{"path":"account.info"}`，也可使用该文件的绝对路径。同名文件覆盖更新，同 UID 不同文件名返回 409。
 
 ## 命令行参数
 
@@ -153,29 +150,28 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 
 ## Docker
 
-当前版本为 **1.0.0**，API 从 `VERSION` 读取，CI 同步校验。首次标签发布后，预构建镜像地址为 `ghcr.io/maiphucgiang/codebuddy2api:1.0.0`，包含 `linux/amd64` 和 `linux/arm64`，拉取时自动选择架构。可用它替换下方本地构建示例中的镜像名。
+镜像：`ghcr.io/maiphucgiang/codebuddy2api:1.0.0`，支持 `linux/amd64` 和 `linux/arm64`。版本标签用于固定版本，`latest` 为稳定版，`edge` 跟随 `main`。
+
+### Docker Compose
 
 ```bash
-docker build -t codebuddy2api .
-docker run -d --name codebuddy2api -p 8787:8787 \
-  -v /path/to/auth:/data/auth \
-  -e CODEBUDDY_AUTH_DIR=/data/auth \
-  codebuddy2api
+docker compose pull
+docker compose up -d
 ```
 
-挂载任意含 `*.info` 的目录即可；没有凭据时，启动后用无感登录添加。也可用 `docker compose up -d --build`（先改 `docker-compose.yml` 里的挂载路径）。
+凭据与缓存持久化到 `./auth`，以读写方式挂载至 `/data/auth`。可在环境变量或 `.env` 中设置 `CODEBUDDY2API_KEY` 启用鉴权。切换版本时，修改 `docker-compose.yml` 的 `image` 标签，再执行上述两条命令。
 
-### 镜像发布工作流
+### Docker CLI
 
-`.github/workflows/docker.yml` 先执行全部回归测试，再通过 Buildx/QEMU 构建两个平台。Actions 固定到提交 SHA；仅镜像任务申请 `packages: write`，使用仓库自动提供的 `GITHUB_TOKEN`，无需额外仓库密码。镜像附带构建来源记录及 SBOM，`.dockerignore` 仅允许运行所需文件进入构建上下文。
+```bash
+docker run -d --name codebuddy2api -p 8787:8787 \
+  -v "$PWD/auth:/data/auth" \
+  -e CODEBUDDY_AUTH_DIR=/data/auth \
+  -e CODEBUDDY2API_KEY \
+  ghcr.io/maiphucgiang/codebuddy2api:1.0.0
+```
 
-| 触发方式 | 镜像标签 |
-|------|------|
-| 面向 `main` 的 PR | 只构建，不登录、不推送 |
-| 推送 `main` | `edge`、`sha-<commit>` |
-| 推送 `v1.0.0` 标签 | `1.0.0`、`1.0`、`1`、`latest`、`sha-<commit>` |
-
-手动运行仅在选择 `main` 或版本标签时推送。发布标签必须与 `VERSION` 一致，开发镜像不会覆盖 `latest`。以后发布时，先把改动提交到 `main`，再创建并推送 `v1.0.0`；推送标签不会自动创建 GitHub Release。首次发布后，请检查 GHCR 包的公开可见性及该仓库的 Actions 访问权限，需要匿名拉取时将包设为 Public。
+本地构建可运行 `docker build -t codebuddy2api:local .`，再将镜像名替换为 `codebuddy2api:local`。
 
 ## 模型列表
 
@@ -201,3 +197,7 @@ docker run -d --name codebuddy2api -p 8787:8787 \
 ## 开源协议
 
 [MIT](./LICENSE)
+
+## 社区
+
+感谢 [LINUX DO](https://linux.do) 社区提供开放、友善的技术交流平台。
