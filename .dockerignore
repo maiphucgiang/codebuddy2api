@@ -1,0 +1,14 @@
+# Only runtime files enter the build context; never send credentials or logs.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!VERSION
+!converter.py
+!anthropic_adapter.py
+!auth_oauth.py
+!credential_io.py
+!credits.py
+!desensitize.py
+!responses_adapter.py
+!responses_projection.py

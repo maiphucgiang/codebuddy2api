@@ -5,7 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY converter.py responses_adapter.py responses_projection.py anthropic_adapter.py desensitize.py credits.py auth_oauth.py ./
+COPY VERSION ./
+COPY converter.py responses_adapter.py responses_projection.py anthropic_adapter.py desensitize.py credits.py auth_oauth.py credential_io.py ./
 
 EXPOSE 8787
 

@@ -62,6 +62,7 @@ from anthropic_adapter import (
 )
 
 import auth_oauth
+from credential_io import CredentialFileError, read_import_file, atomic_write_credential
 try:
     import credits as credits_mod
 except ImportError:  # 模块缺失时签到/积分/快过期优先调度不可用
@@ -71,6 +72,7 @@ except ImportError:  # 模块缺失时签到/积分/快过期优先调度不可�
 # 常量
 # ---------------------------------------------------------------------------
 
+APP_VERSION = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip()
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 CBC_VERSION = "2.148.0"      # 掩盖用的官方 cbc 客户端版本（随本机 @tencent-ai/codebuddy-code 更新）
@@ -312,7 +314,7 @@ def session_key(payload: dict) -> str | None:
     first_user = next((_msg_text(m) for m in msgs if m.get("role") == "user"), "")
     if not system and not first_user:
         return None
-    return hashlib.sha1((system + "\x00" + first_user).encode("utf-8", "replace")).hexdigest()[:16]
+    return hashlib.sha256((system + "\x00" + first_user).encode("utf-8", "replace")).hexdigest()[:32]
 
 
 def _parse_reset_time(raw: bytes) -> float | None:
@@ -360,7 +362,7 @@ def _dynamic_request_headers(skey: str | None) -> dict:
     crid = secrets.token_hex(16)  # X-Conversation-Request-ID == X-Root-Request-ID == trace id
     span, parent = secrets.token_hex(8), secrets.token_hex(8)
     if skey:
-        conv = str(uuid.UUID(hex=hashlib.sha1(skey.encode()).hexdigest()[:32]))
+        conv = str(uuid.UUID(hex=hashlib.sha256(skey.encode()).hexdigest()[:32]))
     else:
         conv = str(uuid.uuid4())
     return {
@@ -620,8 +622,8 @@ class CredentialPool:
                                                   if cid == e["id"] and now - ts <= STICKY_TTL)}
                 try:
                     s.update(e["cm"].summary())
-                except Exception as ex:
-                    s["error"] = str(ex)
+                except Exception:
+                    s["error"] = "凭据读取失败"
                 out.append(s)
             return out
 
@@ -773,7 +775,7 @@ PASSTHROUGH_BODY_KEYS = {
 # FastAPI 应用
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="codebuddy2api", version="2.0")
+app = FastAPI(title="codebuddy2api", version=APP_VERSION)
 CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "models_remote": None,   # 国内站云端模型表（缓存或同步结果）
                 "models_intl": None,     # 国际站云端模型表（仅当有国际凭证且有额度时对外暴露）
@@ -874,22 +876,8 @@ def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = 
 
 @app.get("/health")
 def health():
-    info: dict = {"status": "ok", "platform": sys.platform, "python": sys.version.split()[0],
-                  "mode": "direct-proxy (native function calling)"}
-    pool = CONFIG.get("cred_pool")
-    if pool is not None:
-        creds = pool.snapshot()
-        info["credentials"] = creds
-        info["auth_file"] = creds[0]["auth_file"] if creds else "(未找到)"
-    else:
-        cred = CONFIG["cred"]
-        info["auth_file"] = str(find_auth_file() or "(未找到)")
-        if cred is not None:
-            try:
-                info["credential"] = cred.summary()
-            except Exception as e:
-                info["credential_error"] = str(e)
-    return info
+    """公开存活检查，不访问或暴露凭证池。"""
+    return {"status": "ok"}
 
 
 @app.get("/admin/credentials")
@@ -905,34 +893,43 @@ def admin_list_credentials(authorization: Optional[str] = Header(default=None),
 async def admin_add_credential(request: Request,
                                authorization: Optional[str] = Header(default=None),
                                x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """导入凭据文件：复制进 auth 目录并热加入池，无需重启。"""
+    """从允许目录导入已校验的凭据，原子更新并热加入池。"""
     _check_auth(authorization, x_api_key)
     try:
         body = await request.json()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
-    src = Path(str(body.get("path", "")))
-    if not src.is_file():
-        raise HTTPException(status_code=400, detail={"error": {"message": f"文件不存在: {src}", "type": "invalid_request_error"}})
+    except (ValueError, UnicodeError):
+        raise HTTPException(status_code=400, detail={"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}) from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail={"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}})
+    dst_dir = managed_auth_dir().resolve()
+    import_dir = Path(os.environ.get("CODEBUDDY_IMPORT_DIR") or dst_dir / "imports")
     try:
-        cred_data = json.loads(src.read_text(encoding="utf-8"))
-        CredentialManager(src).summary()  # 导入前验证可读
-    except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"凭据文件无效: {e}", "type": "invalid_request_error"}})
-    _, verr = auth_oauth.validate_cred_data(cred_data)
-    if verr:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"凭据入库校验失败: {verr}", "type": "invalid_request_error"}})
-    dst_dir = managed_auth_dir()
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / src.name
+        name, content = read_import_file(import_dir, body.get("path"))
+        cred_data = json.loads(content.decode("utf-8"))
+        src_uid, verr = auth_oauth.validate_cred_data(cred_data)
+        if verr:
+            raise CredentialFileError("凭据格式或站点校验失败")
+        if (not isinstance(cred_data.get("account") or {}, dict)
+                or not isinstance(cred_data["auth"].get("expiresAt", 0), (int, float))):
+            raise CredentialFileError("凭据账号或过期时间格式无效")
+    except CredentialFileError:
+        raise HTTPException(status_code=400, detail={"error": {"message": "凭据文件不符合导入要求", "type": "invalid_request_error"}}) from None
+    except (ValueError, UnicodeError, RecursionError):
+        raise HTTPException(status_code=400, detail={"error": {"message": "凭据必须是有效的 UTF-8 JSON 对象", "type": "invalid_request_error"}}) from None
+    except OSError:
+        raise HTTPException(status_code=400, detail={"error": {"message": "导入目录或文件不可读", "type": "invalid_request_error"}}) from None
+    dst = dst_dir / name
     pool = CONFIG.get("cred_pool")
-    src_uid = _cred_uid(src)
     if pool is not None and src_uid:
         holder = pool.find_by_uid(src_uid)
-        if holder and holder != str(dst.resolve()):
-            raise HTTPException(status_code=409, detail={"error": {"message": f"该账号已在池中（{Path(holder).name}）。如需更新请用同文件名覆盖导入，或先 DELETE 移除旧凭据", "type": "invalid_request_error"}})
-    shutil.copyfile(src, dst)
-    os.chmod(dst, 0o600)
+        if holder and holder != str(dst):
+            raise HTTPException(status_code=409, detail={"error": {"message": "该账号已在池中，请使用同文件名更新或先移除旧凭据", "type": "invalid_request_error"}})
+    try:
+        dst = atomic_write_credential(dst_dir, name, content)
+    except CredentialFileError:
+        raise HTTPException(status_code=400, detail={"error": {"message": "凭据文件名或保存目标不符合要求", "type": "invalid_request_error"}}) from None
+    except OSError:
+        raise HTTPException(status_code=500, detail={"error": {"message": "凭据保存失败", "type": "server_error"}}) from None
     if pool is not None:
         pool.reload([dst])
     return {"imported": str(dst)}

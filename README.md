@@ -115,14 +115,22 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI or your own SDK client:
 | `POST /v1/responses` | OpenAI Responses (Codex CLI) |
 | `POST /v1/messages` | Anthropic Messages (Claude Code / CC Switch) |
 | `GET /v1/models` | Available models (cloud catalog synced, cached locally) |
-| `GET /health` | Service + credential pool status |
+| `GET /health` | Public liveness only (`{"status":"ok"}`) |
 | `GET /v1/dashboard/billing/subscription` | Total credit balance as `hard_limit_usd` |
 | `GET /v1/dashboard/billing/usage` | Usage in cents, with daily cost breakdown |
 | `GET/POST/DELETE /admin/credentials` | View / import / remove credentials |
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | Seamless login (see above) |
 | `GET /admin/credits` · `POST /admin/checkin` | Credit balances / manual daily check-in |
 
-Admin endpoints require `--api-key` when it is set.
+Admin endpoints require `--api-key` when it is set. Use `/admin/credentials` for detailed pool status; `/health` never returns account, path or exception details.
+
+### Credential imports
+
+`POST /admin/credentials` keeps the `{"path":"account.info"}` format. The file must be a direct child of the server-side `CODEBUDDY_IMPORT_DIR` (default: `imports/` inside the managed auth directory). Create that directory and place the source file there before importing; a bare filename or its absolute path is accepted. Arbitrary server paths, subdirectories, symlinks and non-`.info` files are rejected; the limit is 1 MiB.
+
+The file is read once, checked for credential structure and an allowed origin (not token authenticity), then atomically saved with private permissions. Same-name updates remain supported; the same UID under another filename returns 409. Bad input/read failures return 400 and save failures return 500 without internal error details. For existing automation, move source files into this directory or configure an explicit import directory before restarting.
+
+Session keys and conversation IDs now use SHA-256, with a 128-bit session key. IDs change after upgrading and restarting; sticky bindings are memory-only.
 
 ## Options
 
@@ -141,9 +149,11 @@ Admin endpoints require `--api-key` when it is set.
 | `--model-catalog-ttl` | `21600` | Cloud model catalog cache TTL (seconds) |
 | `--no-model-guard` | off | Disable local 404 for models outside the catalog |
 
-Environment variables: `CODEBUDDY_AUTH_DIR` (credential dir), `CODEBUDDY2API_KEY`, `CODEBUDDY2API_LOG`.
+Environment variables: `CODEBUDDY_AUTH_DIR` (credential dir), `CODEBUDDY_IMPORT_DIR` (allowed API import dir), `CODEBUDDY2API_KEY`, `CODEBUDDY2API_LOG`.
 
 ## Docker
+
+Current version: **1.0.0**, read from `VERSION` by the API and checked by CI. After the first tagged release, the prebuilt image will be `ghcr.io/maiphucgiang/codebuddy2api:1.0.0` (`linux/amd64` and `linux/arm64`, selected automatically when pulled). Replace the image name in the local-build example below to use it.
 
 ```bash
 docker build -t codebuddy2api .
@@ -154,6 +164,18 @@ docker run -d --name codebuddy2api -p 8787:8787 \
 ```
 
 Any directory with `*.info` files works for the mount — add accounts afterwards via seamless login if you have none. `docker compose up -d --build` also works; edit the mount path in `docker-compose.yml` first.
+
+### Image publishing workflow
+
+`.github/workflows/docker.yml` runs all regression tests before building both platforms with Buildx/QEMU. Actions are pinned to commit SHAs; only the image job requests `packages: write`, using the repository's `GITHUB_TOKEN` (no extra registry secret). Published images include build provenance and an SBOM; `.dockerignore` only allows runtime files into the build context.
+
+| Trigger | Image tags |
+|------|------|
+| Pull request to `main` | Build only, no login or push |
+| Push to `main` | `edge`, `sha-<commit>` |
+| Push `v1.0.0` | `1.0.0`, `1.0`, `1`, `latest`, `sha-<commit>` |
+
+Manual runs publish only when selecting `main` or a version tag. Release tags must match `VERSION`; development builds never move `latest`. To publish later, commit the changes to `main`, then create and push `v1.0.0`. A tag alone does not create a GitHub Release. For anonymous pulls, check that the GHCR package is public and grants this repository Actions access after the first publish.
 
 ## Models
 
@@ -167,7 +189,7 @@ Runtime `/v1/models` follows the cloud catalog (synced every 6 h, cached in `aut
 
 - **Local 401**: you started with `--api-key` but the client did not send the same key.
 - **Upstream 401**: the account token died — re-add the account via seamless login.
-- **429**: quota/rate limit — the gateway cools that model on that credential and routes to another; check `/health`.
+- **429**: quota/rate limit — the gateway cools that model on that credential and routes to another; check `/admin/credentials` with your configured API key.
 - **Content-filter blocks**: usually triggered by agent runtime text; start with `--desensitize`, or `--desensitize --no-compact`.
 - **Slow**: switch to a faster model, e.g. `deepseek-v4-flash`.
 - **Same account used elsewhere**: a credential copied from a desktop client refreshes independently — with rolling refresh tokens they can kick each other off; prefer seamless-login accounts or stop using the account in the client.
