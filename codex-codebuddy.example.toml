@@ -1,0 +1,59 @@
+# ============================================================
+# CodeBuddy/WorkBuddy 订阅 -> OpenAI 兼容客户端 —— provider 配置示例（片段）
+# ------------------------------------------------------------
+# 前提：转换器已在本地运行（见 README.md）
+#   uv run converter.py --port 8787
+# 或：
+#   python3 converter.py --port 8787
+#
+# ⚠️ 本文件只是「示例」。若你的客户端需要合并配置，请【手动】把下面的段落
+#    复制/合并进你自己的配置文件。本脚本绝不自动改写任何已有配置。
+# ============================================================
+
+
+# ── 方式一：Codex CLI（Responses API）──────────────────────
+# 新版 Codex CLI 使用 Responses API（wire_api = "responses"）。
+# 转换器已支持 POST /v1/responses 端点，可直接接入 Codex CLI。
+#
+# 将以下配置合并到 ~/.codex/config.toml（或项目 codex.toml）：
+
+[model_providers.workbuddy]
+name = "WorkBuddy (via local converter)"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"              # ← 关键：使用 Responses API
+env_key = "CODEBUDDY2API_KEY"    # 转换器未启用 --api-key 时，可随便填一个环境变量名
+
+[profiles.workbuddy]
+model = "glm-5.2"                   # 也可用 kimi-k2.7 / deepseek-v4-pro / auto 等
+model_provider = "workbuddy"
+
+# 然后设置环境变量（值随便填，除非转换器启用了 --api-key）：
+#   export CODEBUDDY2API_KEY=any-value
+#
+# 启动 Codex CLI：
+#   codex --profile workbuddy "你的任务描述"
+
+
+# ── 方式二：Cherry Studio / ZCode 等 OpenAI 兼容客户端 ─────
+# 这些客户端使用 Chat Completions API（/v1/chat/completions），
+# 转换器原生支持，只需在客户端的「自定义模型 / OpenAI 兼容」里填：
+#   接口地址 base_url : http://127.0.0.1:8787/v1
+#   API Key          : 留空（除非转换器启动时用了 --api-key）
+#   模型名 model     : glm-5.2 （或 kimi-k2.7 / deepseek-v4-pro / auto）
+
+
+# ── 方式三：Claude Code（通过 CC Switch，Anthropic API）─────
+# Claude Code 使用 Anthropic Messages API（POST /v1/messages）。
+# 转换器已内置 Anthropic 适配层，可通过 CC Switch 接入。
+#
+# 启动转换器（强烈建议开启脱敏，避免后端审核拦截）：
+#   uv run converter.py --desensitize
+# 若需保留 Claude Code 完整 system prompt（不压缩），加 --no-compact：
+#   uv run converter.py --desensitize --no-compact
+#
+# 通过 CC Switch 配置模型提供商，指向 Anthropic 端点：
+#   base_url : http://127.0.0.1:8787/v1/messages
+#   API Key  : 留空（除非转换器启动时用了 --api-key）
+#   模型名   : deepseek-v4-pro （或 glm-5.2 / kimi-k2.7 / auto 等 CodeBuddy 支持的模型）
+#
+# 注意：模型名必须填 CodeBuddy 支持的名称，不做 Anthropic 名称到 CodeBuddy 名称的自动映射。
