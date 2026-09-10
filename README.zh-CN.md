@@ -26,7 +26,21 @@ uv pip install -r requirements.txt
 
 或用普通虚拟环境：`python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
 
-### 2. 启动
+### 2. 添加账号（无需桌面端）
+
+```bash
+uv run converter.py login
+```
+
+浏览器会自动打开登录页。扫码后，即使网页已显示“登录成功”，也请等待终端提示“账号已保存”再关闭命令。账号默认保存在 `auth/`，无需手动复制凭据或先启动服务。
+
+- 国际站（workbuddy.ai）：`uv run converter.py login --site intl`。
+- 服务器或无浏览器环境：`uv run converter.py login --no-browser`，在其他设备打开终端里的链接扫码。
+- 添加多个账号时，重复运行登录命令；同一账号重新登录会更新已有凭据。
+- 登录链接 10 分钟内有效，按 `Ctrl+C` 可取消。
+- 使用普通虚拟环境时，将 `uv run` 换成 `python3`。
+
+### 3. 启动
 
 ```bash
 uv run converter.py --desensitize --log converter.log
@@ -34,23 +48,9 @@ uv run converter.py --desensitize --log converter.log
 
 看到监听 `http://127.0.0.1:8787` 即启动成功。
 
-### 3. 添加账号（无需桌面端）
+服务运行期间也可以在另一个终端添加账号，默认在下次请求时自动加载。登录命令与服务须使用同一个 `CODEBUDDY_AUTH_DIR`（默认 `auth/`）；以 `--auth-file` 启动的服务只使用指定文件。
 
-```bash
-# 1）申请登录链接
-curl -X POST http://127.0.0.1:8787/admin/oauth/start
-# → {"login_id": "oa_...", "verification_uri": "https://www.codebuddy.cn/login?...", "expires_in": 600}
-
-# 2）浏览器打开 verification_uri，扫码授权
-
-# 3）轮询直到完成——凭证自动入库并热加载入池
-curl "http://127.0.0.1:8787/admin/oauth/poll?login_id=oa_..."
-# → {"done": true, "uid": "...", "nickname": "...", "imported": ".../auth/<uid>.info"}
-```
-
-- 国际站（workbuddy.ai）用 `POST /admin/oauth/start?site=intl`。
-- 本机桌面端已登录的话，首次启动会自动导入其凭据。
-- 也可以直接把其他机器/账号的 `*.info` 文件放进 `auth/` 目录，即热加载入池。
+本机桌面端已登录的话，首次启动会自动导入其凭据。也可以把其他账号的 `*.info` 文件放进 `auth/`。
 
 ### 4. 自检
 
@@ -150,16 +150,19 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 
 ## Docker
 
-镜像：`ghcr.io/maiphucgiang/codebuddy2api:1.0.0`，支持 `linux/amd64` 和 `linux/arm64`。版本标签用于固定版本，`latest` 为稳定版，`edge` 跟随 `main`。
+镜像：`ghcr.io/maiphucgiang/codebuddy2api:1.0.1`，支持 `linux/amd64` 和 `linux/arm64`。版本标签用于固定版本，`latest` 为稳定版，`edge` 跟随 `main`。
 
 ### Docker Compose
 
 ```bash
 docker compose pull
 docker compose up -d
+docker compose exec codebuddy2api python3 converter.py login --no-browser
 ```
 
-凭据与缓存持久化到 `./auth`，以读写方式挂载至 `/data/auth`。可在环境变量或 `.env` 中设置 `CODEBUDDY2API_KEY` 启用鉴权。切换版本时，修改 `docker-compose.yml` 的 `image` 标签，再执行上述两条命令。
+在自己的浏览器中打开终端里的链接扫码，等待终端提示“账号已保存”。国际站在登录命令末尾加 `--site intl`。
+
+凭据与缓存持久化到 `./auth`，以读写方式挂载至 `/data/auth`。添加账号后默认在下次请求时自动加载，无需重启。可在环境变量或 `.env` 中设置 `CODEBUDDY2API_KEY` 启用鉴权。切换版本时，修改 `docker-compose.yml` 的 `image` 标签，重新拉取并启动即可，已有账号无需再次登录。
 
 ### Docker CLI
 
@@ -168,10 +171,18 @@ docker run -d --name codebuddy2api -p 8787:8787 \
   -v "$PWD/auth:/data/auth" \
   -e CODEBUDDY_AUTH_DIR=/data/auth \
   -e CODEBUDDY2API_KEY \
-  ghcr.io/maiphucgiang/codebuddy2api:1.0.0
+  ghcr.io/maiphucgiang/codebuddy2api:1.0.1
+
+docker exec -it codebuddy2api python3 converter.py login --no-browser
 ```
 
-本地构建可运行 `docker build -t codebuddy2api:local .`，再将镜像名替换为 `codebuddy2api:local`。
+### 从源码构建
+
+```bash
+CODEBUDDY2API_IMAGE=codebuddy2api:local docker compose up -d --build --pull never
+```
+
+启动后使用上面的容器登录命令添加账号。使用 `docker run` 时，先执行 `docker build -t codebuddy2api:local .`，再将启动命令的镜像名换成 `codebuddy2api:local`。
 
 ## 模型列表
 

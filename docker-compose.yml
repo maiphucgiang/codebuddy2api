@@ -1,6 +1,7 @@
 services:
   codebuddy2api:
-    image: ghcr.io/maiphucgiang/codebuddy2api:1.0.0
+    image: ${CODEBUDDY2API_IMAGE:-ghcr.io/maiphucgiang/codebuddy2api:1.0.1}
+    build: .
     container_name: codebuddy2api
     ports:
       - "8787:8787"

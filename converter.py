@@ -948,6 +948,29 @@ def admin_del_credential(name: str,
 
 
 
+def _save_oauth_credential(cred: dict) -> Path:
+    """CLI 与管理接口共用入库路径：校验、按 uid 更新、私有原子写入并热加载。"""
+    uid, error = auth_oauth.validate_cred_data(cred)
+    if error:
+        raise CredentialFileError("凭据格式或站点校验失败")
+    dst_dir = managed_auth_dir()
+    target = next((f for f in sorted(dst_dir.glob("*.info")) if _cred_uid(f) == uid), None)
+    existing = None
+    if target is not None:
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    name = target.name if target is not None else f"{uid}.info"
+    cred = auth_oauth.merge_existing_accounts(cred, existing)
+    target = atomic_write_credential(
+        dst_dir, name, json.dumps(cred, ensure_ascii=False, indent=2).encode("utf-8"))
+    pool = CONFIG.get("cred_pool")
+    if pool is not None:
+        pool.reload([target])
+    return target
+
+
 @app.post("/admin/oauth/start")
 def admin_oauth_start(site: str = "cn",
                       authorization: Optional[str] = Header(default=None),
@@ -978,25 +1001,12 @@ def admin_oauth_poll(login_id: str = "",
     if r.get("error") or not cred:
         return {"done": True, "error": r.get("error") or "登录失败"}
     uid = r["uid"]
-    dst_dir = managed_auth_dir()
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    target = next((f for f in sorted(dst_dir.glob("*.info")) if _cred_uid(f) == uid), None)
-    existing = None
-    if target is not None:
-        try:
-            existing = json.loads(target.read_text(encoding="utf-8"))
-        except Exception:
-            existing = None
-    if target is None:
-        target = dst_dir / f"{uid}.info"
-    cred = auth_oauth.merge_existing_accounts(cred, existing)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(json.dumps(cred, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, target)
-    pool = CONFIG.get("cred_pool")
-    if pool is not None:
-        pool.reload([target])
+    try:
+        target = _save_oauth_credential(cred)
+    except CredentialFileError:
+        return {"done": True, "error": "凭据格式、站点或保存目标不符合要求"}
+    except OSError:
+        raise HTTPException(status_code=500, detail={"error": {"message": "凭据保存失败", "type": "server_error"}}) from None
     _log(f"[oauth] 无感登录已入库: {r.get('nickname') or uid} ({uid}) -> {target.name}")
     return {"done": True, "uid": uid, "nickname": r.get("nickname") or "", "imported": str(target)}
 
@@ -1968,7 +1978,7 @@ def preflight() -> bool:
         sys.stderr.write(f"种子来源  : {', '.join(str(d) for d in auth_dirs())}\n")
     ok = True
     if not files:
-        sys.stderr.write("\n[警告] 未找到登录文件。请在桌面端完成登录（CodeBuddy/WorkBuddy），或用 --auth-file 指定。\n")
+        sys.stderr.write("\n[警告] 未找到登录文件。请运行 python3 converter.py login 扫码添加账号，或用 --auth-file 指定。\n")
         ok = False
     for af in files:
         try:
@@ -1983,8 +1993,58 @@ def preflight() -> bool:
     return ok
 
 
+def login(site: str = "cn", open_browser: bool = True) -> int:
+    """独立完成扫码与入库；凭据只写入自管目录，不经过本地 HTTP 接口。"""
+    import webbrowser
+
+    try:
+        started = _OAUTH.start(site=site)
+        uri = started["verification_uri"]
+        print(f"请打开以下链接扫码登录：\n{uri}", flush=True)
+        if open_browser:
+            try:
+                opened = webbrowser.open(uri)
+            except webbrowser.Error:
+                opened = False
+            if not opened:
+                print("无法自动打开浏览器，请手动打开上面的链接。", flush=True)
+        print("正在等待扫码授权；网页显示登录成功后，请继续等待终端确认入库。\n"
+              "按 Ctrl+C 取消。", flush=True)
+        while True:
+            result = _OAUTH.poll(started["login_id"])
+            if result.get("done"):
+                if result.get("error") or not result.get("cred"):
+                    print(f"登录失败：{result.get('error') or '未获取到凭据'}", file=sys.stderr)
+                    return 1
+                target = _save_oauth_credential(result["cred"])
+                print(f"登录成功，账号已保存至：{target}\n"
+                      "使用同一凭据目录的服务会在下次请求时自动加载（默认目录扫描模式）。",
+                      flush=True)
+                return 0
+            time.sleep(1.5)
+    except KeyboardInterrupt:
+        print("\n已取消登录。", file=sys.stderr)
+        return 130
+    except CredentialFileError as e:
+        print(f"登录失败：{e}", file=sys.stderr)
+        return 1
+    except OSError:
+        print("登录失败：无法保存凭据，请检查凭据目录的写入权限。", file=sys.stderr)
+        return 1
+    except (httpx.HTTPError, ValueError, RuntimeError):
+        # 上游异常可能包含授权 URL 或响应正文，不向终端转储。
+        print("登录失败：登录接口请求失败或响应无效，请检查网络后重试。", file=sys.stderr)
+        return 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="CodeBuddy -> OpenAI 兼容转换器（直连后端）")
+    ap.add_argument("command", nargs="?", choices=("serve", "login"), default="serve",
+                    help="serve 启动服务（默认）；login 扫码登录、自动轮询并保存账号")
+    ap.add_argument("--site", choices=tuple(auth_oauth.SITE_HOSTS), default="cn",
+                    help="login 使用的站点：cn 国内站（默认），intl 国际站")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="login 仅显示授权链接，不自动打开浏览器（服务器/容器环境）")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2API_KEY", ""),
@@ -2013,6 +2073,8 @@ def main():
     ap.add_argument("--no-model-guard", action="store_true",
                     help="关闭表外模型本地拦截；默认拦截，避免无效请求打到上游并触发扣费")
     args = ap.parse_args()
+    if args.command == "login":
+        return login(site=args.site, open_browser=not args.no_browser)
 
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize
@@ -2052,7 +2114,7 @@ def main():
     sys.stderr.write("   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)\n")
     sys.stderr.write("   GET  /health\n")
     sys.stderr.write("   GET/POST/DELETE /admin/credentials  (凭证池管理)\n")
-    sys.stderr.write("   POST /admin/oauth/start + GET /admin/oauth/poll  (无感登录采集新凭证)\n")
+    sys.stderr.write("   添加账号：python3 converter.py login（自动等待扫码并保存）\n")
     if credits_mod is not None:
         sys.stderr.write("   GET  /admin/credits           (积分/签到状态)\n")
         sys.stderr.write("   POST /admin/checkin           (手动触发签到+积分刷新)\n")
@@ -2073,4 +2135,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

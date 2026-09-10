@@ -26,7 +26,21 @@ uv pip install -r requirements.txt
 
 Or with plain venv: `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
 
-### 2. Start
+### 2. Add an account (no desktop client needed)
+
+```bash
+uv run converter.py login
+```
+
+The command opens the login page in your browser. Scan the QR code, then wait for the terminal to confirm that your account has been saved, even if the browser already says login succeeded. Credentials are saved to `auth/` by default. You do not need to copy tokens or start the server first.
+
+- International site (workbuddy.ai): `uv run converter.py login --site intl`.
+- Server or no browser: `uv run converter.py login --no-browser`, then open the displayed link on another device to scan.
+- Run the command again to add another account. Logging in to the same account updates its existing credential.
+- Login links expire after 10 minutes. Press `Ctrl+C` to cancel.
+- With a plain virtual environment, replace `uv run` with `python3`.
+
+### 3. Start
 
 ```bash
 uv run converter.py --desensitize --log converter.log
@@ -34,23 +48,9 @@ uv run converter.py --desensitize --log converter.log
 
 Listening on `http://127.0.0.1:8787` means it is up.
 
-### 3. Add an account (no desktop client needed)
+You can also add accounts from another terminal while the server runs; they are loaded on the next request by default. Use the same `CODEBUDDY_AUTH_DIR` for login and the server (default: `auth/`). A server started with `--auth-file` only uses the specified files.
 
-```bash
-# 1) request a login link
-curl -X POST http://127.0.0.1:8787/admin/oauth/start
-# → {"login_id": "oa_...", "verification_uri": "https://www.codebuddy.cn/login?...", "expires_in": 600}
-
-# 2) open verification_uri in your browser and scan the QR code
-
-# 3) poll until done — the credential is saved and hot-loaded into the pool
-curl "http://127.0.0.1:8787/admin/oauth/poll?login_id=oa_..."
-# → {"done": true, "uid": "...", "nickname": "...", "imported": ".../auth/<uid>.info"}
-```
-
-- Use `POST /admin/oauth/start?site=intl` for the international site (workbuddy.ai).
-- If the WorkBuddy / CodeBuddy desktop client is already logged in on this machine, its credential is imported automatically on first start.
-- You can also drop any `*.info` credential file into `auth/` — it is hot-loaded.
+If the desktop client is already logged in on this machine, its credential is imported automatically on first start. You can also place other accounts' `*.info` files in `auth/`.
 
 ### 4. Verify
 
@@ -150,16 +150,19 @@ Environment variables: `CODEBUDDY_AUTH_DIR` (credential dir), `CODEBUDDY_IMPORT_
 
 ## Docker
 
-Image: `ghcr.io/maiphucgiang/codebuddy2api:1.0.0` for `linux/amd64` and `linux/arm64`. Use a version tag to pin a release, `latest` for the stable release, or `edge` for `main`.
+Image: `ghcr.io/maiphucgiang/codebuddy2api:1.0.1` for `linux/amd64` and `linux/arm64`. Use a version tag to pin a release, `latest` for the stable release, or `edge` for `main`.
 
 ### Docker Compose
 
 ```bash
 docker compose pull
 docker compose up -d
+docker compose exec codebuddy2api python3 converter.py login --no-browser
 ```
 
-Credentials and caches persist in `./auth`, mounted read-write at `/data/auth`. Set `CODEBUDDY2API_KEY` in your environment or `.env` to enable authentication. To change versions, edit the `image` tag in `docker-compose.yml` and run the two commands above.
+Open the displayed link in your own browser and scan the QR code. Wait for the terminal to confirm that the account has been saved. Add `--site intl` to the login command for the international site.
+
+Credentials and caches persist in `./auth`, mounted read-write at `/data/auth`. Added accounts are loaded on the next request by default; no restart is needed. Set `CODEBUDDY2API_KEY` in your environment or `.env` to enable authentication. To change versions, edit the `image` tag in `docker-compose.yml`, then pull and start again. Existing accounts do not need to log in again.
 
 ### Docker CLI
 
@@ -168,10 +171,18 @@ docker run -d --name codebuddy2api -p 8787:8787 \
   -v "$PWD/auth:/data/auth" \
   -e CODEBUDDY_AUTH_DIR=/data/auth \
   -e CODEBUDDY2API_KEY \
-  ghcr.io/maiphucgiang/codebuddy2api:1.0.0
+  ghcr.io/maiphucgiang/codebuddy2api:1.0.1
+
+docker exec -it codebuddy2api python3 converter.py login --no-browser
 ```
 
-For a local image, run `docker build -t codebuddy2api:local .` and use `codebuddy2api:local` as the image name.
+### Build from source
+
+```bash
+CODEBUDDY2API_IMAGE=codebuddy2api:local docker compose up -d --build --pull never
+```
+
+After starting, use the container login commands above to add accounts. With `docker run`, first run `docker build -t codebuddy2api:local .`, then use `codebuddy2api:local` as the image name in the start command.
 
 ## Models
 
