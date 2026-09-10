@@ -198,7 +198,6 @@ For personal learning only — no commercial use. Not affiliated with Tencent, W
 
 [MIT](./LICENSE)
 
-<sub>Keywords: codebuddy to openai · codebuddy2api · workbuddy api proxy · workbuddy openai adapter · codex cli workbuddy · claude code workbuddy · tencent code assistant openai compatible api</sub>
 
 ## Community
 
