@@ -4,7 +4,7 @@ version: "3.8"
 
 services:
   codebuddy2api:
-    image: ${CODEBUDDY2API_IMAGE:-ghcr.io/maiphucgiang/codebuddy2api:1.1.1}
+    image: ${CODEBUDDY2API_IMAGE:-ghcr.io/maiphucgiang/codebuddy2api:1.1.2}
     build: .
     container_name: codebuddy2api
     ports:

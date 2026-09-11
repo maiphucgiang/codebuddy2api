@@ -30,9 +30,12 @@ HOSTS = dict(DOMAINS, **{"cn-cli": "copilot.tencent.com"})
 GENERATIONS = ("chat/completions", "responses", "messages")
 
 
-def model(identifier):
-    return {"id": identifier, "name": identifier, "supportsToolCall": True,
-            "supportsImages": True, "credits": {"input": 1, "output": 2}}
+def model(identifier, credits=None):
+    value = {"id": identifier, "name": identifier, "supportsToolCall": True,
+             "supportsImages": True, "credits": {"input": 1, "output": 2}}
+    if credits is not None:
+        value["credits"] = credits
+    return value
 
 
 def catalogs():
@@ -469,6 +472,37 @@ class RegionRoutingTests(unittest.TestCase):
         actual = {item["id"] for item in response.json()["data"]}
         expected = {item["id"] for items in catalogs().values() for item in items}
         self.assertEqual(actual, expected | {"auto"})
+
+    def test_models_exposes_credits_multiplier_per_profile(self):
+        tables = catalogs()
+        # 默认目录的 credits 是 {input, output} 对象（官方新版形态），只有字符串倍率可解析。
+        tables["cn-cli"] = [model("shared-model", credits="x0.00"), model("cn-cli-only", credits="x0.03")]
+        tables["intl-cli"] = [model("shared-model", credits="x0.34"), model("intl-cli-only", credits="x0.03")]
+        self.configure(tables=tables)
+        data = {item["id"]: item for item in self.client.get("/v1/models").json()["data"]}
+        shared = data["shared-model"]
+        self.assertEqual(shared["credits"], 0.0)  # 取各来源最小值
+        # 只有给出可解析字符串倍率的来源进入分组；cn-work / intl-work 仍是对象形态，故不列出。
+        self.assertEqual(shared["credits_by_profile"], {"cn-cli": 0.0, "intl-cli": 0.34})
+        self.assertEqual(data["cn-cli-only"]["credits"], 0.03)
+        self.assertEqual(data["cn-cli-only"]["credits_by_profile"], {"cn-cli": 0.03})
+        # 标准 OpenAI 字段必须保留。
+        for item in data.values():
+            self.assertEqual(item["object"], "model")
+            self.assertIsInstance(item["created"], int)
+            self.assertEqual(item["owned_by"], "codebuddy")
+
+    def test_models_omits_unknown_and_unusable_multipliers(self):
+        tables = catalogs()
+        tables["cn-cli"] = [model("shared-model", credits="x0.03"),
+                            dict(model("cn-cli-only"), credits=""),
+                            dict(model("cn-cli-only-2"), credits="not-a-multiplier")]
+        self.configure(tables=tables)
+        data = {item["id"]: item for item in self.client.get("/v1/models").json()["data"]}
+        self.assertEqual(data["shared-model"]["credits"], 0.03)  # 只有 cn-cli 给出可解析倍率
+        self.assertEqual(data["shared-model"]["credits_by_profile"], {"cn-cli": 0.03})
+        self.assertIsNone(data["cn-cli-only"]["credits"])
+        self.assertEqual(data["cn-cli-only"]["credits_by_profile"], {})
         for selected in ("shared-model", "intl-cli-only"):
             response = self.client.post("/v1/messages/count_tokens",
                                         json=self.payload("messages", selected))

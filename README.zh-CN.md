@@ -122,7 +122,7 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 | `POST /v1/responses` | OpenAI Responses（适配 Codex CLI） |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | Anthropic token 数量估算 |
-| `GET /v1/models` | 自动合并可用账号的模型（云端目录 + 本地缓存） |
+| `GET /v1/models` | 自动合并可用账号的模型；标准字段之外附 `credits` 倍率与 `credits_by_profile` 分组 |
 
 以上原地址适用于所有支持的地域和产品；不注册 `/cn`、`/intl` API 前缀，带前缀请求返回 404。三个生成协议统一保证发往上游的首条消息为 system：已有 system 则移到首位，缺失时补默认值；保留已有 system 和其它内容。
 
@@ -226,6 +226,8 @@ docker exec -it codebuddy2api python3 converter.py login --no-browser
 ## 模型列表
 
 以 `/v1/models` 为准，自动合并国内、国际账号的可用来源。目录按账号/租户、地域、产品与客户端版本缓存于 `auth/model-catalog.json`，有效期 6 小时；新凭据触发同步。同步失败只保留相同账号的可信旧缓存，旧版未隔离的根模型表不用于授权路由。
+
+每个模型在标准 OpenAI 字段（`id` / `object` / `created` / `owned_by`）之外附带倍率：`credits` 为该模型各来源的最小倍率（`0.0` 表示零计费，`null` 表示目录未声明可解析倍率），`credits_by_profile` 为按产品来源的分组倍率，例如 `{"intl-work": 0.0, "cn-cli": 0.03}`。客户端可忽略这两个扩展字段，不影响兼容性。
 
 凭据的 domain / token issuer 决定产品 profile；聊天与 token 刷新使用固定入口，CLI / WorkBuddy 身份头各自生成：
 

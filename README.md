@@ -122,7 +122,7 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI or your own SDK client:
 | `POST /v1/responses` | OpenAI Responses (Codex CLI) |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | Anthropic token count estimate |
-| `GET /v1/models` | Available models merged across accounts (cloud catalogs, locally cached) |
+| `GET /v1/models` | Available models merged across accounts; adds `credits` multiplier and `credits_by_profile` breakdown |
 
 These original paths serve all supported regions and products. `/cn` and `/intl` API prefixes are not registered and return 404. Across the three generation protocols, the upstream request always starts with a system message: an existing system message is moved to the front, or a default is inserted if absent; existing system messages and other content are retained.
 
@@ -226,6 +226,8 @@ docker exec -it codebuddy2api python3 converter.py login --no-browser
 ## Models
 
 Use `/v1/models` as the source of truth: it merges the available sources across domestic and international accounts. Catalogs are cached in `auth/model-catalog.json` by account/tenant, region, product and client version, with a 6-hour TTL. New credentials trigger synchronization. Refresh failures retain only the same account's trusted cache; legacy unscoped root catalogs cannot authorize routing.
+
+Beyond the standard OpenAI fields (`id` / `object` / `created` / `owned_by`), each model carries its multiplier: `credits` is the lowest multiplier across sources (`0.0` means zero-cost, `null` means no parseable multiplier was declared), and `credits_by_profile` breaks it down per product source, e.g. `{"intl-work": 0.0, "cn-cli": 0.03}`. Clients may ignore both extension fields.
 
 Credential domain / token issuer determine the product profile; chat and token refresh use fixed origins with separately generated CLI / WorkBuddy identity headers:
 

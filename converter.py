@@ -1674,6 +1674,19 @@ def _free_multiplier(credits) -> bool:
     return match is not None
 
 
+def _multiplier_value(credits):
+    """解析官方倍率字符串为数值；无倍率或格式未知返回 None。"""
+    if not isinstance(credits, str):
+        return None
+    match = re.fullmatch(r"x\s*([0-9]+(?:\.[0-9]+)?)\s*(?:credits?)?", credits.strip(), re.IGNORECASE)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
 def _model_free(models, model: str | None, profile: str) -> bool:
     """该账号目录是否把此模型声明为 x0.00；名单里没有该模型时不算免费。"""
     if not model:
@@ -1771,14 +1784,54 @@ def current_models(region: str | None = None) -> list[str]:
         return list(dict.fromkeys(out))
 
 
-def _model_table(region: str | None = None) -> list[str]:
-    now = time.time()
-    cached = _model_table_cache.get(region)
-    if cached is None or now - cached[0] > _MODEL_TABLE_TTL:
-        _model_table_cache[region] = (now, current_models(region))
-    return _model_table_cache[region][1]
+def current_model_details(region: str | None = None) -> list[dict]:
+    """模型表（含倍率）：{id, credits, credits_by_profile}；credits 取各来源最小值。"""
+    pool = CONFIG.get("cred_pool")
+    if pool is not None:
+        pool._rescan()
+    details: dict[str, dict] = {}
+    for name in current_models(region):
+        details[name] = {"id": name, "credits": None, "credits_by_profile": {}}
+    if pool is None:
+        return list(details.values())
+    with pool._lock:
+        def record(profile: str, item: dict, *, zero: bool) -> None:
+            name = item.get("id")
+            if name not in details:
+                return
+            if zero and not _free_multiplier(item.get("credits")):
+                return  # 零余额账号不参与付费模型的倍率展示
+            value = _multiplier_value(item.get("credits"))
+            if value is None:
+                return
+            details[name]["credits_by_profile"][profile] = value
+            best = details[name]["credits"]
+            details[name]["credits"] = value if best is None else min(best, value)
 
-
+        if CONFIG.get("account_catalogs") is not None or CONFIG.get("model_cache") is not None:
+            accounts = CONFIG.get("account_catalogs") or {}
+            for entry in pool.entries():
+                profile = entry.get("profile")
+                if not profile or not _in_region(profile, region):
+                    continue
+                zero = pool._zero_balance(entry, profile)
+                if not zero and not pool._has_credit(entry, profile):
+                    continue
+                account = accounts.get(entry.get("account_key")) or {}
+                if account.get("profile") != profile:
+                    continue
+                for item in _usable_models(account.get("models")):
+                    record(profile, item, zero=zero)
+        else:
+            configured = _configured_profiles(region)
+            for profile in sorted(configured):
+                entries = [entry for entry in pool.entries() if pool._entry_profile(entry) == profile]
+                zero_only = bool(entries) and all(pool._zero_balance(entry, profile) for entry in entries)
+                if not (_profile_has_credits(profile) or zero_only):
+                    continue
+                for item in _models_for_profile(profile, configured):
+                    record(profile, item, zero=zero_only)
+    return list(details.values())
 
 
 def _prepare_payload(payload, field="messages") -> dict:
@@ -1881,8 +1934,9 @@ def guard_model(name: str, *, region=None) -> None:
 def list_models(authorization: Optional[str] = Header(default=None),
                 x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     _check_auth(authorization, x_api_key)
-    data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-            for m in current_models()]
+    data = [{"id": item["id"], "object": "model", "created": 1700000000, "owned_by": "codebuddy",
+             "credits": item["credits"], "credits_by_profile": item["credits_by_profile"]}
+            for item in current_model_details()]
     return {"object": "list", "data": data}
 
 
