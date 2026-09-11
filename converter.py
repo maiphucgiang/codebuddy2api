@@ -675,6 +675,20 @@ class CredentialPool:
                 return False
         return not model or self._has_credit(entry, profile)
 
+    def _model_free(self, entry, model: str | None, *, profile=None) -> bool:
+        """该凭证的账号目录是否把此模型声明为零计费（x0.00）。"""
+        if not model or model == "auto":
+            return False
+        profile = profile or self._entry_profile(entry)
+        if not profile:
+            return False
+        accounts = CONFIG.get("account_catalogs")
+        if accounts is not None or CONFIG.get("model_cache") is not None:
+            account = (accounts or {}).get(entry.get("account_key")) or {}
+            if account.get("profile") != profile:
+                return False
+            return _model_free(account.get("models"), model, profile)
+        return _model_free(_models_for_profile(profile), model, profile)
 
     def _model_healthy(self, e: dict, model: str | None) -> bool:
         """该凭证对指定模型未处于 429 冷却期；model 为空时不做模型级检查。"""
@@ -692,31 +706,42 @@ class CredentialPool:
             else:
                 break
 
+    def _candidates(self, model: str | None, *, region=None) -> list[dict]:
+        """可用凭证按（零计费优先, 快过期积分优先）排序；同级由调用方轮询。"""
+        healthy = [entry for entry in self._entries if self._healthy(entry)
+                   and self._eligible(entry, model, region=region) and self._model_healthy(entry, model)]
+        if not healthy:
+            return []
+        # 目录倍率 x0.00 的同名模型排最前，其次快过期积分优先；无数据排最后。
+        healthy.sort(key=lambda entry: (not self._model_free(entry, model), *self._expiry_rank(entry)))
+        return healthy
+
     def pick(self, skey: str | None, model: str | None = None, *, region=None) -> CredentialManager | None:
         """按黏绑选凭证；未绑定/已失效则轮询取健康凭证并绑定。
 
         model 非空时跳过该模型 429 冷却中的凭证（黏性会话自动换绑）；
         全部凭证对该模型冷却时返回 None，由上层快速失败，不再打上游。
+        候选优先零计费账号；黏绑账号被更好的来源替代时自动重绑。
         """
         self._rescan()  # 锁外扫描，reload/prune 各自取锁，避免死锁
         with self._lock:
             self._evict_sticky()
+            candidates = self._candidates(model, region=region)
+            if not candidates:
+                if skey:
+                    self._sticky.pop(skey, None)
+                return None
+            best = candidates[0]
+            free = self._model_free(best, model)
+            top = [e for e in candidates if self._model_free(e, model) == free
+                   and self._expiry_rank(e) == self._expiry_rank(best)]
             if skey and skey in self._sticky:
                 cid, _ = self._sticky[skey]
-                e = next((x for x in self._entries if x["id"] == cid), None)
-                if e and self._healthy(e) and self._eligible(e, model, region=region) and self._model_healthy(e, model):
+                sticky = next((e for e in top if e["id"] == cid), None)
+                if sticky is not None:
                     self._sticky[skey] = (cid, time.time())
                     self._sticky.move_to_end(skey)
-                    return e["cm"]
-                self._sticky.pop(skey, None)
-            if not self._entries:
-                return None
-            healthy = [entry for entry in self._entries if self._healthy(entry)
-                       and self._eligible(entry, model, region=region) and self._model_healthy(entry, model)]
-            if not healthy:
-                return None
-            healthy.sort(key=self._expiry_rank)  # 快过期积分优先；无数据排最后（稳定排序保原顺序）
-            top = [e for e in healthy if self._expiry_rank(e) == self._expiry_rank(healthy[0])]
+                    return sticky["cm"]
             e = top[self._rr[region] % len(top)]
             self._rr[region] += 1
             if skey:
@@ -1626,6 +1651,23 @@ def _models_for_profile(profile: str, configured=None) -> list[dict]:
 
 def _upstream_model(model: str | None, profile: str) -> str | None:
     return "default-model" if model == "auto" and profile_region(profile) == "intl" else model
+
+
+def _free_multiplier(credits) -> bool:
+    """目录 credits 倍率是否为 0（官方对当前账号声明的零计费标记）。"""
+    if not isinstance(credits, str):
+        return False
+    match = re.fullmatch(r"x\s*0(?:\.0+)?\s*(?:credits?)?", credits.strip(), re.IGNORECASE)
+    return match is not None
+
+
+def _model_free(models, model: str | None, profile: str) -> bool:
+    """该账号目录是否把此模型声明为 x0.00；名单里没有该模型时不算免费。"""
+    if not model:
+        return False
+    routed = _upstream_model(model, profile)
+    return any(item.get("id") == routed and _free_multiplier(item.get("credits"))
+               for item in models or [])
 
 
 def _model_profiles(model: str | None, region: str | None = None, configured=None) -> set[str]:

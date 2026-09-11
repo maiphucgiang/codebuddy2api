@@ -242,6 +242,72 @@ class RegionRoutingTests(unittest.TestCase):
                 seen.add(request.headers["x-user-id"])
             self.assertEqual(seen, set(PROFILES))
 
+    def test_zero_multiplier_model_prefers_free_accounts(self):
+        free = "intl-cli"
+        tables = catalogs()
+        tables[free] = [dict(model("shared-model"), credits="x0.00"), model(free + "-exclusive")]
+        for profile in PROFILES:
+            if profile != free:
+                tables[profile] = [dict(model("shared-model"), credits="x0.03"), model(profile + "-exclusive")]
+        self.configure(tables=tables)
+        for endpoint in GENERATIONS:
+            for _ in range(6):
+                request, _ = self.post_ok(endpoint, self.payload(endpoint), {free})
+                self.assertEqual(request.headers["x-user-id"], free)
+            # 计费账号只在免费账号不可用时兜底。
+            self.pool.note_status(self.entries[free]["cm"], 429, model="shared-model")
+            request, _ = self.post_ok(endpoint, self.payload(endpoint), set(PROFILES) - {free})
+            self.assertNotEqual(request.headers["x-user-id"], free)
+            # 冷却换绑后该会话黏在计费账号上；解除冷却应重绑回免费账号。
+            self.pool.note_status(self.entries[free]["cm"], 429, model="other-model")
+            with self.pool._lock:
+                self.pool._model_fail.clear()
+            request, _ = self.post_ok(endpoint, self.payload(endpoint), {free})
+            self.assertEqual(request.headers["x-user-id"], free)
+
+    def test_zero_multiplier_model_requires_declared_credits_field(self):
+        tables = catalogs()
+        # 只给 intl-cli 声明零倍率，其余账号目录仍是不带 credits 字段的同名模型。
+        tables["intl-cli"] = [dict(model("shared-model"), credits="x0.00"), model("intl-cli-exclusive")]
+        tables["intl-work"] = [model("shared-model"), model("intl-work-exclusive")]
+        self.configure(tables=tables)
+        self.assertTrue(self.pool._model_free(self.entries["intl-cli"], "shared-model"))
+        self.assertFalse(self.pool._model_free(self.entries["intl-work"], "shared-model"))
+        for _ in range(4):
+            request, _ = self.post_ok("chat/completions", self.payload(), {"intl-cli"})
+            self.assertEqual(request.headers["x-user-id"], "intl-cli")
+        # 免费账号不可用后，未声明 credits 的账号按普通轮询调度，不会被误判为免费。
+        self.pool.note_status(self.entries["intl-cli"]["cm"], 429, model="shared-model")
+        seen = set()
+        for _ in range(6):
+            request, _ = self.post_ok("chat/completions", self.payload(), set(PROFILES) - {"intl-cli"})
+            seen.add(request.headers["x-user-id"])
+        self.assertEqual(seen, {"cn-cli", "cn-work", "intl-work"})
+
+    def test_free_account_sticky_rebinds_only_while_it_stays_best(self):
+        free = "intl-cli"
+        tables = catalogs()
+        for profile in PROFILES:
+            tables[profile] = [dict(model("shared-model"), credits="x0.00" if profile == free else "x0.03"),
+                               model(profile + "-exclusive")]
+        self.configure(tables=tables)
+        payload = self.payload()
+        request, _ = self.post_ok("chat/completions", payload, {free})
+        self.assertEqual(request.headers["x-user-id"], free)
+        self.post_ok("chat/completions", payload, {free})  # 黏绑保持
+        # 免费账号改为计费后，旧黏绑必须重绑到仍然免费的账号。
+        tables[free] = [dict(model("shared-model"), credits="x0.03"), model(free + "-exclusive")]
+        tables["cn-cli"] = [dict(model("shared-model"), credits="x0.00"), model("cn-cli-exclusive")]
+        self.account_catalogs(tables)
+        request, _ = self.post_ok("chat/completions", payload, {"cn-cli"})
+        self.assertEqual(request.headers["x-user-id"], "cn-cli")
+
+    def test_credits_multiplier_parser_accepts_official_forms(self):
+        for value in ("x0.00", "x0.00 credits", "x0.0", "X0.00 CREDITS", " x0.00 ", "x0"):
+            self.assertTrue(converter._free_multiplier(value), value)
+        for value in ("x0.03", "x0.03 credits", "x0.34 credits", "", "credits", None, 0, {}, "x0.00x"):
+            self.assertFalse(converter._free_multiplier(value), repr(value))
+
     def test_product_exclusive_models_only_rotate_between_supporting_regions(self):
         for endpoint in GENERATIONS:
             for product in ("cli", "work"):

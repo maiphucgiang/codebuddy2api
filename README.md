@@ -8,7 +8,7 @@ Use your **WorkBuddy / CodeBuddy (Tencent)** subscription as local **OpenAI- and
 
 - OpenAI Chat Completions / Responses and Anthropic Messages, with native tools / tool_calls and streaming SSE; automatic domestic / international and CLI / WorkBuddy backend routing through the original `/v1` endpoints
 - **Seamless login**: add an account by scanning a QR code in your browser — the desktop client is **not** required
-- Multi-account pool: per-session sticky routing, least-expiring-credit first, automatic cooldown on 401/429
+- Multi-account pool: per-session sticky routing, zero-multiplier (`x0.00`) model preference, least-expiring-credit first, automatic cooldown on 401/429
 - Automatic token refresh and daily keepalive
 - Optional credit balance via OpenAI billing endpoints (`/v1/dashboard/billing/*`)
 
@@ -236,7 +236,7 @@ Credential domain / token issuer determine the product profile; chat and token r
 | `intl-cli` | `https://www.codebuddy.ai` |
 | `intl-work` | `https://www.workbuddy.ai` |
 
-A concrete model can be scheduled across any region or product, but only among accounts whose own known catalog supports it. Each account retains its own catalog and balance; one account's capabilities or credits never authorize another. International credentials must have a known positive credit balance. Selection respects credit priority, cooldown and session stickiness; an ineligible sticky account is rebound before sending, and the final account determines both the fixed host and identity headers. An upstream POST that has already been sent is not replayed against another account. Catalog / credential readiness failures return retryable 503; explicitly unsupported models return 404.
+A concrete model can be scheduled across any region or product, but only among accounts whose own known catalog supports it. Each account retains its own catalog and balance; one account's capabilities or credits never authorize another. International credentials must have a known positive credit balance. Accounts whose own catalog declares the model as zero-multiplier (`credits: x0.00`, e.g. `deepseek-v4.1-flash` on international WorkBuddy) are preferred, then selection respects credit priority, cooldown and session stickiness; an ineligible or no-longer-preferred sticky account is rebound before sending, and the final account determines both the fixed host and identity headers. An upstream POST that has already been sent is not replayed against another account. Catalog / credential readiness failures return retryable 503; explicitly unsupported models return 404.
 
 `auto` remains a scheduling alias for each eligible account's default, not permission to use every account or model. International accounts must declare `default-model` in their own catalog, and the upstream model is then `default-model`. Domestic WorkBuddy must declare `auto`; domestic CLI retains its legacy `auto` only with a known nonempty usable catalog. The alias observes the same balance, stickiness and cooldown constraints, including cooldown of the mapped upstream model.
 
