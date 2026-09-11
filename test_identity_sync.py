@@ -21,8 +21,11 @@ DOMAINS = {"cn-cli": "www.codebuddy.cn", "cn-work": "www.workbuddy.cn",
            "intl-cli": "www.codebuddy.ai", "intl-work": "www.workbuddy.ai"}
 
 
-def model(name):
-    return {"id": name, "supportsToolCall": True}
+def model(name, credits=None):
+    value = {"id": name, "supportsToolCall": True}
+    if credits is not None:
+        value["credits"] = credits
+    return value
 
 
 def credential(uid="A", profile="cn-cli", tenant="tenant", token=None):
@@ -238,6 +241,24 @@ class IdentitySyncTests(unittest.TestCase):
         self.catalog_fetch.assert_called_once()
         self.assertEqual([item["id"] for item in self.cache.models(self.key())], ["a-only", "shared"])
         self.assertIsNone(self.picked_uid("a-only"))
+
+    def test_zero_balance_account_leaves_paid_models_but_keeps_free_ones(self):
+        self.catalog_fetch.side_effect = lambda token, **kw: (
+            [model("free-only", credits="x0.00"), model("paid-only", credits="x0.03")]
+            if kw["uid"] == "A" else [model("paid-only", credits="x0.03")])
+        self.configure(self.write_credential("a.info"), self.write_credential("b.info", uid="B"))
+        self.sync()
+        entries = {entry["cm"].summary()["uid"]: entry for entry in self.pool.entries()}
+        self.ledger.update_credits(entries["A"]["id"], {
+            "credits": 0, "intl": False, "segments": [], "soonest_expiry": None})
+        self.assertFalse(self.pool._eligible(entries["A"], "paid-only"))
+        self.assertTrue(self.pool._eligible(entries["A"], "free-only"))
+        self.assertEqual({self.picked_uid("paid-only") for _ in range(6)}, {"B"})
+        self.assertEqual(self.picked_uid("free-only"), "A")
+        # 余额恢复后重新进入付费模型轮询。
+        self.ledger.update_credits(entries["A"]["id"], {
+            "credits": 100, "intl": False, "segments": [], "soonest_expiry": None})
+        self.assertEqual({self.picked_uid("paid-only") for _ in range(6)}, {"A", "B"})
 
     def test_old_v1_root_and_unbound_profile_caches_never_publish(self):
         self.configure(self.write_credential())

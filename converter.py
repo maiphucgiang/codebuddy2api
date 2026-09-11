@@ -633,6 +633,17 @@ class CredentialPool:
         profile = cls._entry_profile(entry)
         return profile_site(profile) if profile else None
 
+    def _zero_balance(self, entry, profile) -> bool:
+        """该账号已确认余额为 0：只能使用目录声明的零倍率模型。"""
+        balance = (self._ledger.entry(entry["id"]).get("credits") or {}) if self._ledger else {}
+        if not balance:
+            return False
+        try:
+            return (bool(balance.get("intl")) == (profile_region(profile) == "intl")
+                    and float(balance.get("credits") or 0) <= 0)
+        except (TypeError, ValueError):
+            return False
+
     def _has_credit(self, entry, profile):
         balance = (self._ledger.entry(entry["id"]).get("credits") or {}) if self._ledger else {}
         if not balance:
@@ -673,7 +684,9 @@ class CredentialPool:
                            and len(configured) == 1)
             if model and not (supported or cli_auto or passthrough):
                 return False
-        return not model or self._has_credit(entry, profile)
+        # 零余额账号退出付费模型轮询，只保留自身目录声明为 x0.00 的模型。
+        return (not model or self._has_credit(entry, profile)
+                or self._model_free(entry, model, profile=profile))
 
     def _model_free(self, entry, model: str | None, *, profile=None) -> bool:
         """该凭证的账号目录是否把此模型声明为零计费（x0.00）。"""
@@ -1726,19 +1739,31 @@ def current_models(region: str | None = None) -> list[str]:
             accounts = CONFIG.get("account_catalogs") or {}
             for entry in pool.entries():
                 profile = entry.get("profile")
-                if not profile or not _in_region(profile, region) or not pool._has_credit(entry, profile):
+                if not profile or not _in_region(profile, region):
+                    continue
+                # 零余额账号退出付费模型：不发布付费项，仅保留自身声明的零倍率模型。
+                zero = pool._zero_balance(entry, profile)
+                if not zero and not pool._has_credit(entry, profile):
                     continue
                 account = accounts.get(entry.get("account_key")) or {}
                 if account.get("profile") != profile:
                     continue
                 models = _usable_models(account.get("models"))
+                if zero:
+                    models = [model for model in models if _free_multiplier(model.get("credits"))]
                 out.extend(model["id"] for model in models)
                 if profile in auto_profiles and models:
                     has_auto |= profile == "cn-cli" or any(model["id"] == _upstream_model("auto", profile) for model in models)
         else:
             for profile in sorted(configured):
-                if _profile_has_credits(profile):
+                entries = ([entry for entry in pool.entries() if pool._entry_profile(entry) == profile]
+                           if pool is not None else [])
+                # 该产品全部账号余额归零时，只发布自身目录声明的零倍率模型。
+                zero_only = bool(entries) and all(pool._zero_balance(entry, profile) for entry in entries)
+                if _profile_has_credits(profile) or zero_only:
                     models = _models_for_profile(profile, configured)
+                    if zero_only:
+                        models = [model for model in models if _free_multiplier(model.get("credits"))]
                     out.extend(model["id"] for model in models)
                     has_auto |= bool(models) and profile in auto_profiles
         if has_auto:
