@@ -6,7 +6,7 @@ Use your **WorkBuddy / CodeBuddy (Tencent)** subscription as local **OpenAI- and
 
 ## Features
 
-- Serves `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, `GET /v1/models` from your logged-in accounts, with native tools / tool_calls and streaming SSE
+- OpenAI Chat Completions / Responses and Anthropic Messages, with native tools / tool_calls and streaming SSE; separate domestic (`/cn/v1`) and international (`/intl/v1`) routes
 - **Seamless login**: add an account by scanning a QR code in your browser — the desktop client is **not** required
 - Multi-account pool: per-session sticky routing, least-expiring-credit first, automatic cooldown on 401/429
 - Automatic token refresh and daily keepalive
@@ -42,11 +42,17 @@ The command opens the login page in your browser. Scan the QR code, then wait fo
 
 ### 3. Start
 
+Copy and edit the configuration before the first start; do not overwrite an existing `.env`. Compose-only image and port-mapping settings do not change the local Python listener.
+
 ```bash
-uv run converter.py --desensitize --log converter.log
+cp .env.example .env
+# Edit .env: API key, image policy, and other settings
+uv run --env-file .env converter.py --desensitize --log converter.log
 ```
 
 Listening on `http://127.0.0.1:8787` means it is up.
+
+Plain `python3` does not load `.env`; set environment variables or CLI flags explicitly. With an API key enabled, include its Authorization header on API requests, including regional routes.
 
 You can also add accounts from another terminal while the server runs; they are loaded on the next request by default. Use the same `CODEBUDDY_AUTH_DIR` for login and the server (default: `auth/`). A server started with `--auth-file` only uses the specified files.
 
@@ -56,19 +62,22 @@ If the desktop client is already logged in on this machine, its credential is im
 
 ```bash
 curl http://127.0.0.1:8787/health
-curl http://127.0.0.1:8787/v1/models
+curl http://127.0.0.1:8787/cn/v1/models
+# International accounts: use /intl/v1/models; add Authorization if a key is set
 ```
 
 ## Client setup
 
+Choose the region explicitly: OpenAI / Responses base URL is `http://127.0.0.1:8787/cn/v1` or `http://127.0.0.1:8787/intl/v1`. Legacy `/v1` defaults to domestic accounts only; routes never fall back across regions.
+
 ### Codex CLI (recommended)
 
-Codex CLI uses `/v1/responses`. Merge into `~/.codex/config.toml`:
+Codex CLI uses `/cn/v1/responses` (or `/intl/v1/responses`). Merge into `~/.codex/config.toml`:
 
 ```toml
 [model_providers.workbuddy]
 name = "WorkBuddy (via local converter)"
-base_url = "http://127.0.0.1:8787/v1"
+base_url = "http://127.0.0.1:8787/cn/v1"
 wire_api = "responses"
 env_key = "CODEBUDDY2API_KEY"
 
@@ -84,17 +93,17 @@ codex --profile workbuddy "your task"
 
 ### Claude Code / CC Switch
 
-Claude Code uses `/v1/messages`. In CC Switch:
+For Claude Code / Anthropic SDKs, use a base URL **without `/v1/messages`**: the SDK appends that path automatically.
 
-```json
-{
-  "DeepSeek-V4-Pro": {
-    "base_url": "http://127.0.0.1:8787/v1/messages",
-    "api_key": "",
-    "model": "deepseek-v4-pro"
-  }
-}
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/cn
+# International: http://127.0.0.1:8787/intl
+export ANTHROPIC_AUTH_TOKEN=any-value  # use the configured API key when enabled
+export ANTHROPIC_MODEL=deepseek-v4-pro
+claude
 ```
+
+In CC Switch, use the same regional root for the Anthropic provider's Base URL. Only clients asking for a complete endpoint should use `/cn/v1/messages` or `/intl/v1/messages`. The legacy root `http://127.0.0.1:8787` remains domestic-only.
 
 Model names must be real Tencent-backend model names (no Anthropic→Tencent mapping). Keep `--desensitize` on for Claude Code.
 
@@ -102,18 +111,24 @@ Model names must be real Tencent-backend model names (no Anthropic→Tencent map
 
 Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI or your own SDK client:
 
-- Base URL: `http://127.0.0.1:8787/v1`
+- Base URL: `http://127.0.0.1:8787/cn/v1` or `http://127.0.0.1:8787/intl/v1`
 - API Key: empty, or the `--api-key` you started with
 - Model: `glm-5.2` / `deepseek-v4-pro` / `kimi-k2.7` / `auto` …
 
 ## Endpoints
 
-| Endpoint | Description |
+| Domestic endpoint | International endpoint | Description |
+|------|------|------|
+| `POST /cn/v1/chat/completions` | `POST /intl/v1/chat/completions` | OpenAI Chat Completions |
+| `POST /cn/v1/responses` | `POST /intl/v1/responses` | OpenAI Responses (Codex CLI) |
+| `POST /cn/v1/messages` | `POST /intl/v1/messages` | Anthropic Messages |
+| `POST /cn/v1/messages/count_tokens` | `POST /intl/v1/messages/count_tokens` | Anthropic token count estimate |
+| `GET /cn/v1/models` | `GET /intl/v1/models` | Regional models (cloud catalog, locally cached) |
+
+All five also accept legacy `/v1/...` paths for domestic accounts only. Across the three generation protocols, the upstream request always starts with a system message: an existing system message is moved to the front, or a default is inserted if absent; existing system messages and other content are retained.
+
+| Shared endpoint | Description |
 |------|------|
-| `POST /v1/chat/completions` | OpenAI Chat Completions |
-| `POST /v1/responses` | OpenAI Responses (Codex CLI) |
-| `POST /v1/messages` | Anthropic Messages (Claude Code / CC Switch) |
-| `GET /v1/models` | Available models (cloud catalog synced, cached locally) |
 | `GET /health` | Public liveness only (`{"status":"ok"}`) |
 | `GET /v1/dashboard/billing/subscription` | Total credit balance as `hard_limit_usd` |
 | `GET /v1/dashboard/billing/usage` | Usage in cents, with daily cost breakdown |
@@ -145,58 +160,93 @@ Send `POST /admin/credentials` with `{"path":"account.info"}` or the file's abso
 | `--usd-rate` | `7.15` | CNY→USD rate for billing endpoints |
 | `--model-catalog-ttl` | `21600` | Cloud model catalog cache TTL (seconds) |
 | `--no-model-guard` | off | Disable local 404 for models outside the catalog |
+| `--auto-trial [true/false]` | `false` | Enable one-time trial-credit claims for international WorkBuddy accounts |
+| `--max-images` | `16` | Total images per request; `0` permits no images |
+| `--image-policy` | `truncate` | `truncate` keeps the newest images; `error` rejects excess images with 413 |
+| `--max-request-bytes` | `33554432` | Positive JSON byte limit after image processing and conversion (32 MiB) |
+| `--log-body-limit` | `65536` | Body preview byte budget (64 KiB); `0` logs summaries only |
+
+Named function choices are sent upstream as `required` with only that function available; invalid names are rejected locally. Set `stream: false` explicitly for JSON responses and `stream: true` for SSE.
 
 Environment variables: `CODEBUDDY_AUTH_DIR` (credential dir), `CODEBUDDY_IMPORT_DIR` (allowed API import dir), `CODEBUDDY2API_KEY`, `CODEBUDDY2API_LOG`.
 
-## Docker
+Limits also accept `CODEBUDDY2API_MAX_IMAGES`, `CODEBUDDY2API_IMAGE_POLICY`, `CODEBUDDY2API_MAX_REQUEST_BYTES`, and `CODEBUDDY2API_LOG_BODY_LIMIT`. CLI flags take precedence; restart after changing configuration.
 
-Image: `ghcr.io/maiphucgiang/codebuddy2api:1.0.1` for `linux/amd64` and `linux/arm64`. Use a version tag to pin a release, `latest` for the stable release, or `edge` for `main`.
+Set `CODEBUDDY2API_AUTO_TRIAL=true` in `.env` to enable one-time trial-credit claims for `intl-work` accounts. It is off by default. Success or already-claimed results are persisted by account in `auth/trial-ledger.json`; failures wait at least 24 hours without immediate POST replay. Credits and eligibility are determined by the upstream; keep this state file when upgrading.
+
+### Image and request limits
+
+- Chat, Responses, and Anthropic requests count images across all history and tool results, including repeated images. Message/content array order determines recency, not nonstandard timestamps.
+- The default keeps the newest 16 images without removing text or tool messages; image-only content receives a text placeholder when emptied. `--image-policy error` returns `413 / too_many_images` before contacting upstream.
+- Requests still exceeding the byte budget after processing return `413 / request_too_large`, without further text truncation. Image count does not guarantee acceptable individual image sizes or model vision support. URL/base64 images can be converted; Responses `file_id` is unsupported.
+- Logs contain bounded previews with image base64 and common credentials redacted, not complete original requests. Treat logs as private data.
+
+## Docker
 
 ### Docker Compose
 
+From the repository directory, copy the template to `.env` and edit it first. Keep an existing `.env` and add only the missing settings.
+
 ```bash
-docker compose pull
+cp .env.example .env
+# Edit .env: API key, bind address, port, credential directory, image policy, etc.
+docker compose build
 docker compose up -d
 docker compose exec codebuddy2api python3 converter.py login --no-browser
 ```
 
-Open the displayed link in your own browser and scan the QR code. Wait for the terminal to confirm that the account has been saved. Add `--site intl` to the login command for the international site.
+The template builds the current source, binds only to `127.0.0.1:8787`, and keeps the newest 16 images per request. Before exposing another interface with `CODEBUDDY2API_BIND`, set your own random `CODEBUDDY2API_KEY` and restrict network access.
 
-Credentials and caches persist in `./auth`, mounted read-write at `/data/auth`. Added accounts are loaded on the next request by default; no restart is needed. Set `CODEBUDDY2API_KEY` in your environment or `.env` to enable authentication. To change versions, edit the `image` tag in `docker-compose.yml`, then pull and start again. Existing accounts do not need to log in again.
+Compose automatically reads the declared variables from `.env`; shell environment variables take precedence. Ordinary interpolation retains compatibility with older Compose versions. Without `.env`, the Compose file still supplies compatibility defaults; new deployments should always copy the template.
+
+Open the login link, scan, and wait for the terminal to confirm saving; add `--site intl` for international accounts. `CODEBUDDY2API_AUTH_PATH` defaults to `./auth` and mounts at `/data/auth`; added accounts load automatically. After editing `.env`, run `docker compose up -d` to recreate containers whose configuration changed, without logging in again.
+
+### Published images
+
+Set `CODEBUDDY2API_IMAGE` in `.env` to `ghcr.io/maiphucgiang/codebuddy2api:<version>`, then run:
+
+```bash
+docker compose pull
+docker compose up -d --no-build
+```
+
+Published images support `linux/amd64` and `linux/arm64`. Version tags pin releases, `latest` follows stable releases, and `edge` follows `main`. Features depend on the selected image version; local changes require rebuilding.
 
 ### Docker CLI
 
-```bash
-docker run -d --name codebuddy2api -p 8787:8787 \
-  -v "$PWD/auth:/data/auth" \
-  -e CODEBUDDY_AUTH_DIR=/data/auth \
-  -e CODEBUDDY2API_KEY \
-  ghcr.io/maiphucgiang/codebuddy2api:1.0.1
+Prepare `.env` first as above; these commands use local source and the default port and directory:
 
+```bash
+docker build -t codebuddy2api:local .
+docker run -d --name codebuddy2api -p 127.0.0.1:8787:8787 \
+  --env-file .env -v "$PWD/auth:/data/auth" \
+  -e CODEBUDDY_AUTH_DIR=/data/auth codebuddy2api:local
 docker exec -it codebuddy2api python3 converter.py login --no-browser
 ```
 
-### Build from source
-
-```bash
-CODEBUDDY2API_IMAGE=codebuddy2api:local docker compose up -d --build --pull never
-```
-
-After starting, use the container login commands above to add accounts. With `docker run`, first run `docker build -t codebuddy2api:local .`, then use `codebuddy2api:local` as the image name in the start command.
-
 ## Models
 
-Runtime `/v1/models` follows the cloud catalog (synced every 6 h, cached in `auth/model-catalog.json`); international models appear only while an international credential has credit. Fallback list when the cloud is unreachable:
+Use `/cn/v1/models` or `/intl/v1/models` as the source of truth. Catalogs are cached in `auth/model-catalog.json` by account/tenant, region, product and client version, with a 6-hour TTL. New credentials trigger synchronization. Refresh failures retain only the same account's trusted cache; legacy unscoped root catalogs cannot authorize routing.
 
-`hy4-preview`、`hy4-preview-x`、`hy3`、`hy3-x`、`deepseek-v4-pro`、`deepseek-v4-flash`、`deepseek-v4.1-flash`、`deepseek-v3-2-volc`、`glm-5.3`、`glm-5.3-flash`、`glm-5.2`、`glm-5.1`、`glm-5.0`、`glm-5.0-turbo`、`glm-5v-turbo`、`glm-4.7`、`glm-4.6`、`glm-4.6v`、`minimax-m3`、`minimax-m2.7`、`minimax-m2.5`、`kimi-k3-1`、`kimi-k2.7`、`kimi-k2.6`、`kimi-k2.5`、`kimi-k2-thinking`、`hunyuan-chat`、`default`、`auto`
+Credential domain / token issuer determine the product profile; chat and token refresh use fixed origins with separately generated CLI / WorkBuddy identity headers:
 
-`auto` is a gateway-side scheduling alias. Actual availability depends on your account.
+| Profile | Chat / refresh origin |
+|------|------|
+| `cn-cli` | `https://copilot.tencent.com` |
+| `cn-work` | `https://www.workbuddy.cn` |
+| `intl-cli` | `https://www.codebuddy.ai` |
+| `intl-work` | `https://www.workbuddy.ai` |
+
+Routing selects only same-region credentials whose own product catalog supports the requested model. Switching products is possible only for models overlapping their known catalogs, never across regions. International credentials must have a known positive credit balance. Catalog / credential readiness failures return retryable 503; explicitly unsupported models return 404. `auto` is a scheduling alias, not a way to bypass these constraints.
 
 ## Troubleshooting
 
 - **Local 401**: you started with `--api-key` but the client did not send the same key.
 - **Upstream 401**: the account token died — re-add the account via seamless login.
 - **429**: quota/rate limit — the gateway cools that model on that credential and routes to another; check `/admin/credentials` with your configured API key.
+- **Network errors**: connection setup failures receive one delayed retry. Disconnects after sending, read/write timeouts, and HTTP errors are not replayed, to avoid duplicate billing. Logs include exception type and elapsed time.
+- **Malformed tool calls**: failed aggregate validation permits up to three regenerations, then returns an error instead of broken calls. Regeneration may consume additional credits.
+- **Empty upstream stream**: a stream containing only `stop` / `[DONE]` without content is treated as an error, not a successful empty answer.
 - **Content-filter blocks**: usually triggered by agent runtime text; start with `--desensitize`, or `--desensitize --no-compact`.
 - **Slow**: switch to a faster model, e.g. `deepseek-v4-flash`.
 - **Same account used elsewhere**: a credential copied from a desktop client refreshes independently — with rolling refresh tokens they can kick each other off; prefer seamless-login accounts or stop using the account in the client.

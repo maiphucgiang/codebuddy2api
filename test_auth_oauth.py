@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import time
+import threading
 from pathlib import Path
 
 sys.path.insert(0, ".")
@@ -216,20 +217,24 @@ def test_oauth_edge_cases():
 
 
 class _StubCM:
-    """假 CredentialManager：summary 可控，get_headers 记录调用/可失败。"""
+    """假 CredentialManager：summary 可控，refresh_if_due 记录调度调用。"""
     def __init__(self, summary, fail=False):
         self._s = summary
+        self._lock = threading.RLock()
+        self._generation = 0
         self._fail = fail
         self.refreshed = 0
 
     def summary(self):
         return dict(self._s)
 
-    def get_headers(self):
+    def refresh_if_due(self, margin_s, keepalive_s):
         self.refreshed += 1
         if self._fail:
             raise RuntimeError("refresh token 已失效")
-        return {}
+        self._s.update(last_refresh_time=time.time() * 1000,
+                       token_expires_at=(time.time() + 3600) * 1000, token_expired=False)
+        return True
 
 
 def _pool_with(entries):
@@ -254,7 +259,7 @@ def test_keepalive_refresh():
     es = [{"id": f"/tmp/{i}.info", "cm": cm, "fail_until": 0.0, "uid": str(i)}
           for i, cm in enumerate([fresh, stale, never, expiring, failing])]
     pool = _pool_with(es)
-    pool.cooldown = lambda cm, reason="": None     # 单测不触发熔断副作用
+    pool.cooldown = lambda cm, reason="", **kw: None  # 单测不触发熔断副作用
     pool.refresh_due()
     assert fresh.refreshed == 0                    # 刚刷过 → 不动
     assert stale.refreshed == 1                    # >24h → 保活

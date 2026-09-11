@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 用你已登录的账号对外提供 `POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/messages`、`GET /v1/models`，支持原生 tools / tool_calls 与流式 SSE
+- 提供 OpenAI Chat Completions / Responses 与 Anthropic Messages，支持原生 tools / tool_calls 与流式 SSE；国内（`/cn/v1`）和国际（`/intl/v1`）路由隔离
 - **无感登录**：浏览器扫码即可添加账号，**无需安装桌面端**
 - 多账号凭证池：会话黏绑、快过期积分优先调度、401/429 自动熔断换绑
 - token 自动刷新与每日保活
@@ -42,11 +42,17 @@ uv run converter.py login
 
 ### 3. 启动
 
+首次启动先复制并编辑配置；已有 `.env` 不要覆盖。Compose 专用的镜像、端口映射等变量不会改变本地 Python 的监听参数。
+
 ```bash
-uv run converter.py --desensitize --log converter.log
+cp .env.example .env
+# 编辑 .env 中的密钥、图片策略等配置
+uv run --env-file .env converter.py --desensitize --log converter.log
 ```
 
 看到监听 `http://127.0.0.1:8787` 即启动成功。
+
+直接运行 `python3` 不会自动读取 `.env`，需显式设置环境变量或命令行参数。启用 API key 后，API 请求（包括地域路由）须携带对应的 Authorization 头。
 
 服务运行期间也可以在另一个终端添加账号，默认在下次请求时自动加载。登录命令与服务须使用同一个 `CODEBUDDY_AUTH_DIR`（默认 `auth/`）；以 `--auth-file` 启动的服务只使用指定文件。
 
@@ -56,19 +62,22 @@ uv run converter.py --desensitize --log converter.log
 
 ```bash
 curl http://127.0.0.1:8787/health
-curl http://127.0.0.1:8787/v1/models
+curl http://127.0.0.1:8787/cn/v1/models
+# 国际账号使用 /intl/v1/models；启用密钥时添加 Authorization 头
 ```
 
 ## 客户端接入
 
+显式选择地域：OpenAI / Responses 的 Base URL 为 `http://127.0.0.1:8787/cn/v1` 或 `http://127.0.0.1:8787/intl/v1`。旧 `/v1` 默认仅使用国内账号，不跨地域回退。
+
 ### Codex CLI（推荐）
 
-Codex CLI 走 `/v1/responses`。把下面配置合并到 `~/.codex/config.toml`：
+Codex CLI 走 `/cn/v1/responses`（国际为 `/intl/v1/responses`）。把下面配置合并到 `~/.codex/config.toml`：
 
 ```toml
 [model_providers.workbuddy]
 name = "WorkBuddy (via local converter)"
-base_url = "http://127.0.0.1:8787/v1"
+base_url = "http://127.0.0.1:8787/cn/v1"
 wire_api = "responses"
 env_key = "CODEBUDDY2API_KEY"
 
@@ -84,17 +93,17 @@ codex --profile workbuddy "你的任务描述"
 
 ### Claude Code / CC Switch
 
-Claude Code 走 `/v1/messages`。在 CC Switch 里配置：
+Claude Code / Anthropic SDK 的 Base URL **不要带 `/v1/messages`**，SDK 会自动追加该路径。
 
-```json
-{
-  "DeepSeek-V4-Pro": {
-    "base_url": "http://127.0.0.1:8787/v1/messages",
-    "api_key": "",
-    "model": "deepseek-v4-pro"
-  }
-}
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/cn
+# 国际：http://127.0.0.1:8787/intl
+export ANTHROPIC_AUTH_TOKEN=any-value  # 启用 API key 时填写配置的密钥
+export ANTHROPIC_MODEL=deepseek-v4-pro
+claude
 ```
+
+CC Switch 的 Anthropic 提供商 Base URL 同样填写地域根地址；只有明确要求完整端点的客户端才填写 `/cn/v1/messages` 或 `/intl/v1/messages`。旧根地址 `http://127.0.0.1:8787` 保留国内兼容。
 
 模型名必须填腾讯后端真实模型名（不做 Anthropic→腾讯映射）。Claude Code 场景建议保持 `--desensitize` 开启。
 
@@ -102,18 +111,24 @@ Claude Code 走 `/v1/messages`。在 CC Switch 里配置：
 
 Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端：
 
-- Base URL：`http://127.0.0.1:8787/v1`
+- Base URL：`http://127.0.0.1:8787/cn/v1` 或 `http://127.0.0.1:8787/intl/v1`
 - API Key：留空，或填启动时设置的 `--api-key`
 - 模型名：`glm-5.2` / `deepseek-v4-pro` / `kimi-k2.7` / `auto` 等
 
 ## 接口一览
 
-| 接口 | 说明 |
+| 国内接口 | 国际接口 | 说明 |
+|------|------|------|
+| `POST /cn/v1/chat/completions` | `POST /intl/v1/chat/completions` | OpenAI Chat Completions |
+| `POST /cn/v1/responses` | `POST /intl/v1/responses` | OpenAI Responses（适配 Codex CLI） |
+| `POST /cn/v1/messages` | `POST /intl/v1/messages` | Anthropic Messages |
+| `POST /cn/v1/messages/count_tokens` | `POST /intl/v1/messages/count_tokens` | Anthropic token 数量估算 |
+| `GET /cn/v1/models` | `GET /intl/v1/models` | 地域可用模型（云端目录 + 本地缓存） |
+
+以上五个接口均保留旧 `/v1/...` 国内兼容地址。三个生成协议统一保证发往上游的首条消息为 system：已有 system 则移到首位，缺失时补默认值；保留已有 system 和其它内容。
+
+| 共用接口 | 说明 |
 |------|------|
-| `POST /v1/chat/completions` | OpenAI Chat Completions |
-| `POST /v1/responses` | OpenAI Responses（适配 Codex CLI） |
-| `POST /v1/messages` | Anthropic Messages（适配 Claude Code / CC Switch） |
-| `GET /v1/models` | 可用模型（云端模型表同步 + 本地缓存） |
 | `GET /health` | 公开存活检查，仅返回 `{"status":"ok"}` |
 | `GET /v1/dashboard/billing/subscription` | 总积分折算余额（`hard_limit_usd`） |
 | `GET /v1/dashboard/billing/usage` | 用量（美分）与按日明细 |
@@ -145,58 +160,93 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 | `--usd-rate` | `7.15` | 人民币→美元汇率（billing 端点用） |
 | `--model-catalog-ttl` | `21600` | 云端模型表缓存有效期（秒） |
 | `--no-model-guard` | 关 | 关闭表外模型本地拦截 |
+| `--auto-trial [true/false]` | `false` | 启用国际 WorkBuddy 账号的一次性体验积分领取 |
+| `--max-images` | `16` | 单请求图片总数上限；`0` 不允许图片 |
+| `--image-policy` | `truncate` | `truncate` 保留最新图片；`error` 超限返回 413 |
+| `--max-request-bytes` | `33554432` | 图片处理与适配后发往上游的 JSON 上限（32 MiB，须为正整数） |
+| `--log-body-limit` | `65536` | 正文日志预览上限（64 KiB）；`0` 只记摘要 |
+
+指定函数的 `tool_choice` 会转换为仅提供该函数并设为 `required`，无效名称在本地拒绝。需要 JSON 响应时显式设置 `stream: false`，SSE 则设置 `stream: true`。
 
 环境变量：`CODEBUDDY_AUTH_DIR`（凭据目录）、`CODEBUDDY_IMPORT_DIR`（API 允许导入目录）、`CODEBUDDY2API_KEY`、`CODEBUDDY2API_LOG`。
 
-## Docker
+限额也可通过 `CODEBUDDY2API_MAX_IMAGES`、`CODEBUDDY2API_IMAGE_POLICY`、`CODEBUDDY2API_MAX_REQUEST_BYTES`、`CODEBUDDY2API_LOG_BODY_LIMIT` 配置；命令行参数优先，修改后重启生效。
 
-镜像：`ghcr.io/maiphucgiang/codebuddy2api:1.0.1`，支持 `linux/amd64` 和 `linux/arm64`。版本标签用于固定版本，`latest` 为稳定版，`edge` 跟随 `main`。
+在 `.env` 设置 `CODEBUDDY2API_AUTO_TRIAL=true` 可启用 `intl-work` 账号的一次性体验积分领取，默认关闭。成功或已领取后按账号持久化到 `auth/trial-ledger.json`，失败至少退避 24 小时，不立即重放 POST；资格及额度以上游为准，升级时保留该状态文件。
+
+### 图片与请求限制
+
+- Chat、Responses、Anthropic 请求均计入全部历史及工具结果中的图片，重复图片逐次计数；按消息与内容块数组顺序判断新旧，不依赖非标准时间戳。
+- 默认保留最新 16 张，只移除超额图片，保留文本和工具消息；图片清空的内容用文本占位。设置 `--image-policy error` 后超限返回 `413 / too_many_images`，不访问上游。
+- 图片处理后仍超过请求字节上限时返回 `413 / request_too_large`，不再截断文本；图片数量合规不保证单图大小或模型视觉能力符合上游限制。URL/base64 图片可转换，Responses 的 `file_id` 不支持。
+- 日志只记录有界预览，图片 base64 与常见认证字段会脱敏；日志不等于完整原始请求，仍应按私有数据保管。
+
+## Docker
 
 ### Docker Compose
 
+在仓库目录首次配置：复制模板为 `.env` 并修改；已有 `.env` 不要覆盖，补齐需要的字段即可。
+
 ```bash
-docker compose pull
+cp .env.example .env
+# 编辑 .env：密钥、监听地址、端口、凭据目录、图片策略等
+docker compose build
 docker compose up -d
 docker compose exec codebuddy2api python3 converter.py login --no-browser
 ```
 
-在自己的浏览器中打开终端里的链接扫码，等待终端提示“账号已保存”。国际站在登录命令末尾加 `--site intl`。
+模板默认构建当前源码，只监听 `127.0.0.1:8787`，图片上限 16 张、保留最新图片。需要外部访问时修改 `CODEBUDDY2API_BIND`，并先设置随机的 `CODEBUDDY2API_KEY`、限制网络访问。
 
-凭据与缓存持久化到 `./auth`，以读写方式挂载至 `/data/auth`。添加账号后默认在下次请求时自动加载，无需重启。可在环境变量或 `.env` 中设置 `CODEBUDDY2API_KEY` 启用鉴权。切换版本时，修改 `docker-compose.yml` 的 `image` 标签，重新拉取并启动即可，已有账号无需再次登录。
+Compose 自动读取 `.env` 中已声明的变量，Shell 环境优先；使用普通变量插值保留旧版兼容性。没有 `.env` 时仍使用 Compose 文件中的兼容默认值；新部署建议始终复制模板。
+
+在浏览器中打开登录链接扫码，等待终端确认已保存；国际站追加 `--site intl`。凭据目录由 `CODEBUDDY2API_AUTH_PATH` 指定，默认 `./auth`，挂载至 `/data/auth`；添加账号自动热加载。修改 `.env` 后执行 `docker compose up -d` 重建配置有变化的容器，无需重新登录。
+
+### 使用发布镜像
+
+将 `.env` 中 `CODEBUDDY2API_IMAGE` 改为 `ghcr.io/maiphucgiang/codebuddy2api:<版本>`，然后执行：
+
+```bash
+docker compose pull
+docker compose up -d --no-build
+```
+
+发布镜像支持 `linux/amd64` 和 `linux/arm64`；版本标签固定版本，`latest` 为稳定版，`edge` 跟随 `main`。镜像功能以所选版本为准，本地修改只有重新构建后生效。
 
 ### Docker CLI
 
-```bash
-docker run -d --name codebuddy2api -p 8787:8787 \
-  -v "$PWD/auth:/data/auth" \
-  -e CODEBUDDY_AUTH_DIR=/data/auth \
-  -e CODEBUDDY2API_KEY \
-  ghcr.io/maiphucgiang/codebuddy2api:1.0.1
+同样先准备 `.env`；以下命令使用本地源码及默认端口、目录：
 
+```bash
+docker build -t codebuddy2api:local .
+docker run -d --name codebuddy2api -p 127.0.0.1:8787:8787 \
+  --env-file .env -v "$PWD/auth:/data/auth" \
+  -e CODEBUDDY_AUTH_DIR=/data/auth codebuddy2api:local
 docker exec -it codebuddy2api python3 converter.py login --no-browser
 ```
 
-### 从源码构建
-
-```bash
-CODEBUDDY2API_IMAGE=codebuddy2api:local docker compose up -d --build --pull never
-```
-
-启动后使用上面的容器登录命令添加账号。使用 `docker run` 时，先执行 `docker build -t codebuddy2api:local .`，再将启动命令的镜像名换成 `codebuddy2api:local`。
-
 ## 模型列表
 
-运行时 `/v1/models` 以云端模型表为准（每 6 小时同步，缓存于 `auth/model-catalog.json`）；国际模型只在池内存在有额度的国际凭证时暴露。云端不可达时使用内置兜底表：
+以 `/cn/v1/models` 或 `/intl/v1/models` 为准。目录按账号/租户、地域、产品与客户端版本缓存于 `auth/model-catalog.json`，有效期 6 小时；新凭据触发同步。同步失败只保留相同账号的可信旧缓存，旧版未隔离的根模型表不用于授权路由。
 
-`hy4-preview`、`hy4-preview-x`、`hy3`、`hy3-x`、`deepseek-v4-pro`、`deepseek-v4-flash`、`deepseek-v4.1-flash`、`deepseek-v3-2-volc`、`glm-5.3`、`glm-5.3-flash`、`glm-5.2`、`glm-5.1`、`glm-5.0`、`glm-5.0-turbo`、`glm-5v-turbo`、`glm-4.7`、`glm-4.6`、`glm-4.6v`、`minimax-m3`、`minimax-m2.7`、`minimax-m2.5`、`kimi-k3-1`、`kimi-k2.7`、`kimi-k2.6`、`kimi-k2.5`、`kimi-k2-thinking`、`hunyuan-chat`、`default`、`auto`
+凭据的 domain / token issuer 决定产品 profile；聊天与 token 刷新使用固定入口，CLI / WorkBuddy 身份头各自生成：
 
-`auto` 为网关侧调度别名；模型可用性取决于你的账号权限。
+| Profile | 聊天 / 刷新入口 |
+|------|------|
+| `cn-cli` | `https://copilot.tencent.com` |
+| `cn-work` | `https://www.workbuddy.cn` |
+| `intl-cli` | `https://www.codebuddy.ai` |
+| `intl-work` | `https://www.workbuddy.ai` |
+
+仅选择同地域且自身产品目录支持目标模型的凭据；只有各产品已知目录重合的模型才可在产品间切换，不跨地域。国际凭据必须有已知的正额度。目录或凭据未就绪返回可重试的 503，明确不支持的模型返回 404。`auto` 是调度别名，不绕过上述约束。
 
 ## 常见问题
 
 - **本地 401**：启用了 `--api-key` 但客户端没带同一个 key。
 - **上游 401**：账号 token 失效，用无感登录重新添加账号。
 - **429**：额度/频率限制——网关会对该「凭证 × 模型」冷却并换绑其他凭证，详情请携带已配置的 API key 查询 `/admin/credentials`。
+- **网络错误**：只对建连失败自动退避重试一次；发送后断连、读写超时及 HTTP 错误不整单重放，避免重复计费。日志包含异常类型与耗时。
+- **工具参数损坏**：聚合校验失败最多重新生成 3 次，耗尽后返回错误而非损坏的调用；重新生成可能额外消耗额度。
+- **上游空流**：只有 `stop` / `[DONE]`、没有内容的流按错误处理，不作为成功的空回答。
 - **被内容审核拦截**：多为 agent runtime 文本触发，开 `--desensitize`，仍不稳再试 `--desensitize --no-compact`。
 - **响应慢**：换更快的模型，如 `deepseek-v4-flash`。
 - **同一账号多处使用**：从桌面端复制的凭据与桌面端各自刷新 token，滚动刷新场景可能互相顶掉；优先用无感登录账号，或让桌面端停用该账号。

@@ -91,7 +91,7 @@ def _convert_input_items(items: list) -> list[dict]:
     """
     messages: list[dict] = []
     # 临时缓存：合并相邻的 assistant message 和 function_call
-    pending_assistant_content: str | None = None
+    pending_assistant_content: str | list[dict] | None = None
     pending_tool_calls: list[dict] = []
 
     def _flush_assistant():
@@ -163,7 +163,8 @@ def _convert_input_items(items: list) -> list[dict]:
             messages.append({
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
-                "content": item.get("output", ""),
+                "content": (_extract_content(item["output"])
+                            if isinstance(item.get("output"), list) else item.get("output", "")),
             })
             continue
 
@@ -177,26 +178,45 @@ def _convert_input_items(items: list) -> list[dict]:
     return messages
 
 
-def _extract_content(content) -> str:
-    """提取 content（可能是 str / list[{type,text}]）。"""
+def _extract_content(content) -> str | list[dict]:
+    """转换协议内容块；含图片时保留多模态数组，不字符串化图片。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
+        has_image = False
         for p in content:
             if isinstance(p, dict):
-                if p.get("type") in ("input_text", "text"):
-                    parts.append(p.get("text", ""))
-                elif p.get("type") == "output_text":
-                    parts.append(p.get("text", ""))
+                kind = p.get("type")
+                if kind in ("input_text", "text", "output_text"):
+                    parts.append({"type": "text", "text": p.get("text", "")})
+                elif kind == "input_image":
+                    if p.get("file_id"):
+                        raise ValueError("Responses input_image file_id is not supported; provide image_url instead")
+                    url = p.get("image_url")
+                    if not isinstance(url, str) or not url:
+                        raise ValueError("Responses input_image requires a non-empty image_url")
+                    image_url = {"url": url}
+                    if "detail" in p:
+                        image_url["detail"] = p["detail"]
+                    parts.append({"type": "image_url", "image_url": image_url})
+                    has_image = True
+                elif kind == "image_url":
+                    parts.append(p)
+                    has_image = True
             elif isinstance(p, str):
-                parts.append(p)
-        return "".join(parts) or str(content)
+                parts.append({"type": "text", "text": p})
+        if has_image:
+            return parts
+        return "".join(part["text"] for part in parts) or str(content)
     return str(content)
 
 
-def _extract_output_text(content_parts: list) -> str:
-    """从 Responses output content parts 提取纯文本。"""
+def _extract_output_text(content_parts: list) -> str | list[dict]:
+    """保留历史消息图片；没有图片时沿用 output_text 提取行为。"""
+    if any(isinstance(part, dict) and part.get("type") in ("input_image", "image_url")
+           for part in content_parts):
+        return _extract_content(content_parts)
     texts = []
     for part in content_parts:
         if isinstance(part, dict) and part.get("type") == "output_text":
@@ -378,8 +398,8 @@ class ResponsesStreamConverter:
                     "output_index": 0, "summary_index": 0, "delta": reasoning
                 }))
 
-            # ---- content delta ----
-            content = delta.get("content")
+            # 当前适配器只发 output_text；拒绝说明也保留为合法文本，不丢弃原文。
+            content = (delta.get("content") or "") + (delta.get("refusal") or "")
             if content:
                 if not self._emitted_msg_item:
                     events.append(self._evt("response.output_item.added", {

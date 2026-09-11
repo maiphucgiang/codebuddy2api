@@ -1,14 +1,24 @@
+# 使用兼容旧版 Compose 的语法；.env 自动参与变量插值，Shell 环境优先。
+version: "3.8"
+
+
 services:
   codebuddy2api:
-    image: ${CODEBUDDY2API_IMAGE:-ghcr.io/maiphucgiang/codebuddy2api:1.0.1}
+    image: ${CODEBUDDY2API_IMAGE:-ghcr.io/maiphucgiang/codebuddy2api:1.1.0}
     build: .
     container_name: codebuddy2api
     ports:
-      - "8787:8787"
+      - "${CODEBUDDY2API_BIND:-0.0.0.0}:${CODEBUDDY2API_PORT:-8787}:8787"
     volumes:
-      - ./auth:/data/auth
+      - "${CODEBUDDY2API_AUTH_PATH:-./auth}:/data/auth"
     environment:
       CODEBUDDY2API_KEY: ${CODEBUDDY2API_KEY:-}
+      CODEBUDDY2API_MAX_IMAGES: ${CODEBUDDY2API_MAX_IMAGES:-16}
+      CODEBUDDY2API_IMAGE_POLICY: ${CODEBUDDY2API_IMAGE_POLICY:-truncate}
+      CODEBUDDY2API_MAX_REQUEST_BYTES: ${CODEBUDDY2API_MAX_REQUEST_BYTES:-33554432}
+      CODEBUDDY2API_LOG_BODY_LIMIT: ${CODEBUDDY2API_LOG_BODY_LIMIT:-65536}
+      CODEBUDDY2API_LOG: ${CODEBUDDY2API_LOG:-}
+      CODEBUDDY2API_AUTO_TRIAL: ${CODEBUDDY2API_AUTO_TRIAL:-false}
       CODEBUDDY_AUTH_DIR: /data/auth
     command: >
       python3 converter.py

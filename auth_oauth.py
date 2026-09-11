@@ -21,6 +21,8 @@ import uuid
 
 import httpx
 
+from site_routing import profile_for_auth
+
 PLUGIN_PREFIX = "/v2/plugin"
 OAUTH_TIMEOUT_S = 600          # 授权等待超时秒数
 RESULT_RETENTION_S = 300       # 完成状态保留，供调用方重复轮询取结果
@@ -78,13 +80,17 @@ def validate_cred_data(data) -> tuple[str | None, str | None]:
     if not uid:
         return None, "缺少 account.uid"
     auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
-    token = str(auth.get("accessToken") or auth.get("access_token") or auth.get("token") or "")
-    if not token:
-        return None, "缺少 accessToken"
+    token = auth.get("accessToken") or auth.get("access_token") or auth.get("token")
+    if not isinstance(token, str) or not token:
+        return None, "缺少有效的 accessToken"
     domain = _normalize_origin(auth.get("domain") or auth.get("issuer") or "")
     issuer = _token_issuer_origin(token)
     if not any(o in ALLOWED_ORIGINS for o in (domain, issuer) if o):
         return None, f"认证域名不在允许列表（domain={domain or '-'} issuer={issuer or '-'}）"
+    try:
+        profile_for_auth({**auth, "accessToken": token, "domain": auth.get("domain") or auth.get("issuer")})
+    except ValueError:
+        return None, "凭据的地域或产品信息无效、不一致"
     return uid, None
 
 

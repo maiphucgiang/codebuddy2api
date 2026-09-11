@@ -4,11 +4,13 @@
 HTTP 流程（官方 Web 端接口，Bearer 鉴权）：
   签到  POST {host}/billing/meter/daily-checkin（兜底 /v2/...）
   积分  POST {host}/v2/billing/meter/get-user-resource
-接口域名按 access token 的 JWT issuer 映射，解析失败时按国内双 host 兜底。
+财务域名按 site_routing 的凭据身份解析选择固定品牌 host，不跨产品或地域兜底。
 """
 
 import base64
+from copy import deepcopy
 import json
+import math
 import os
 import re
 import threading
@@ -17,17 +19,20 @@ from pathlib import Path
 
 import httpx
 
+from client_profiles import catalog_headers
+from site_routing import PROFILE_ENDPOINTS, profile_for_auth, profile_product
+
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 REQUEST_TIMEOUT = 12.0
 
-ISSUER_HOST_MAP = {
-    "https://www.workbuddy.ai": "https://www.workbuddy.ai",
-    "https://www.workbuddy.cn": "https://www.workbuddy.cn",
-    "https://www.codebuddy.cn": "https://www.codebuddy.cn",
-    "https://www.codebuddy.ai": "https://www.codebuddy.ai",
+# 财务使用官方 Web 品牌站；国内 CLI 的 chat/config 入口 copilot 不适用于此处。
+BILLING_PROFILE_HOSTS = {
+    "cn-cli": "https://www.codebuddy.cn",
+    "cn-work": "https://www.workbuddy.cn",
+    "intl-cli": "https://www.codebuddy.ai",
+    "intl-work": "https://www.workbuddy.ai",
 }
-DEFAULT_HOSTS = ["https://www.codebuddy.cn", "https://www.workbuddy.cn"]
 CHECKIN_PATHS = ("/billing/meter/daily-checkin", "/v2/billing/meter/daily-checkin")
 RESOURCE_PATH = "/v2/billing/meter/get-user-resource"
 CONFIG_PATH = "/v3/config"  # cbc CLI CloudProductProvider 同源：云端模型表
@@ -58,14 +63,14 @@ def token_issuer_origin(access_token: str) -> str | None:
         return None
 
 
-def hosts_for_token(access_token: str) -> list[str]:
-    """按 token issuer 选接口域名；未识别时国内双 host 兜底。"""
-    host = ISSUER_HOST_MAP.get(token_issuer_origin(access_token) or "")
-    return [host] if host else list(DEFAULT_HOSTS)
+def hosts_for_token(access_token: str, domain: str = "") -> list[str]:
+    """复用凭据身份解析，仅返回同 profile 财务 host；未知或冲突提示直接拒绝。"""
+    profile = profile_for_auth({"accessToken": access_token, "domain": domain})
+    return [BILLING_PROFILE_HOSTS[profile]]
 
 
 def _web_headers(api_host: str, access_token: str, uid: str = "", domain: str = "") -> dict:
-    """与官方 Web 端一致的请求头。"""
+    """财务端点保留官方 Web 协议，不套用模型目录的 CLI/WorkBuddy 身份头。"""
     return {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
@@ -109,8 +114,8 @@ def classify_checkin_result(http_ok: bool, code, message: str) -> dict:
 
 
 def daily_checkin(access_token: str, uid: str = "", domain: str = "") -> dict:
-    """多 host × 多 path 兜底签到；返回 classify 结果 + status/url。全部失败返回 ok=False。"""
-    endpoints = [h + p for h in hosts_for_token(access_token) for p in CHECKIN_PATHS]
+    """仅在同 profile host 内切换签到 path；返回 classify 结果 + status/url。"""
+    endpoints = [h + p for h in hosts_for_token(access_token, domain) for p in CHECKIN_PATHS]
     last_err = "未知错误"
     first_401: dict | None = None
     with httpx.Client() as client:
@@ -284,7 +289,7 @@ def _resource_body() -> dict:
 
 def fetch_credits(access_token: str, uid: str = "", domain: str = "") -> dict:
     """查询剩余积分：{credits, count, segments, soonest_expiry}。空结果重试，401 抛 AuthExpiredError。"""
-    host = hosts_for_token(access_token)[0]
+    host = hosts_for_token(access_token, domain)[0]
     url = host + RESOURCE_PATH
     headers = _web_headers(host, access_token, uid, domain)
     last_err: Exception | None = None
@@ -320,38 +325,119 @@ def fetch_credits(access_token: str, uid: str = "", domain: str = "") -> dict:
 
 
 
-def fetch_model_catalog(access_token: str, user_agent: str = "") -> list[dict]:
-    """GET {host}/v3/config 拉云端模型表（cbc CLI CloudProductProvider 同源）。
+def select_product_models(data: dict, product: str = "cli") -> list[dict]:
+    """按产品对话 agent 解析模型；未声明名单兼容根表，显式空可用表不兜底。"""
+    if product not in ("cli", "workbuddy"):
+        raise ValueError("未知模型目录产品")
+    def invalid(field: str):
+        raise ValueError(f"模型配置格式错误: {field}")
 
-    必须 x-client-platform: cli（否则 400）；只接受 GET（POST 404）。
-    返回 [{id, name, credits, supportsToolCall, ...}]；失败抛异常。"""
-    last_err: Exception | None = None
-    for host in hosts_for_token(access_token):
-        headers = {"accept": "application/json", "authorization": f"Bearer {access_token}",
-                   "x-client-platform": "cli"}
-        if user_agent:
-            headers["user-agent"] = user_agent
-        try:
-            with httpx.Client() as client:
-                r = client.get(host + CONFIG_PATH, headers=headers, timeout=REQUEST_TIMEOUT)
-        except httpx.HTTPError as e:
-            last_err = e
-            continue
-        if r.status_code == 401:
-            raise AuthExpiredError("登录身份过期")
-        if r.status_code != 200:
-            last_err = RuntimeError(f"模型配置接口 HTTP {r.status_code}")
-            continue
-        try:
-            payload = r.json()
-        except Exception:
-            last_err = RuntimeError("模型配置接口返回无法解析")
-            continue
-        if payload.get("code") != 0:
-            raise RuntimeError(str(payload.get("msg") or f"模型配置接口 code={payload.get('code')}"))
-        models = (payload.get("data") or {}).get("models") or []
-        return [m for m in models if isinstance(m, dict) and m.get("id")]
-    raise RuntimeError(f"模型配置拉取失败: {last_err}")
+    def text(value) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        invalid("data.models")
+    models = data["models"]
+    by_id: dict = {}
+    by_name: dict = {}
+    by_alias: dict = {}
+    for model in models:
+        if not isinstance(model, dict) or not text(model.get("id")):
+            invalid("data.models.id")
+        if "name" in model and not text(model["name"]):
+            invalid("data.models.name")
+        aliases = model.get("aliases", [])
+        if not isinstance(aliases, list) or not all(text(a) for a in aliases):
+            invalid("data.models.aliases")
+        if model["id"] in by_id:
+            invalid("data.models.id duplicate")
+        by_id[model["id"]] = model
+        if "name" in model:
+            by_name.setdefault(model["name"], model)
+        for alias in aliases:
+            by_alias.setdefault(alias, model)
+
+    available = data.get("availableModels")
+    if available is not None and (not isinstance(available, list) or not all(text(value) for value in available)):
+        invalid("data.availableModels")
+
+    # WorkBuddy 5.5.2 AvailableModelsFilterProvider：空 availableModels 表示不附加过滤。
+    def finish(items):
+        return deepcopy([model for model in items if not model.get("disabled")
+                         and (not available or model["id"] in available)])
+
+    cli = None
+    if "agents" in data:
+        if not isinstance(data["agents"], list):
+            invalid("data.agents")
+        for agent in data["agents"]:
+            if not isinstance(agent, dict) or not text(agent.get("name")):
+                invalid("data.agents.name")
+            tags = agent.get("tags")
+            if tags is not None and (not isinstance(tags, list) or not all(text(tag) for tag in tags)):
+                invalid("data.agents.tags")
+            if agent["name"] == "cli":
+                if cli is not None:
+                    invalid("data.agents.cli duplicate")
+                cli = agent
+    if product == "workbuddy" and isinstance(data.get("agents"), list):
+        default = next((agent for agent in data["agents"] if "default" in (agent.get("tags") or [])), None)
+        fallback = next((agent for agent in data["agents"] if isinstance(agent.get("models"), list) and agent["models"]), None)
+        cli = default or cli or fallback
+    if cli is None or "models" not in cli:
+        return finish(models)
+    if not isinstance(cli["models"], list):
+        invalid("data.agents.cli.models")
+
+    selected = []
+    seen = set()
+    for reference in cli["models"]:
+        if text(reference):
+            keys = [reference]
+        elif isinstance(reference, dict):
+            keys = [reference[k] for k in ("id", "name") if k in reference]
+            if not keys or not all(text(k) for k in keys):
+                invalid("data.agents.cli.models reference")
+        else:
+            invalid("data.agents.cli.models reference")
+        model = next((index[key] for index in (by_id, by_name, by_alias)
+                      for key in keys if key in index), None)
+        if model is not None and model["id"] not in seen:
+            selected.append(model)
+            seen.add(model["id"])
+    if cli["models"] and not selected:
+        invalid("data.agents.cli.models unresolved")
+    return finish(selected)
+
+
+def select_cli_models(data: dict) -> list[dict]:
+    return select_product_models(data, "cli")
+
+
+def fetch_model_catalog(access_token: str, user_agent: str = "", *, domain: str = "",
+                        uid: str = "", enterprise_id: str = "") -> list[dict]:
+    """按凭据产品使用专属入口和目录请求头，不混用 CLI/WorkBuddy 视图。"""
+    auth = {"accessToken": access_token, "domain": domain}
+    profile = profile_for_auth(auth)
+    headers = catalog_headers(auth, {"uid": uid, "enterpriseId": enterprise_id}, user_agent=user_agent)
+    try:
+        with httpx.Client() as client:
+            response = client.get(PROFILE_ENDPOINTS[profile] + CONFIG_PATH, headers=headers, timeout=REQUEST_TIMEOUT)
+    except httpx.HTTPError:
+        raise RuntimeError("模型配置接口网络错误") from None
+    if response.status_code == 401:
+        raise AuthExpiredError("登录身份过期")
+    if response.status_code != 200:
+        raise RuntimeError(f"模型配置接口 HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError:
+        raise ValueError("模型配置接口返回无法解析") from None
+    if not isinstance(payload, dict):
+        raise ValueError("模型配置格式错误: response")
+    if payload.get("code") != 0:
+        raise RuntimeError("模型配置接口返回非成功状态")
+    return select_product_models(payload.get("data"), profile_product(profile))
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +508,7 @@ def fetch_request_usage(access_token: str, days: int = USAGE_MAX_DAYS,
     返回 {by_day: {'YYYY-MM-DD': {model: credits}}, total_credits, requests}。
     跨度超 31 天官方会静默返回空，故 days 强制夹到 USAGE_MAX_DAYS。"""
     days = max(1, min(int(days or USAGE_MAX_DAYS), USAGE_MAX_DAYS))
-    host = hosts_for_token(access_token)[0]
+    host = hosts_for_token(access_token, domain)[0]
     url = host + USAGE_PATH
     headers = _web_headers(host, access_token, uid, domain)
     fmt = "%Y-%m-%d %H:%M:%S"
@@ -489,6 +575,27 @@ class CreditLedger:
     def _entry(self, cred_id: str) -> dict:
         return self._data["creds"].setdefault(cred_id, {"checkin": {}, "credits": {}, "error": None})
 
+    def entry(self, cred_id: str) -> dict:
+        """单凭证快照；未知凭证返回空字典且不创建条目。"""
+        with self._lock:
+            return deepcopy(self._data["creds"].get(cred_id) or {})
+
+    def bind_identity(self, cred_id: str, identity: str) -> bool:
+        """路径只作索引；未知或不同账号的旧余额不得转移给新身份。"""
+        with self._lock:
+            entry = self._data["creds"].get(cred_id) or {}
+            if entry.get("identity") == identity:
+                return False
+            self._data["creds"][cred_id] = {"identity": identity, "checkin": {}, "credits": {}, "error": None}
+            self._save()
+            return True
+
+    def remove(self, cred_id: str):
+        """凭证身份/站点替换时删除旧积分、签到与错误状态，幂等持久化。"""
+        with self._lock:
+            self._data["creds"].pop(cred_id, None)
+            self._save()
+
     # ---- 签到 ----
 
     def checkin_done(self, cred_id: str, day: str) -> bool:
@@ -512,7 +619,7 @@ class CreditLedger:
             e["credits"] = {
                 "credits": result.get("credits"),
                 "count": result.get("count", 0),
-                "segments": result.get("segments") or [],
+                "segments": deepcopy(result.get("segments") or []),
                 "soonest_expiry": result.get("soonest_expiry"),
                 "fetched_at": time.time(),
                 "intl": bool(result.get("intl")),  # 站点归属：国内/国际积分与单价均独立
@@ -538,22 +645,41 @@ class CreditLedger:
 class ModelCatalogCache:
     """云端模型表按站点分组持久化缓存，TTL 内不重复拉取。
 
-    启动即加载缓存对外可用（不必等首轮同步）；仅 TTL 过期才打 /v3/config。"""
+    v1 根模型表保留供降级，但不视为 fresh；各组成功刷新后才升级 CLI 语义。
+    空目录同样缓存。每组版本独立，避免刷新一站后另一站旧数据误判 fresh。"""
+
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: Path, ttl: float = 6 * 3600):
         self.path = Path(path)
         self.ttl = max(60.0, float(ttl or 0))
         self._lock = threading.Lock()
-        self._data: dict = {"version": 1, "groups": {}}
+        self._data: dict = {"version": self.SCHEMA_VERSION, "groups": {}}
         self._load()
 
     def _load(self):
-        try:
-            d = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(d.get("groups"), dict):
-                self._data = d
-        except Exception:
-            self._data = {"version": 1, "groups": {}}
+        with self._lock:
+            try:
+                d = json.loads(self.path.read_text(encoding="utf-8"))
+                if (not isinstance(d, dict) or d.get("version") not in (1, self.SCHEMA_VERSION)
+                        or not isinstance(d.get("groups"), dict)):
+                    return
+                groups = {}
+                for group, entry in d["groups"].items():
+                    if (not isinstance(entry, dict) or not isinstance(entry.get("models"), list)
+                            or not all(isinstance(m, dict) for m in entry["models"])):
+                        continue
+                    ts = entry.get("fetched_at", 0)
+                    if not isinstance(ts, (int, float)) or not math.isfinite(ts):
+                        ts = 0
+                    groups[group] = {"models": entry["models"], "fetched_at": ts,
+                                     "version": (self.SCHEMA_VERSION
+                                                 if d["version"] == self.SCHEMA_VERSION
+                                                 and entry.get("version") == self.SCHEMA_VERSION
+                                                 else 1)}
+                self._data = {"version": self.SCHEMA_VERSION, "groups": groups}
+            except (OSError, ValueError):
+                pass  # 无法读取时不清除已载入的目录。
 
     def _save(self):
         try:
@@ -576,19 +702,20 @@ class ModelCatalogCache:
         with self._lock:
             g = self._data["groups"].get(group) or {}
             age = time.time() - float(g.get("fetched_at") or 0)
-            return bool(g.get("models")) and age < self.ttl
+            return g.get("version") == self.SCHEMA_VERSION and 0 <= age < self.ttl
 
     def models(self, group: str) -> list[dict]:
         with self._lock:
-            return list((self._data["groups"].get(group) or {}).get("models") or [])
+            return deepcopy((self._data["groups"].get(group) or {}).get("models") or [])
 
     def age(self, group: str) -> float | None:
-        """缓存年龄秒数；无缓存返回 None。"""
+        """缓存年龄秒数（包括空目录）；仅未知组返回 None。"""
         with self._lock:
-            ts = (self._data["groups"].get(group) or {}).get("fetched_at")
-            return (time.time() - float(ts)) if ts else None
+            g = self._data["groups"].get(group)
+            return time.time() - float(g.get("fetched_at") or 0) if g is not None else None
 
     def put(self, group: str, models: list[dict]):
         with self._lock:
-            self._data["groups"][group] = {"models": models, "fetched_at": time.time()}
+            self._data["groups"][group] = {"models": deepcopy(models), "fetched_at": time.time(),
+                                           "version": self.SCHEMA_VERSION}
             self._save()

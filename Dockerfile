@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY VERSION ./
 COPY converter.py responses_adapter.py responses_projection.py anthropic_adapter.py desensitize.py credits.py auth_oauth.py credential_io.py ./
+COPY request_limits.py safe_logging.py upstream_io.py client_profiles.py site_routing.py trial_rewards.py ./
 
 EXPOSE 8787
 

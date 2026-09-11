@@ -79,7 +79,8 @@ class LoginTests(unittest.TestCase):
         self.assertEqual(auth_oauth.validate_cred_data(credential), ("u1", None))
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
-        self.assertEqual(pool.pick(None).summary()["uid"], "u1")
+        self.assertIsNone(pool.pick(None))  # 默认国内，不借用刚登录的国际凭据。
+        self.assertEqual(pool.pick(None, region="intl").summary()["uid"], "u1")
         self.assertIn("账号已保存", self.stdout.getvalue())
         self.assert_no_tokens_printed()
 
@@ -139,7 +140,10 @@ class LoginTests(unittest.TestCase):
             self.assertEqual(converter.login(open_browser=False), 1)
         self.assertNotIn("账号已保存", self.stdout.getvalue())
         self.assertIn("无法保存凭据", self.stderr.getvalue())
-        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertEqual(list(self.directory.glob("*.info")), [])
+        for path in self.directory.iterdir():
+            self.assertTrue(path.name.endswith(".lock"))
+            self.assertIn(path.read_bytes(), (b"", b"\0"))
         self.assert_no_tokens_printed()
 
     def test_admin_poll_still_saves_and_loads_into_pool(self):

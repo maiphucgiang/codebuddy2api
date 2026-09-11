@@ -83,7 +83,13 @@ def anthropic_request_to_chat(body: dict) -> dict:
     if "tool_choice" in body:
         tc = body["tool_choice"]
         if isinstance(tc, dict):
-            chat["tool_choice"] = {"type": tc.get("type", "any"), "function": {"name": tc.get("name", "")}}
+            kind = tc.get("type")
+            if kind == "tool":
+                chat["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+            elif kind in ("auto", "none", "any"):
+                chat["tool_choice"] = "required" if kind == "any" else kind
+            else:
+                raise ValueError("unsupported tool_choice type")
         elif isinstance(tc, str):
             chat["tool_choice"] = tc if tc in ("none", "auto", "required") else {"type": "function", "function": {"name": tc}}
 
@@ -127,37 +133,33 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 检查是否包含 tool_result（role=user 时）
     if role == "user":
         result: list[dict] = []
-        text_parts: list[str] = []
+        user_blocks: list[dict] = []
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
-            if bt == "text":
-                text_parts.append(block.get("text", ""))
+            if bt in ("text", "image"):
+                user_blocks.append(block)
             elif bt == "tool_result":
                 # tool_result → 独立的 tool 消息
                 tc_id = block.get("tool_use_id", "")
                 output = block.get("content", "")
                 if isinstance(output, list):
-                    output = "".join(
-                        b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
-                    )
+                    output = _convert_content_blocks(output)
                 result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
-        if text_parts:
-            result.insert(0, {"role": "user", "content": "".join(text_parts)})
+        if user_blocks:
+            result.insert(0, {"role": "user", "content": _convert_content_blocks(user_blocks)})
         return result
 
     # assistant 角色
     if role == "assistant":
-        text_parts: list[str] = []
+        content_out = _convert_content_blocks(blocks)
         tool_calls: list[dict] = []
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
-            if bt == "text":
-                text_parts.append(block.get("text", ""))
-            elif bt == "tool_use":
+            if bt == "tool_use":
                 tc = {
                     "id": block.get("id", _rand_id("call_")),
                     "type": "function",
@@ -168,26 +170,45 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                 }
                 tool_calls.append(tc)
         msg_out: dict[str, Any] = {"role": "assistant"}
-        if text_parts:
-            msg_out["content"] = "".join(text_parts)
-        else:
-            msg_out["content"] = None
+        has_text = any(isinstance(block, dict) and block.get("type") == "text" for block in blocks)
+        msg_out["content"] = content_out if content_out or has_text else None
         if tool_calls:
             msg_out["tool_calls"] = tool_calls
         return [msg_out]
 
-    # 其他角色：尝试提取文本
-    text = _extract_blocks_text(blocks)
-    return [{"role": role, "content": text}] if text else []
+    content_out = _convert_content_blocks(blocks)
+    return [{"role": role, "content": content_out}] if content_out else []
 
 
-def _extract_blocks_text(blocks: list) -> str:
-    """从 content blocks 中提取所有 text 块合并为字符串。"""
+def _convert_content_blocks(blocks: list) -> str | list[dict]:
+    """保留图片与文本顺序；纯文本仍使用原来的字符串表示。"""
     parts = []
+    has_image = False
     for block in blocks:
-        if isinstance(block, dict) and block.get("type") == "text":
-            parts.append(block.get("text", ""))
-    return "".join(parts)
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image":
+            source = block.get("source")
+            if not isinstance(source, dict):
+                raise ValueError("Anthropic image requires a URL or base64 source")
+            if source.get("type") == "url":
+                url = source.get("url")
+                if not isinstance(url, str) or not url:
+                    raise ValueError("Anthropic image URL source requires a non-empty url")
+            elif source.get("type") == "base64":
+                media_type = source.get("media_type")
+                data = source.get("data")
+                if (not isinstance(media_type, str) or not media_type.startswith("image/")
+                        or not isinstance(data, str) or not data):
+                    raise ValueError("Anthropic base64 image requires image media_type and data")
+                url = f"data:{media_type};base64,{data}"
+            else:
+                raise ValueError("Unsupported Anthropic image source; only URL and base64 are supported")
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+            has_image = True
+    return parts if has_image else "".join(part["text"] for part in parts)
 
 
 def _convert_anthropic_tools(tools: list) -> list:
@@ -389,8 +410,8 @@ class AnthropicStreamConverter:
                     "delta": {"type": "thinking_delta", "thinking": thinking},
                 }))
 
-            # content delta
-            content = delta.get("content")
+            # Anthropic 没有 refusal 文本块；使用 text 保留原始拒绝说明。
+            content = (delta.get("content") or "") + (delta.get("refusal") or "")
             if content:
                 # 正文开始时关闭 thinking 块（thinking 必须位于正文之前）
                 if self._thinking_block_open:

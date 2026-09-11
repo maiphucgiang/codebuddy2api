@@ -10,6 +10,10 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import TestCase
+from unittest.mock import MagicMock, patch
+
+import httpx
 
 sys.path.insert(0, ".")
 
@@ -37,8 +41,112 @@ def test_issuer_origin():
 def test_hosts_for_token():
     assert hosts_for_token(_jwt("https://www.codebuddy.cn/auth/realms/copilot")) == ["https://www.codebuddy.cn"]
     assert hosts_for_token(_jwt("https://www.workbuddy.ai/auth/realms/copilot")) == ["https://www.workbuddy.ai"]
-    assert hosts_for_token("bad") == credits.DEFAULT_HOSTS  # 未识别 → 国内双 host 兜底
+    # 无显式提示时与 site_routing 一致，仅默认国内 CLI，绝不再遍历另一产品。
+    assert hosts_for_token("bad") == ["https://www.codebuddy.cn"]
+    for brand in ("codebuddy", "workbuddy"):
+        for suffix in ("cn", "ai"):
+            domain = f"www.{brand}.{suffix}"
+            expected = [f"https://{domain}"]
+            assert hosts_for_token(_jwt(f"https://{domain}/auth/realms/copilot")) == expected
+            assert hosts_for_token("opaque", domain) == expected
+            assert hosts_for_token("opaque", f"https://{domain}/") == expected
+            assert hosts_for_token(_jwt(f"https://{domain}/x"), domain) == expected
+    assert hosts_for_token("opaque", "copilot.tencent.com") == ["https://www.codebuddy.cn"]
+    assert hosts_for_token(_jwt("https://copilot.tencent.com/x"), "www.workbuddy.cn") == [
+        "https://www.workbuddy.cn"]
+    assert hosts_for_token(_jwt("https://www.workbuddy.cn/x"), "copilot.tencent.com") == [
+        "https://www.workbuddy.cn"]
     print("✅ test_hosts_for_token")
+
+
+def test_financial_hints_rejected_before_network():
+    """显式未知/不安全提示与跨地域、跨产品冲突均在建立 Client 前拒绝。"""
+    invalid = [
+        ("opaque", "unknown.example"),
+        ("opaque", "http://www.codebuddy.cn"),
+        ("opaque", "https://www.codebuddy.ai:443"),
+        ("opaque", "https://www.workbuddy.ai/other"),
+        (_jwt("https://unknown.example/x"), ""),
+        (_jwt("https://unknown.example/x"), "www.workbuddy.ai"),
+        (_jwt("https://www.codebuddy.cn/x"), "www.workbuddy.cn"),
+        (_jwt("https://www.workbuddy.ai/x"), "www.codebuddy.ai"),
+        (_jwt("https://www.workbuddy.ai/x"), "www.workbuddy.cn"),
+        (_jwt("https://www.codebuddy.ai/x"), "copilot.tencent.com"),
+    ]
+    with patch("credits.httpx.Client") as factory:
+        for token, domain in invalid:
+            for operation in (hosts_for_token, credits.daily_checkin, credits.fetch_credits,
+                              credits.fetch_request_usage):
+                with TestCase().assertRaises(ValueError):
+                    operation(token, domain=domain)
+        factory.assert_not_called()
+    # 对外纯解析函数保留宽松解析兼容性，不把它当作受信任路由。
+    assert token_issuer_origin(_jwt("https://unknown.example/x")) == "https://unknown.example"
+    print("test_financial_hints_rejected_before_network passed")
+
+
+def test_financial_profile_hosts_and_web_headers():
+    """三类财务请求传递 domain，使用各自品牌 Web 协议而非目录 CLI 身份头。"""
+    for domain in ("www.codebuddy.cn", "copilot.tencent.com", "www.workbuddy.cn",
+                   "www.codebuddy.ai", "www.workbuddy.ai"):
+        host = "https://" + ("www.codebuddy.cn" if domain == "copilot.tencent.com" else domain)
+        for operation, path in ((credits.daily_checkin, credits.CHECKIN_PATHS[0]),
+                                (credits.fetch_credits, credits.RESOURCE_PATH),
+                                (credits.fetch_request_usage, credits.USAGE_PATH)):
+            client = MagicMock()
+            client.post.return_value.status_code = 200
+            client.post.return_value.json.return_value = {"code": 0, "data": {
+                "Accounts": [{"CapacityRemain": 3}], "data": [], "total": 0}}
+            with patch("credits.httpx.Client") as factory:
+                factory.return_value.__enter__.return_value = client
+                result = operation("opaque", uid="test-user", domain=domain)
+            client.post.assert_called_once()
+            args, kwargs = client.post.call_args
+            assert args == (host + path,)
+            headers = httpx.Headers(kwargs["headers"])
+            assert headers["x-client-platform"] == "web"
+            assert headers["origin"] == host
+            assert headers["referer"] == host + "/profile/plans-usage"
+            assert headers["authorization"] == "Bearer opaque"
+            assert headers["x-user-id"] == "test-user" and headers["x-domain"] == domain
+            assert headers["user-agent"] == credits.BROWSER_UA
+            assert headers["content-type"] == "application/json"
+            assert "x-ide-type" not in headers
+            assert kwargs["timeout"] == credits.REQUEST_TIMEOUT
+            if operation is credits.fetch_credits:
+                assert result["credits"] == 3 and result["intl"] == domain.endswith(".ai")
+    print("test_financial_profile_hosts_and_web_headers passed")
+
+
+def test_financial_failures_stay_on_profile():
+    """保留原 POST 尝试次数/同 host 签到路径，失败也不转发 token 到其他产品。"""
+    for domain in ("", "www.codebuddy.cn", "www.workbuddy.cn", "www.codebuddy.ai", "www.workbuddy.ai"):
+        host = "https://" + (domain or "www.codebuddy.cn")
+        for failure in (404, 401, "network"):
+            for operation, paths in (
+                    (credits.daily_checkin, list(credits.CHECKIN_PATHS)),
+                    (credits.fetch_credits, [credits.RESOURCE_PATH] * (1 if failure == 401 else 3)),
+                    (credits.fetch_request_usage, [credits.USAGE_PATH])):
+                client = MagicMock()
+                client.post.return_value.status_code = failure if isinstance(failure, int) else 500
+                client.post.return_value.json.return_value = {}
+                if failure == "network":
+                    client.post.side_effect = httpx.ConnectError("mock connection failure")
+                with patch("credits.httpx.Client") as factory, patch("credits.time.sleep"):
+                    factory.return_value.__enter__.return_value = client
+                    if operation is credits.daily_checkin:
+                        result = operation("opaque", domain=domain)
+                        assert result["ok"] is False
+                        if failure == 401:
+                            assert result["code"] == 401
+                    else:
+                        expected_error = (AuthExpiredError if failure == 401 else
+                                          httpx.HTTPError if failure == "network" and operation is credits.fetch_request_usage
+                                          else RuntimeError)
+                        with TestCase().assertRaises(expected_error):
+                            operation("opaque", domain=domain)
+                assert [call.args[0] for call in client.post.call_args_list] == [host + path for path in paths]
+    print("test_financial_failures_stay_on_profile passed")
 
 
 def test_classify_checkin():
@@ -134,6 +242,67 @@ def test_ledger(tmp_path=None):
     print("✅ test_ledger")
 
 
+def test_ledger_remove_and_entry():
+    """同路径换账号/站点时彻底清旧状态；快照不泄露内部引用。"""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "ledger.json"
+        ledger = CreditLedger(path)
+        assert ledger.entry("missing") == {}
+        assert ledger.snapshot() == {}  # 只读 entry 不创建条目
+        result = {"credits": 10, "intl": False, "segments": [
+            {"remaining": 10, "total": 10, "expires_at": time.time() + 3600}]}
+        ledger.update_credits("same-path", result)
+        ledger.mark_checkin("same-path", "2026-01-01", True, 0, "ok")
+        ledger.note_error("same-path", "old-account-error")
+        ledger.update_credits("other", {"credits": 20, "intl": True})
+        other = ledger.entry("other")
+        result["segments"][0]["remaining"] = 999
+        entry = ledger.entry("same-path")
+        assert entry["credits"]["segments"][0]["remaining"] == 10
+        entry["credits"]["segments"][0]["remaining"] = 888
+        entry["checkin"]["ok"] = False
+        assert ledger.entry("same-path")["credits"]["segments"][0]["remaining"] == 10
+        assert ledger.checkin_done("same-path", "2026-01-01")
+        ledger.remove("same-path")
+        ledger.remove("missing")  # 幂等且不创建幽灵条目
+        assert ledger.entry("same-path") == {}
+        assert ledger.soonest_expiry_of("same-path") is None
+        reloaded = CreditLedger(path)
+        assert reloaded.snapshot() == {"other": other}
+        reloaded.update_credits("same-path", {"credits": 3, "intl": True})
+        replacement = reloaded.entry("same-path")
+        assert replacement["credits"]["intl"] is True
+        assert replacement["credits"]["credits"] == 3
+        assert replacement["checkin"] == {} and replacement["error"] is None
+        assert not reloaded.checkin_done("same-path", "2026-01-01")
+    print("test_ledger_remove_and_entry passed")
+
+
+def test_ledger_threaded_entries():
+    """不同凭证并发更新/删除与深拷贝读取仍可持久化。"""
+    from concurrent.futures import ThreadPoolExecutor
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "ledger.json"
+        ledger = CreditLedger(path)
+
+        def update(cred_id):
+            for i in range(10):
+                ledger.update_credits(cred_id, {"credits": i, "segments": [{"remaining": i}]})
+                snap = ledger.entry(cred_id)
+                snap["credits"]["segments"][0]["remaining"] = -1
+                assert ledger.entry(cred_id)["credits"]["segments"][0]["remaining"] == i
+                ledger.remove(cred_id)
+                assert ledger.entry(cred_id) == {}
+            ledger.update_credits(cred_id, {"credits": 10})
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(update, ["domestic", "international"]))
+        restored = CreditLedger(path).snapshot()
+        assert set(restored) == {"domestic", "international"}
+        assert all(e["credits"]["credits"] == 10 for e in restored.values())
+    print("test_ledger_threaded_entries passed")
+
+
 def test_daily_checkin_http(monkey_response=None):
     """mock httpx：首 host 404 换 path 后 code=0 成功。"""
     calls = []
@@ -163,8 +332,7 @@ def test_daily_checkin_http(monkey_response=None):
     finally:
         credits.httpx.Client = orig
     assert r["ok"] is True, r
-    assert calls[0].endswith("/billing/meter/daily-checkin")
-    assert calls[1].endswith("/v2/billing/meter/daily-checkin")  # 404 后换 v2 path
+    assert calls == ["https://www.codebuddy.cn" + path for path in credits.CHECKIN_PATHS]  # 只换 path
     print("✅ test_daily_checkin_http")
 
 
@@ -276,29 +444,27 @@ def test_fetch_model_catalog():
         credits.httpx.Client = orig
     assert [m["id"] for m in models] == ["glm-9.9", "img-1"]
     assert seen_headers.get("x-client-platform") == "cli"  # 必须 cli,否则 400
-    assert seen_headers.get("user-agent") == "CLI/9.9"
+    assert httpx.Headers(seen_headers)["user-agent"] == "CLI/9.9"
     print("✅ test_fetch_model_catalog")
 
 
 def test_current_models_merge():
-    """云端表优先(过滤非对话模型),auto 调度别名保留,无云端数据回退默认表;-free 别名已移除。"""
+    """已知目录不补静态模型，明确空表不回退；仅旧式国内 CLI 未知目录保留默认表。"""
     import converter
-    saved = converter.CONFIG.get("models_remote")
-    try:
-        converter.CONFIG["models_remote"] = [
+    with patch.dict(converter.CONFIG, {"cred_pool": None, "cred": None, "model_catalogs": {},
+                                       "models_intl": None, "models_remote": [
             {"id": "glm-9.9", "supportsToolCall": True},
-            {"id": "hunyuan-image", "supportsToolCall": False},  # 图像模型不进表
-        ]
+            {"id": "hunyuan-image", "supportsToolCall": False},
+        ]}):
         out = converter.current_models()
-        assert out[0] == "glm-9.9" and "hunyuan-image" not in out
-        assert "auto" in out                                  # 网关调度别名保留
-        assert not [m for m in out if m.endswith("-free")]     # -free 别名已彻底移除
-        assert "deepseek-v4.1-flash" in converter.DEFAULT_MODELS  # 兜底表已补齐官方新模型
-        assert "glm-5.3" in out                              # 默认表补充
+        assert out == ["glm-9.9", "auto"]  # 图像模型不进表，调度别名保留
+        assert not [m for m in out if m.endswith("-free")]
+        assert "deepseek-v4.1-flash" in converter.DEFAULT_MODELS
+        assert "glm-5.3" not in out  # 已知目录禁止借用默认表扩大产品能力
         converter.CONFIG["models_remote"] = []
-        assert converter.current_models() == converter.DEFAULT_MODELS  # 回退
-    finally:
-        converter.CONFIG["models_remote"] = saved
+        assert converter.current_models() == []
+        converter.CONFIG["models_remote"] = None
+        assert converter.current_models() == converter.DEFAULT_MODELS
     print("✅ test_current_models_merge")
 
 
@@ -459,29 +625,25 @@ def test_billing_intl_split():
 
 
 def test_current_models_intl_condition():
-    """国际模型仅在「有国际表 + 池内有额度的国际凭证」时对外暴露。"""
+    """有额度的国际模型仅在国际视图暴露，不能流入国内目录，反之亦然。"""
     import converter
-    saved = (converter.CONFIG.get("models_remote"), converter.CONFIG.get("models_intl"),
-             converter.CONFIG.get("ledger"))
-    with tempfile.TemporaryDirectory() as td:
-        try:
-            converter.CONFIG["models_remote"] = [{"id": "glm-5.3", "supportsToolCall": True}]
-            converter.CONFIG["models_intl"] = [{"id": "gpt-5.5", "supportsToolCall": True},
-                                               {"id": "img-1", "supportsToolCall": False}]
-            converter.CONFIG["ledger"] = None          # 无国际凭证
-            out = converter.current_models()
-            assert "glm-5.3" in out and "gpt-5.5" not in out, out
-            led = credits.CreditLedger(Path(td) / "l.json")
-            led.update_credits("ai", {"credits": 0.0, "segments": [], "intl": True})
-            converter.CONFIG["ledger"] = led          # 有国际凭证但额度为 0
-            assert "gpt-5.5" not in converter.current_models()
-            led.update_credits("ai", {"credits": 120.0, "segments": [
-                {"remaining": 120.0, "total": 120.0, "expires_at": None}], "intl": True})
-            out = converter.current_models()          # 有额度 → 暴露
-            assert "gpt-5.5" in out and "img-1" not in out, out
-        finally:
-            (converter.CONFIG["models_remote"], converter.CONFIG["models_intl"],
-             converter.CONFIG["ledger"]) = saved
+    with tempfile.TemporaryDirectory() as td, patch.dict(converter.CONFIG, {
+            "cred_pool": None, "cred": None, "model_catalogs": {}, "ledger": None,
+            "models_remote": [{"id": "glm-5.3", "supportsToolCall": True}],
+            "models_intl": [{"id": "gpt-5.5", "supportsToolCall": True},
+                            {"id": "img-1", "supportsToolCall": False}]}):
+        assert converter.current_models("cn") == ["glm-5.3", "auto"]
+        assert converter.current_models("intl") == []  # 无国际凭证
+        led = credits.CreditLedger(Path(td) / "l.json")
+        led.update_credits("ai", {"credits": 0.0, "segments": [], "intl": True})
+        converter.CONFIG["ledger"] = led
+        assert converter.current_models("intl") == []  # 有国际凭证但额度为 0
+        led.update_credits("ai", {"credits": 120.0, "segments": [
+            {"remaining": 120.0, "total": 120.0, "expires_at": None}], "intl": True})
+        assert converter.current_models("intl") == ["gpt-5.5"]
+        assert converter.current_models("cn") == ["glm-5.3", "auto"]
+        converter.CONFIG["models_intl"] = []
+        assert converter.current_models("intl") == []  # 有额度也不绕过明确空表
     print("✅ test_current_models_intl_condition")
 
 
@@ -496,7 +658,10 @@ def test_guard_model():
         converter.invalidate_model_table()
         converter.guard_model("glm-5.3")   # 表内
         converter.guard_model("auto")      # 网关调度别名（来自兜底表）
-        converter.guard_model("")          # 空值不拦截，交由默认值逻辑
+        with TestCase().assertRaises(HTTPException) as raised:
+            converter.guard_model("")  # 显式空模型不是默认模型别名
+        assert raised.exception.status_code == 400
+        assert raised.exception.detail["error"]["param"] == "model"
         try:
             converter.guard_model("gpt-9.9")
         except HTTPException as e:
@@ -539,11 +704,16 @@ def test_model_catalog_cache():
 if __name__ == "__main__":
     test_issuer_origin()
     test_hosts_for_token()
+    test_financial_hints_rejected_before_network()
+    test_financial_profile_hosts_and_web_headers()
+    test_financial_failures_stay_on_profile()
     test_classify_checkin()
     test_extract_segments()
     test_merge_and_sort_segments()
     test_soonest_expiry()
     test_ledger()
+    test_ledger_remove_and_entry()
+    test_ledger_threaded_entries()
     test_daily_checkin_http()
     test_fetch_credits_http()
     test_pick_expiry_priority()

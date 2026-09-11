@@ -16,6 +16,8 @@ Codex CLI 会把大量运行时提示、完整工具 schema、长历史、以及
 - 把更早历史压缩成规则摘要
 - 把 tool schema 收敛成结构字段
 - 把超长 tool output / tool arguments 压缩成可继续推理的摘要
+
+含图片时保留消息历史与图片块，只压缩文本和工具元数据，避免限额内图片再次被摘要丢弃。
 """
 
 from __future__ import annotations
@@ -113,7 +115,10 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
     elif "tools" in projected:
         projected["tools"] = []
 
-    aggressive = _looks_like_agentic_cli(messages, tools)
+    # Image history must not disappear into a text-only summary or harness filter.
+    has_images = any(isinstance(msg, dict) and _has_image_content(msg.get("content"))
+                     for msg in messages)
+    aggressive = _looks_like_agentic_cli(messages, tools) and not has_images
     if not aggressive:
         projected["messages"] = _project_messages_conservative(messages)
         return projected, {
@@ -239,18 +244,18 @@ def _project_conversation_message(msg: dict, conservative: bool = False) -> dict
     out = dict(msg)
 
     if role == "system":
-        text = _content_to_text(msg.get("content", ""))
-        out["content"] = _truncate_text(text, MAX_SYSTEM_GUIDANCE_CHARS)
+        out["content"] = _project_content(msg.get("content", ""),
+                                          lambda text: _truncate_text(text, MAX_SYSTEM_GUIDANCE_CHARS))
         return out
 
     if role == "user":
-        text = _content_to_text(msg.get("content", ""))
-        out["content"] = _truncate_text(text, MAX_USER_CHARS)
+        out["content"] = _project_content(msg.get("content", ""),
+                                          lambda text: _truncate_text(text, MAX_USER_CHARS))
         return out
 
     if role == "assistant":
-        text = _content_to_text(msg.get("content", ""))
-        out["content"] = _summarize_free_text(text, MAX_ASSISTANT_CHARS)
+        out["content"] = _project_content(msg.get("content", ""),
+                                          lambda text: _summarize_free_text(text, MAX_ASSISTANT_CHARS))
         tool_calls = []
         for tool_call in msg.get("tool_calls") or []:
             projected_call = _project_tool_call(tool_call)
@@ -263,15 +268,32 @@ def _project_conversation_message(msg: dict, conservative: bool = False) -> dict
         return out
 
     if role == "tool":
-        out["content"] = _summarize_tool_output(_content_to_text(msg.get("content", "")))
+        out["content"] = _project_content(msg.get("content", ""), _summarize_tool_output)
         return out
 
     if conservative:
-        text = _content_to_text(msg.get("content", ""))
-        out["content"] = _truncate_text(text, MAX_ASSISTANT_CHARS)
+        out["content"] = _project_content(msg.get("content", ""),
+                                          lambda text: _truncate_text(text, MAX_ASSISTANT_CHARS))
         return out
 
     return None
+
+
+def _has_image_content(content: Any) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "image_url" for block in content
+    )
+
+
+def _project_content(content: Any, transform) -> Any:
+    """Only text is summarizable; image URLs/data and block order stay untouched."""
+    if not _has_image_content(content):
+        return transform(_content_to_text(content))
+    return [
+        {**block, "text": transform(block.get("text", ""))}
+        if isinstance(block, dict) and block.get("type") == "text" else block
+        for block in content
+    ]
 
 
 def _project_tool_call(tool_call: dict) -> dict | None:

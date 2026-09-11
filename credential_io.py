@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+from contextlib import contextmanager
 import tempfile
 from pathlib import Path
 
@@ -49,6 +50,38 @@ def read_import_file(directory: Path, requested_path: str) -> tuple[str, bytes]:
             raise CredentialFileError("凭据文件不能超过 1 MiB")
         return entry.name, content
     raise CredentialFileError("文件不存在或不在允许的导入目录中")
+
+
+@contextmanager
+def credential_file_lock(directory: Path, name: str):
+    """序列化同一凭据的跨线程/进程写入；锁文件不含凭据内容。"""
+    if not isinstance(name, str) or not _valid_name(name):
+        raise CredentialFileError("凭据文件名无效")
+    root = directory.resolve()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(root / f".{name}.lock", flags, 0o600)
+    with os.fdopen(fd, "r+b") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise CredentialFileError("凭据锁必须是普通文件")
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                stream.seek(0)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 def atomic_write_credential(directory: Path, name: str, content: bytes) -> Path:
