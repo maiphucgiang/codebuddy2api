@@ -449,22 +449,24 @@ def test_fetch_model_catalog():
 
 
 def test_current_models_merge():
-    """已知目录不补静态模型，明确空表不回退；仅旧式国内 CLI 未知目录保留默认表。"""
+    """显式国内内部视图：已知目录不补静态模型，明确空表不回退。"""
     import converter
     with patch.dict(converter.CONFIG, {"cred_pool": None, "cred": None, "model_catalogs": {},
+                                       "account_catalogs": None, "model_cache": None, "ledger": None,
                                        "models_intl": None, "models_remote": [
             {"id": "glm-9.9", "supportsToolCall": True},
             {"id": "hunyuan-image", "supportsToolCall": False},
         ]}):
-        out = converter.current_models()
+        out = converter.current_models(region="cn")
         assert out == ["glm-9.9", "auto"]  # 图像模型不进表，调度别名保留
         assert not [m for m in out if m.endswith("-free")]
         assert "deepseek-v4.1-flash" in converter.DEFAULT_MODELS
         assert "glm-5.3" not in out  # 已知目录禁止借用默认表扩大产品能力
         converter.CONFIG["models_remote"] = []
-        assert converter.current_models() == []
+        assert converter.current_models(region="cn") == []
         converter.CONFIG["models_remote"] = None
-        assert converter.current_models() == converter.DEFAULT_MODELS
+        # 无账号的旧式内部展示兜底不代表生产账号获得该目录的路由权限。
+        assert converter.current_models(region="cn") == converter.DEFAULT_MODELS
     print("✅ test_current_models_merge")
 
 
@@ -625,25 +627,30 @@ def test_billing_intl_split():
 
 
 def test_current_models_intl_condition():
-    """有额度的国际模型仅在国际视图暴露，不能流入国内目录，反之亦然。"""
+    """默认视图合并有额度的国际来源；显式地域内部过滤仍相互隔离。"""
     import converter
     with tempfile.TemporaryDirectory() as td, patch.dict(converter.CONFIG, {
             "cred_pool": None, "cred": None, "model_catalogs": {}, "ledger": None,
+            "account_catalogs": None, "model_cache": None,
             "models_remote": [{"id": "glm-5.3", "supportsToolCall": True}],
             "models_intl": [{"id": "gpt-5.5", "supportsToolCall": True},
                             {"id": "img-1", "supportsToolCall": False}]}):
         assert converter.current_models("cn") == ["glm-5.3", "auto"]
-        assert converter.current_models("intl") == []  # 无国际凭证
+        assert converter.current_models("intl") == []  # 无可信国际余额
+        assert set(converter.current_models()) == {"glm-5.3", "auto"}
         led = credits.CreditLedger(Path(td) / "l.json")
         led.update_credits("ai", {"credits": 0.0, "segments": [], "intl": True})
         converter.CONFIG["ledger"] = led
-        assert converter.current_models("intl") == []  # 有国际凭证但额度为 0
+        assert converter.current_models("intl") == []  # 国际额度为 0
+        assert set(converter.current_models()) == {"glm-5.3", "auto"}
         led.update_credits("ai", {"credits": 120.0, "segments": [
             {"remaining": 120.0, "total": 120.0, "expires_at": None}], "intl": True})
         assert converter.current_models("intl") == ["gpt-5.5"]
         assert converter.current_models("cn") == ["glm-5.3", "auto"]
+        assert set(converter.current_models()) == {"glm-5.3", "gpt-5.5", "auto"}
         converter.CONFIG["models_intl"] = []
         assert converter.current_models("intl") == []  # 有额度也不绕过明确空表
+        assert set(converter.current_models()) == {"glm-5.3", "auto"}
     print("✅ test_current_models_intl_condition")
 
 
@@ -657,7 +664,7 @@ def test_guard_model():
         converter.CONFIG["models_remote"] = [{"id": "glm-5.3", "supportsToolCall": True}]
         converter.invalidate_model_table()
         converter.guard_model("glm-5.3")   # 表内
-        converter.guard_model("auto")      # 网关调度别名（来自兜底表）
+        converter.guard_model("auto")      # 已知非空国内 CLI 目录的旧调度别名
         with TestCase().assertRaises(HTTPException) as raised:
             converter.guard_model("")  # 显式空模型不是默认模型别名
         assert raised.exception.status_code == 400

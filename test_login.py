@@ -79,8 +79,8 @@ class LoginTests(unittest.TestCase):
         self.assertEqual(auth_oauth.validate_cred_data(credential), ("u1", None))
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
-        self.assertIsNone(pool.pick(None))  # 默认国内，不借用刚登录的国际凭据。
-        self.assertEqual(pool.pick(None, region="intl").summary()["uid"], "u1")
+        self.assertIsNone(pool.pick(None, region="cn"))  # 内部过滤不能把国际账号当作国内账号。
+        self.assertEqual(pool.pick(None).summary()["uid"], "u1")
         self.assertIn("账号已保存", self.stdout.getvalue())
         self.assert_no_tokens_printed()
 

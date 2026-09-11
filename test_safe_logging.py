@@ -2,6 +2,9 @@
 
 import copy
 import json
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -60,6 +63,133 @@ class SafeLoggingTests(unittest.TestCase):
                     self.assertIn("base64 redacted", result)
                     self.assertIn("HTTP 502", result)
                     self.assertIn("req-image", result)
+
+    def test_image_header_and_body_compatibility(self):
+        cases = (
+            ("data:image/png;base64,", "image/png"),
+            ("DaTa:ImAgE/SvG+XmL;p=1;q=two;BaSe64 \t\n,QQ==", "ImAgE/SvG+XmL"),
+            (r"data:image\/webp;p=1;BASE64,QQ\/QQ==", r"image\/webp"),
+            ("data:image/x-icon;base64;foo=bar;base64,QQ==", "image/x-icon"),
+            ("data:image/png;foo=data:image/gif;base64,QQ==", "image/png"),
+            # Preserve the previous case-insensitive MIME character semantics.
+            ("data:İMAGE/Kıſİ;base64,QQ==", "İMAGE/Kıſİ"),
+        )
+        for url, mime in cases:
+            text = 'preview="' + url + '" HTTP 502'
+            expected = 'preview="<' + mime + '; base64 redacted>" HTTP 502'
+            with self.subTest(url=url):
+                self.assertEqual(sanitize_log_text(text), expected)
+                self.assertEqual(json.loads(format_log_body(text)), expected)
+
+    def test_malformed_image_urls_do_not_hide_later_valid_urls(self):
+        malformed = (
+            "data:image/png", "data:image/;base64,QQ==",
+            "data:image/png;;base64,QQ==", "data:image/png;p=1;;base64,QQ==",
+            "data:image/png;p=hello world;base64,QQ==",
+            r"data:image/png;p=bad\value;base64,QQ==",
+            "data:image/png;base64x,QQ==", "data:image/png;base64 QQ==",
+            "data:image/png,QQ==", "data:text/plain;base64,QQ==",
+        )
+        for url in malformed:
+            with self.subTest(url=url):
+                text = url + ' "data:image/gif;base64,U1lOVEhFVElD" HTTP 401'
+                expected = url + ' "<image/gif; base64 redacted>" HTTP 401'
+                self.assertEqual(sanitize_log_text(text), expected)
+                self.assertEqual(json.loads(format_log_body(text)), expected)
+
+        # A failed outer candidate must not swallow a nested/later valid one.
+        for prefix in ("data:image/png", "data:image/png;;", "data:image/png;bad\\",
+                       "data:image/png;bad ", "data:image/;", "data:image/png,"):
+            text = prefix + "data:image/jpeg;base64,U1lOVEhFVElD"
+            with self.subTest(prefix=prefix):
+                self.assertEqual(sanitize_log_text(text), prefix + "<image/jpeg; base64 redacted>")
+
+    def test_image_redaction_keeps_other_secrets_and_utf8_budget(self):
+        text = ('中文 "data:image/png;p=1;base64,U1lOVEhFVElD" '
+                'password="synthetic-password" Bearer synthetic-bearer '
+                'sk-proj-SyntheticOnly eyJhbGci.e30.c2ln HTTP 403')
+        for render in (sanitize_log_text, format_log_body):
+            for limit in (0, 1, 16, 64, 128, 512):
+                with self.subTest(render=render.__name__, limit=limit):
+                    result = render(text, limit)
+                    self.assert_bounded(result, limit)
+                    for secret in ("U1lOVEhFVElD", "synthetic-password", "synthetic-bearer",
+                                   "SyntheticOnly", "eyJhbGci"):
+                        self.assertNotIn(secret, result)
+                    if limit == 0:
+                        self.assertEqual(result, "")
+                    if limit == 512:
+                        self.assertIn("base64 redacted", result)
+                        self.assertIn("HTTP 403", result)
+
+    def test_image_variants_at_text_and_structured_inspection_boundaries(self):
+        for header in ("data:image/png;base64,", r"DATA:IMAGE\/PNG;p=1;BASE64,",
+                       "data:image/svg+xml;a=b;c=d;base64 \t,"):
+            for visible in range(0, 48):
+                with self.subTest(header=header, visible=visible):
+                    # The long body is cut before redaction on both entry paths.
+                    text = header + "Q" * 100_000
+                    limit = len(header) + visible
+                    result = sanitize_log_text(text, limit)
+                    self.assert_bounded(result, limit)
+                    self.assertNotIn("Q", result)
+                    text = "a" * (4096 - len(header) - visible) + text
+                    result = json.loads(format_log_body(text))
+                    self.assertNotIn("Q", result)
+                    self.assertIn("base64 redacted", result)
+                    self.assertIn("chars total", result)
+
+    def test_image_scanner_has_linear_character_access(self):
+        class CountedText(str):
+            def __init__(self, value):
+                self.accesses = 0
+
+            def __getitem__(self, index):
+                if isinstance(index, slice):
+                    self.accesses += len(range(*index.indices(len(self))))
+                else:
+                    self.accesses += 1
+                if self.accesses > 20 * len(self):
+                    raise AssertionError("image scanner revisited too many characters")
+                return super().__getitem__(index)
+
+        for count in (1000, 5000):
+            attack = "data:image/+;" * count
+            cases = (
+                attack, attack + "base64,QQ==", attack + ";base64,QQ==",
+                "data:image/png;" + "p=1;" * count + "base64,QQ==",
+                '"data:image/png;base64,QQ==" ' * count,
+                "bad;base64," * count,
+            )
+            for text in cases:
+                with self.subTest(count=count, ending=text[-32:]):
+                    counted = CountedText(text)
+                    result = safe_logging._redact_image_urls(counted)
+                    self.assertIsInstance(result, str)
+                    self.assertLessEqual(counted.accesses, 20 * len(text))
+
+    def test_long_malicious_prefixes_finish_in_bounded_subprocess(self):
+        # A generous process timeout catches polynomial regressions without
+        # asserting machine-dependent millisecond thresholds in the test runner.
+        code = r'''
+from safe_logging import format_log_body, sanitize_log_text
+for count in (5000, 20000):
+    for attack in ("data:image/+" + ";data:image/+" * count, "data:image/+;" * count):
+        assert sanitize_log_text(attack, len(attack)) == attack
+        assert len(sanitize_log_text(attack).encode("utf-8")) <= 65536
+        assert len(format_log_body({"model": attack}).encode("utf-8")) <= 65536
+        for ending in ("base64,QQ==", ";base64,QQ==", ' "data:image/png;base64,QQ=="'):
+            result = sanitize_log_text(attack + ending, len(attack) + len(ending))
+            redacted = ending.startswith(' "') or (ending.startswith(";") != attack.endswith(";"))
+            assert ("QQ==" not in result) == redacted, result[-100:]
+print("ok")
+'''
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", code],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "ok")
 
     def test_nested_credentials_are_not_visited(self):
         class ForbiddenList(list):

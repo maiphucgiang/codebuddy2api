@@ -6,7 +6,7 @@ Use your **WorkBuddy / CodeBuddy (Tencent)** subscription as local **OpenAI- and
 
 ## Features
 
-- OpenAI Chat Completions / Responses and Anthropic Messages, with native tools / tool_calls and streaming SSE; separate domestic (`/cn/v1`) and international (`/intl/v1`) routes
+- OpenAI Chat Completions / Responses and Anthropic Messages, with native tools / tool_calls and streaming SSE; automatic domestic / international and CLI / WorkBuddy backend routing through the original `/v1` endpoints
 - **Seamless login**: add an account by scanning a QR code in your browser — the desktop client is **not** required
 - Multi-account pool: per-session sticky routing, least-expiring-credit first, automatic cooldown on 401/429
 - Automatic token refresh and daily keepalive
@@ -52,7 +52,7 @@ uv run --env-file .env converter.py --desensitize --log converter.log
 
 Listening on `http://127.0.0.1:8787` means it is up.
 
-Plain `python3` does not load `.env`; set environment variables or CLI flags explicitly. With an API key enabled, include its Authorization header on API requests, including regional routes.
+Plain `python3` does not load `.env`; set environment variables or CLI flags explicitly. With an API key enabled, include its Authorization header on API requests.
 
 You can also add accounts from another terminal while the server runs; they are loaded on the next request by default. Use the same `CODEBUDDY_AUTH_DIR` for login and the server (default: `auth/`). A server started with `--auth-file` only uses the specified files.
 
@@ -62,22 +62,22 @@ If the desktop client is already logged in on this machine, its credential is im
 
 ```bash
 curl http://127.0.0.1:8787/health
-curl http://127.0.0.1:8787/cn/v1/models
-# International accounts: use /intl/v1/models; add Authorization if a key is set
+curl http://127.0.0.1:8787/v1/models
+# Lists available models across accounts; add Authorization if a key is set
 ```
 
 ## Client setup
 
-Choose the region explicitly: OpenAI / Responses base URL is `http://127.0.0.1:8787/cn/v1` or `http://127.0.0.1:8787/intl/v1`. Legacy `/v1` defaults to domestic accounts only; routes never fall back across regions.
+Keep the OpenAI / Responses base URL at `http://127.0.0.1:8787/v1`. The backend automatically chooses an eligible account that supports the requested model, then uses that account's region and product. International-only models work at the same URL; no region prefix or new client parameter is needed.
 
 ### Codex CLI (recommended)
 
-Codex CLI uses `/cn/v1/responses` (or `/intl/v1/responses`). Merge into `~/.codex/config.toml`:
+Codex CLI uses `/v1/responses`. Merge into `~/.codex/config.toml`:
 
 ```toml
 [model_providers.workbuddy]
 name = "WorkBuddy (via local converter)"
-base_url = "http://127.0.0.1:8787/cn/v1"
+base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
 env_key = "CODEBUDDY2API_KEY"
 
@@ -96,14 +96,13 @@ codex --profile workbuddy "your task"
 For Claude Code / Anthropic SDKs, use a base URL **without `/v1/messages`**: the SDK appends that path automatically.
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/cn
-# International: http://127.0.0.1:8787/intl
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 export ANTHROPIC_AUTH_TOKEN=any-value  # use the configured API key when enabled
 export ANTHROPIC_MODEL=deepseek-v4-pro
 claude
 ```
 
-In CC Switch, use the same regional root for the Anthropic provider's Base URL. Only clients asking for a complete endpoint should use `/cn/v1/messages` or `/intl/v1/messages`. The legacy root `http://127.0.0.1:8787` remains domestic-only.
+In CC Switch, use `http://127.0.0.1:8787` for the Anthropic provider's Base URL, for both domestic and international accounts. Only clients asking for a complete endpoint should use `/v1/messages`; Anthropic SDKs append that path themselves.
 
 Model names must be real Tencent-backend model names (no Anthropic→Tencent mapping). Keep `--desensitize` on for Claude Code.
 
@@ -111,21 +110,21 @@ Model names must be real Tencent-backend model names (no Anthropic→Tencent map
 
 Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI or your own SDK client:
 
-- Base URL: `http://127.0.0.1:8787/cn/v1` or `http://127.0.0.1:8787/intl/v1`
+- Base URL: `http://127.0.0.1:8787/v1`
 - API Key: empty, or the `--api-key` you started with
 - Model: `glm-5.2` / `deepseek-v4-pro` / `kimi-k2.7` / `auto` …
 
 ## Endpoints
 
-| Domestic endpoint | International endpoint | Description |
-|------|------|------|
-| `POST /cn/v1/chat/completions` | `POST /intl/v1/chat/completions` | OpenAI Chat Completions |
-| `POST /cn/v1/responses` | `POST /intl/v1/responses` | OpenAI Responses (Codex CLI) |
-| `POST /cn/v1/messages` | `POST /intl/v1/messages` | Anthropic Messages |
-| `POST /cn/v1/messages/count_tokens` | `POST /intl/v1/messages/count_tokens` | Anthropic token count estimate |
-| `GET /cn/v1/models` | `GET /intl/v1/models` | Regional models (cloud catalog, locally cached) |
+| Endpoint | Description |
+|------|------|
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/responses` | OpenAI Responses (Codex CLI) |
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/messages/count_tokens` | Anthropic token count estimate |
+| `GET /v1/models` | Available models merged across accounts (cloud catalogs, locally cached) |
 
-All five also accept legacy `/v1/...` paths for domestic accounts only. Across the three generation protocols, the upstream request always starts with a system message: an existing system message is moved to the front, or a default is inserted if absent; existing system messages and other content are retained.
+These original paths serve all supported regions and products. `/cn` and `/intl` API prefixes are not registered and return 404. Across the three generation protocols, the upstream request always starts with a system message: an existing system message is moved to the front, or a default is inserted if absent; existing system messages and other content are retained.
 
 | Shared endpoint | Description |
 |------|------|
@@ -226,7 +225,7 @@ docker exec -it codebuddy2api python3 converter.py login --no-browser
 
 ## Models
 
-Use `/cn/v1/models` or `/intl/v1/models` as the source of truth. Catalogs are cached in `auth/model-catalog.json` by account/tenant, region, product and client version, with a 6-hour TTL. New credentials trigger synchronization. Refresh failures retain only the same account's trusted cache; legacy unscoped root catalogs cannot authorize routing.
+Use `/v1/models` as the source of truth: it merges the available sources across domestic and international accounts. Catalogs are cached in `auth/model-catalog.json` by account/tenant, region, product and client version, with a 6-hour TTL. New credentials trigger synchronization. Refresh failures retain only the same account's trusted cache; legacy unscoped root catalogs cannot authorize routing.
 
 Credential domain / token issuer determine the product profile; chat and token refresh use fixed origins with separately generated CLI / WorkBuddy identity headers:
 
@@ -237,7 +236,9 @@ Credential domain / token issuer determine the product profile; chat and token r
 | `intl-cli` | `https://www.codebuddy.ai` |
 | `intl-work` | `https://www.workbuddy.ai` |
 
-Routing selects only same-region credentials whose own product catalog supports the requested model. Switching products is possible only for models overlapping their known catalogs, never across regions. International credentials must have a known positive credit balance. Catalog / credential readiness failures return retryable 503; explicitly unsupported models return 404. `auto` is a scheduling alias, not a way to bypass these constraints.
+A concrete model can be scheduled across any region or product, but only among accounts whose own known catalog supports it. Each account retains its own catalog and balance; one account's capabilities or credits never authorize another. International credentials must have a known positive credit balance. Selection respects credit priority, cooldown and session stickiness; an ineligible sticky account is rebound before sending, and the final account determines both the fixed host and identity headers. An upstream POST that has already been sent is not replayed against another account. Catalog / credential readiness failures return retryable 503; explicitly unsupported models return 404.
+
+`auto` remains a scheduling alias for each eligible account's default, not permission to use every account or model. International accounts must declare `default-model` in their own catalog, and the upstream model is then `default-model`. Domestic WorkBuddy must declare `auto`; domestic CLI retains its legacy `auto` only with a known nonempty usable catalog. The alias observes the same balance, stickiness and cooldown constraints, including cooldown of the mapped upstream model.
 
 ## Troubleshooting
 

@@ -40,10 +40,12 @@ _SCHEME_VALUE = re.compile(r"(?:Bearer|Basic)\s+[^\s\"'<>;,}\]]+", re.IGNORECASE
 _BARE_VALUE = re.compile(r"[^\s,;&}\]]+")
 _COOKIE_VALUE = re.compile(r"[^\s,;&}\]]+(?:[ \t]*;[ \t]*[^\s,;&}\]]+)*")
 _AUTH_SCHEME = re.compile(r"\b(Bearer|Basic)\s+[^\s\"'<>;,}]+", re.IGNORECASE)
-_IMAGE_URL = re.compile(
-    r"data:(?P<mime>image(?:/|\\/)[a-z0-9.+-]+)"
-    r"(?:;[^,;\s\"'<>\\]+)*;base64\s*,[^\s\"'<>]*",
-    re.IGNORECASE,
+# Fixed prefixes/terminators only; parameter chains are scanned without retries.
+_IMAGE_PREFIX = re.compile(r"data:image(?:/|\\/)", re.IGNORECASE)
+_IMAGE_BASE64 = re.compile(r";base64\s*,", re.IGNORECASE)
+_IMAGE_SUBTYPE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.+-"
+    "\u0130\u0131\u017f\u212a"  # Preserve Python's IGNORECASE [a-z] equivalents.
 )
 # Match even incomplete tokens at the inspection boundary. Do not redact generic
 # hex strings/UUIDs: those often carry useful request and trace identifiers.
@@ -126,9 +128,72 @@ def _redact_assignments(text):
     return "".join(parts)
 
 
+def _image_header(text, start, end):
+    """Find the earliest image MIME whose parameter chain ends at ``end``.
+
+    Walk semicolon-separated segments backwards, at most twice per character.
+    A comma always stops the walk, so different base64 terminators cannot cause
+    overlapping header scans. Invalid/empty parameters stop earlier candidates,
+    but a valid image prefix inside the final segment is still recognized.
+    """
+    candidate = None
+    cursor = end
+    while cursor > start:
+        segment_end = cursor
+        valid_parameter = True
+        while cursor > start and text[cursor - 1] not in ";,":
+            cursor -= 1
+            char = text[cursor]
+            if char.isspace() or char in "\"'<>\\":
+                valid_parameter = False
+
+        subtype = segment_end
+        while subtype > cursor and text[subtype - 1] in _IMAGE_SUBTYPE_CHARS:
+            subtype -= 1
+        if subtype < segment_end:
+            # The only alternatives have fixed lengths (plain or escaped slash).
+            for width in (11, 12):
+                prefix = subtype - width
+                if prefix >= cursor and _IMAGE_PREFIX.fullmatch(text, prefix, subtype):
+                    candidate = (prefix, segment_end)
+                    break
+
+        if (not valid_parameter or cursor == segment_end or cursor == start
+                or text[cursor - 1] == ","):
+            break
+        cursor -= 1
+    return candidate
+
+
+def _redact_image_urls(text):
+    """O(n) time/space in the already bounded preview, including failed URLs.
+
+    Terminator searches advance monotonically. Header scans occupy disjoint
+    comma-delimited regions, body scans occupy disjoint matches, and output
+    slices never overlap. In particular, repeated data:image prefixes without
+    a base64 terminator need no header scan at all.
+    """
+    parts = []
+    end = 0
+    for marker in _IMAGE_BASE64.finditer(text):
+        if marker.start() < end:
+            continue
+        header = _image_header(text, end, marker.start())
+        if header is None:
+            continue
+        start, mime_end = header
+        parts.append(text[end:start])
+        parts.append("<" + text[start + 5:mime_end] + "; base64 redacted>")
+        end = marker.end()
+        while end < len(text) and not text[end].isspace() and text[end] not in "\"'<>":
+            end += 1
+    parts.append(text[end:])
+    return "".join(parts)
+
+
 def _redact_preview(text):
     text = _redact_assignments(text)
-    text = _IMAGE_URL.sub(lambda m: "<" + m.group("mime") + "; base64 redacted>", text)
+    text = _redact_image_urls(text)
     text = _AUTH_SCHEME.sub(lambda m: m.group(1) + " " + _REDACTED, text)
     text = _JWT.sub(_REDACTED, text)
     return _API_TOKEN.sub(_REDACTED, text)

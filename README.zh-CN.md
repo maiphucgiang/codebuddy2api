@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 提供 OpenAI Chat Completions / Responses 与 Anthropic Messages，支持原生 tools / tool_calls 与流式 SSE；国内（`/cn/v1`）和国际（`/intl/v1`）路由隔离
+- 提供 OpenAI Chat Completions / Responses 与 Anthropic Messages，支持原生 tools / tool_calls 与流式 SSE；沿用原 `/v1` 接口，后端自动选择国内／国际、CLI／WorkBuddy 账号
 - **无感登录**：浏览器扫码即可添加账号，**无需安装桌面端**
 - 多账号凭证池：会话黏绑、快过期积分优先调度、401/429 自动熔断换绑
 - token 自动刷新与每日保活
@@ -52,7 +52,7 @@ uv run --env-file .env converter.py --desensitize --log converter.log
 
 看到监听 `http://127.0.0.1:8787` 即启动成功。
 
-直接运行 `python3` 不会自动读取 `.env`，需显式设置环境变量或命令行参数。启用 API key 后，API 请求（包括地域路由）须携带对应的 Authorization 头。
+直接运行 `python3` 不会自动读取 `.env`，需显式设置环境变量或命令行参数。启用 API key 后，API 请求须携带对应的 Authorization 头。
 
 服务运行期间也可以在另一个终端添加账号，默认在下次请求时自动加载。登录命令与服务须使用同一个 `CODEBUDDY_AUTH_DIR`（默认 `auth/`）；以 `--auth-file` 启动的服务只使用指定文件。
 
@@ -62,22 +62,22 @@ uv run --env-file .env converter.py --desensitize --log converter.log
 
 ```bash
 curl http://127.0.0.1:8787/health
-curl http://127.0.0.1:8787/cn/v1/models
-# 国际账号使用 /intl/v1/models；启用密钥时添加 Authorization 头
+curl http://127.0.0.1:8787/v1/models
+# 自动合并可用账号的模型；启用密钥时添加 Authorization 头
 ```
 
 ## 客户端接入
 
-显式选择地域：OpenAI / Responses 的 Base URL 为 `http://127.0.0.1:8787/cn/v1` 或 `http://127.0.0.1:8787/intl/v1`。旧 `/v1` 默认仅使用国内账号，不跨地域回退。
+OpenAI / Responses 的 Base URL 保持为 `http://127.0.0.1:8787/v1`。后端自动选择支持目标模型的可用账号，并按最终账号的地域和产品路由；国际特有模型也使用同一地址，无需地域前缀或新增客户端参数。
 
 ### Codex CLI（推荐）
 
-Codex CLI 走 `/cn/v1/responses`（国际为 `/intl/v1/responses`）。把下面配置合并到 `~/.codex/config.toml`：
+Codex CLI 走 `/v1/responses`。把下面配置合并到 `~/.codex/config.toml`：
 
 ```toml
 [model_providers.workbuddy]
 name = "WorkBuddy (via local converter)"
-base_url = "http://127.0.0.1:8787/cn/v1"
+base_url = "http://127.0.0.1:8787/v1"
 wire_api = "responses"
 env_key = "CODEBUDDY2API_KEY"
 
@@ -96,14 +96,13 @@ codex --profile workbuddy "你的任务描述"
 Claude Code / Anthropic SDK 的 Base URL **不要带 `/v1/messages`**，SDK 会自动追加该路径。
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/cn
-# 国际：http://127.0.0.1:8787/intl
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 export ANTHROPIC_AUTH_TOKEN=any-value  # 启用 API key 时填写配置的密钥
 export ANTHROPIC_MODEL=deepseek-v4-pro
 claude
 ```
 
-CC Switch 的 Anthropic 提供商 Base URL 同样填写地域根地址；只有明确要求完整端点的客户端才填写 `/cn/v1/messages` 或 `/intl/v1/messages`。旧根地址 `http://127.0.0.1:8787` 保留国内兼容。
+CC Switch 的 Anthropic 提供商 Base URL 填写 `http://127.0.0.1:8787`，国内、国际账号通用。只有明确要求完整端点的客户端才填写 `/v1/messages`；Anthropic SDK 会自行追加此路径。
 
 模型名必须填腾讯后端真实模型名（不做 Anthropic→腾讯映射）。Claude Code 场景建议保持 `--desensitize` 开启。
 
@@ -111,21 +110,21 @@ CC Switch 的 Anthropic 提供商 Base URL 同样填写地域根地址；只有�
 
 Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端：
 
-- Base URL：`http://127.0.0.1:8787/cn/v1` 或 `http://127.0.0.1:8787/intl/v1`
+- Base URL：`http://127.0.0.1:8787/v1`
 - API Key：留空，或填启动时设置的 `--api-key`
 - 模型名：`glm-5.2` / `deepseek-v4-pro` / `kimi-k2.7` / `auto` 等
 
 ## 接口一览
 
-| 国内接口 | 国际接口 | 说明 |
-|------|------|------|
-| `POST /cn/v1/chat/completions` | `POST /intl/v1/chat/completions` | OpenAI Chat Completions |
-| `POST /cn/v1/responses` | `POST /intl/v1/responses` | OpenAI Responses（适配 Codex CLI） |
-| `POST /cn/v1/messages` | `POST /intl/v1/messages` | Anthropic Messages |
-| `POST /cn/v1/messages/count_tokens` | `POST /intl/v1/messages/count_tokens` | Anthropic token 数量估算 |
-| `GET /cn/v1/models` | `GET /intl/v1/models` | 地域可用模型（云端目录 + 本地缓存） |
+| 接口 | 说明 |
+|------|------|
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/responses` | OpenAI Responses（适配 Codex CLI） |
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/messages/count_tokens` | Anthropic token 数量估算 |
+| `GET /v1/models` | 自动合并可用账号的模型（云端目录 + 本地缓存） |
 
-以上五个接口均保留旧 `/v1/...` 国内兼容地址。三个生成协议统一保证发往上游的首条消息为 system：已有 system 则移到首位，缺失时补默认值；保留已有 system 和其它内容。
+以上原地址适用于所有支持的地域和产品；不注册 `/cn`、`/intl` API 前缀，带前缀请求返回 404。三个生成协议统一保证发往上游的首条消息为 system：已有 system 则移到首位，缺失时补默认值；保留已有 system 和其它内容。
 
 | 共用接口 | 说明 |
 |------|------|
@@ -226,7 +225,7 @@ docker exec -it codebuddy2api python3 converter.py login --no-browser
 
 ## 模型列表
 
-以 `/cn/v1/models` 或 `/intl/v1/models` 为准。目录按账号/租户、地域、产品与客户端版本缓存于 `auth/model-catalog.json`，有效期 6 小时；新凭据触发同步。同步失败只保留相同账号的可信旧缓存，旧版未隔离的根模型表不用于授权路由。
+以 `/v1/models` 为准，自动合并国内、国际账号的可用来源。目录按账号/租户、地域、产品与客户端版本缓存于 `auth/model-catalog.json`，有效期 6 小时；新凭据触发同步。同步失败只保留相同账号的可信旧缓存，旧版未隔离的根模型表不用于授权路由。
 
 凭据的 domain / token issuer 决定产品 profile；聊天与 token 刷新使用固定入口，CLI / WorkBuddy 身份头各自生成：
 
@@ -237,7 +236,9 @@ docker exec -it codebuddy2api python3 converter.py login --no-browser
 | `intl-cli` | `https://www.codebuddy.ai` |
 | `intl-work` | `https://www.workbuddy.ai` |
 
-仅选择同地域且自身产品目录支持目标模型的凭据；只有各产品已知目录重合的模型才可在产品间切换，不跨地域。国际凭据必须有已知的正额度。目录或凭据未就绪返回可重试的 503，明确不支持的模型返回 404。`auto` 是调度别名，不绕过上述约束。
+具体同名模型可在任何地域、产品之间调度，但仅选择自身已知目录支持该模型的账号。目录和余额按账号隔离，不借用其它账号的能力或额度；国际凭据必须有已知的正额度。调度遵守额度优先级、冷却和会话黏绑；失效黏绑在发送前重绑，最终账号严格决定固定 host 和身份头。已发送的上游 POST 不会向其它账号重放。目录或凭据未就绪返回可重试的 503，明确不支持的模型返回 404。
+
+`auto` 保留为按可用账号默认模型调度的别名，并非所有账号都默认获得所有模型。国际账号必须在自身目录声明 `default-model`，上游映射为 `default-model`；国内 WorkBuddy 必须声明 `auto`；国内 CLI 仅在已知非空可用目录下保留旧 `auto`。别名同样遵守余额、黏绑和冷却约束，包括映射后上游模型的冷却。
 
 ## 常见问题
 

@@ -17,7 +17,7 @@ RUNTIME_DEFAULTS = {
     "max_images": 16, "image_policy": "truncate",
     "max_request_bytes": 33554432, "log_body_limit": 65536,
 }
-REGIONAL_ENDPOINTS = {
+API_ENDPOINTS = {
     "chat/completions": "POST", "responses": "POST", "messages": "POST",
     "messages/count_tokens": "POST", "models": "GET",
 }
@@ -102,11 +102,12 @@ class DeploymentTests(unittest.TestCase):
                 """)
             command += f"\nexpected_defaults = {RUNTIME_DEFAULTS!r}\n"
             command += "assert {key: converter.CONFIG[key] for key in expected_defaults} == expected_defaults\n"
-            command += f"endpoints = {REGIONAL_ENDPOINTS!r}\n"
+            command += f"endpoints = {API_ENDPOINTS!r}\n"
             command += dedent("""\
-                for prefix in ("/cn/v1", "/intl/v1", "/v1"):
-                    for suffix, method in endpoints.items():
-                        assert (prefix + "/" + suffix, method) in routes
+                for suffix, method in endpoints.items():
+                    assert ("/v1/" + suffix, method) in routes
+                    for prefix in ("/cn/v1", "/intl/v1"):
+                        assert (prefix + "/" + suffix, method) not in routes
                 """)
             result = subprocess.run([sys.executable, "-B", "-c", command], cwd=directory,
                                     env={"PATH": os.defpath, "PYTHONPATH": directory, "HOME": directory,
@@ -129,21 +130,24 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn("docker compose build", doc)
             self.assertNotRegex(doc, r"\bdocker-compose\s")
 
-    def test_readmes_document_regional_endpoints_and_sdk_roots(self):
+    def test_readmes_keep_original_endpoints_and_sdk_roots_without_region_prefixes(self):
         for filename in ("README.md", "README.zh-CN.md"):
             with self.subTest(filename=filename):
                 doc = (ROOT / filename).read_text()
+                for suffix, method in API_ENDPOINTS.items():
+                    self.assertIn(f"{method} /v1/{suffix}", doc)
+                self.assertIn("`http://127.0.0.1:8787/v1`", doc)
+                self.assertIn('base_url = "http://127.0.0.1:8787/v1"', doc)
                 for region in ("cn", "intl"):
-                    for suffix, method in REGIONAL_ENDPOINTS.items():
-                        self.assertIn(f"{method} /{region}/v1/{suffix}", doc)
-                    self.assertIn(f"`http://127.0.0.1:8787/{region}/v1`", doc)
+                    self.assertNotIn(f"http://127.0.0.1:8787/{region}", doc)
                     for product in ("cli", "work"):
                         self.assertIn(f"`{region}-{product}`", doc)
-                self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8787/cn\n", doc)
-                self.assertIn("http://127.0.0.1:8787/intl\n", doc)
-                self.assertNotIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8787/cn/v1", doc)
+                self.assertIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8787\n", doc)
+                self.assertNotIn("ANTHROPIC_BASE_URL=http://127.0.0.1:8787/v1", doc)
                 for host in ("copilot.tencent.com", "www.workbuddy.cn", "www.codebuddy.ai", "www.workbuddy.ai"):
                     self.assertIn("https://" + host, doc)
+                self.assertIn("default-model", doc)
+                self.assertIn("account/tenant" if filename == "README.md" else "账号/租户", doc)
 
 
 if __name__ == "__main__":

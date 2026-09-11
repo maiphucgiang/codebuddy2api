@@ -424,7 +424,7 @@ class CredentialPool:
         self._entries: list[dict] = []   # {id, cm, fail_until}
         self._sticky: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
         self._model_fail: dict[tuple[str, str], float] = {}  # (cred_id, model) -> 冷却截止 epoch（429 模型级冷却）
-        self._rr = {"cn": 0, "intl": 0}
+        self._rr = {None: 0, "cn": 0, "intl": 0}
         self._ledger = None              # CreditLedger：pick 时按积分最早过期时间优先调度
         self._scan = scan                # True 时 pick 前自动扫描目录增删凭证
         self._ignored_duplicates: set[str] = set()
@@ -643,13 +643,13 @@ class CredentialPool:
         except (TypeError, ValueError):
             return False
 
-    def _eligible(self, entry, model, *, region="cn", profile=None):
+    def _eligible(self, entry, model, *, region=None, profile=None):
         actual = self._entry_profile(entry)
         profile = profile or actual
-        if not profile or profile != actual or profile_region(profile) != region:
+        if not profile or profile != actual or not _in_region(profile, region):
             return False
         configured = {candidate for item in self._entries if (candidate := self._entry_profile(item))
-                      and profile_region(candidate) == region}
+                      and _in_region(candidate, region)}
         if profile not in _model_profiles(model, region, configured):
             return False
         if CONFIG.get("account_catalogs") is not None or CONFIG.get("model_cache") is not None:
@@ -663,8 +663,7 @@ class CredentialPool:
             models = account.get("models")
             if account.get("profile") != profile or models is None:
                 return False
-            usable = [item for item in models if item.get("id") and item.get("supportsToolCall")
-                      and not item.get("disabled")]
+            usable = _usable_models(models)
             supported = any(item["id"] == _upstream_model(model, profile) for item in usable)
             cli_auto = model == "auto" and profile == "cn-cli" and bool(usable)
             # 关闭 guard 仅允许单产品的明确表外透传，不能把 A 的已知能力借给 B。
@@ -693,7 +692,7 @@ class CredentialPool:
             else:
                 break
 
-    def pick(self, skey: str | None, model: str | None = None, *, region="cn") -> CredentialManager | None:
+    def pick(self, skey: str | None, model: str | None = None, *, region=None) -> CredentialManager | None:
         """按黏绑选凭证；未绑定/已失效则轮询取健康凭证并绑定。
 
         model 非空时跳过该模型 429 冷却中的凭证（黏性会话自动换绑）；
@@ -724,7 +723,7 @@ class CredentialPool:
                 self._sticky[skey] = (e["id"], time.time())
             return e["cm"]
 
-    def headers_for(self, skey: str | None, model: str | None = None, *, region="cn", with_generation=False):
+    def headers_for(self, skey: str | None, model: str | None = None, *, region=None, with_generation=False):
         """在发送前复核凭据代次和站点，避免重载竞态导致跨站调用。"""
         for _ in range(max(1, len(self._entries))):
             cm = self.pick(skey, model, region=region)
@@ -792,7 +791,7 @@ class CredentialPool:
         _log(f"[cred] 模型冷却 {model} @ {Path(cm.path).name} 至 "
              f"{time.strftime('%m-%d %H:%M:%S', time.localtime(until))} (HTTP 429)")
 
-    def model_cooldown_until(self, model: str | None, *, region="cn") -> float | None:
+    def model_cooldown_until(self, model: str | None, *, region=None) -> float | None:
         """该模型在所有健康凭证上都在冷却时返回最早恢复时间；否则 None。"""
         if not model:
             return None
@@ -1216,10 +1215,10 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail={"error": {"message": "invalid api key", "type": "auth_error"}})
 
 
-def _cred_for(payload: dict, model: str | None = None, *, region="cn"):
+def _cred_for(payload: dict, model: str | None = None, *, region=None):
     """返回 ((凭据管理器, 代次), headers)；无可用凭据返回 503，模型冷却返回 429。"""
     raw_key = session_key(payload)
-    skey = f"{region}:{raw_key}" if raw_key else None
+    skey = f"{region}:{raw_key}" if raw_key and region is not None else raw_key
     pool = CONFIG.get("cred_pool")
     if pool is not None:
         picked = pool.headers_for(skey, model, region=region, with_generation=True)
@@ -1231,7 +1230,7 @@ def _cred_for(payload: dict, model: str | None = None, *, region="cn"):
                     "message": f"模型 {model} 额度冷却中（全部凭证），预计 {t} 重置后恢复",
                     "type": "rate_limit_error"}})
             raise HTTPException(status_code=503, headers={"Retry-After": "3" if _catalog_pending(region) else "30"},
-                                detail={"error": {"message": f"{region} 无可用凭证（未登录、目录/额度未就绪或全部熔断）",
+                                detail={"error": {"message": "无可用凭证（未登录、目录/额度未就绪或全部熔断）",
                                                   "type": "auth_error"}})
         cm, headers = picked
     else:
@@ -1242,22 +1241,22 @@ def _cred_for(payload: dict, model: str | None = None, *, region="cn"):
             headers = cm.get_headers()
             cm = (cm, cm._generation)
     profile = profile_for_headers(headers)
-    if profile_region(profile) != region:
+    if not _in_region(profile, region):
         raise HTTPException(status_code=503, detail={"error": {"message": "未找到指定地域凭据", "type": "auth_error"}})
     headers.update(_dynamic_request_headers(f"{profile}:{skey}" if skey else None))
     return cm, headers
 
 
-def _route_chat(payload, body, region, rid):
-    """冻结地域/产品凭据，并在同一处映射模型与固定上游地址。"""
-    cred, headers = _cred_for(payload, body.get("model"), region=region)
+def _route_chat(payload, body, rid):
+    """根据所选账号自动确定后端地域、产品及模型，不改变客户端地址。"""
+    cred, headers = _cred_for(payload, body.get("model"))
     profile = profile_for_headers(headers)
     routed_model = _upstream_model(body.get("model"), profile)
     if routed_model != body.get("model"):
         body = {**body, "model": routed_model}
         _guard_request_size(body)
     url = chat_url_for_headers(headers)
-    _log(f"[{rid}] ROUTE | region={region} | profile={profile} | model={routed_model} | url={url}")
+    _log(f"[{rid}] ROUTE | region={profile_region(profile)} | profile={profile} | model={routed_model} | url={url}")
     return body, cred, headers, url
 
 
@@ -1591,18 +1590,27 @@ def _catalog_for(profile: str):
     return CONFIG.get(legacy[profile]) if profile in legacy else None
 
 
-def _configured_profiles(region: str) -> set[str]:
+def _in_region(profile: str, region: str | None) -> bool:
+    return region is None or profile_region(profile) == region
+
+
+def _configured_profiles(region: str | None) -> set[str]:
     pool = CONFIG.get("cred_pool")
     if pool is not None:
         return {profile for entry in pool.entries() if (profile := pool._entry_profile(entry))
-                and profile_region(profile) == region}
+                and _in_region(profile, region)}
     cm = CONFIG.get("cred")
     if cm is not None:
         profile = cm.summary()["profile"]
-        return {profile} if profile_region(profile) == region else set()
+        return {profile} if _in_region(profile, region) else set()
     known = {profile for profile in PROFILE_ENDPOINTS
-             if profile_region(profile) == region and _catalog_for(profile) is not None}
-    return known or ({"cn-cli"} if region == "cn" else {"intl-cli"})
+             if _in_region(profile, region) and _catalog_for(profile) is not None}
+    return known or ({"intl-cli"} if region == "intl" else {"cn-cli"})
+
+
+def _usable_models(models):
+    return [model for model in models or [] if model.get("id") and model.get("supportsToolCall")
+            and not model.get("disabled")]
 
 
 def _models_for_profile(profile: str, configured=None) -> list[dict]:
@@ -1613,17 +1621,16 @@ def _models_for_profile(profile: str, configured=None) -> list[dict]:
         return ([{"id": name, "supportsToolCall": True} for name in DEFAULT_MODELS]
                 if CONFIG.get("model_cache") is None and CONFIG.get("account_catalogs") is None
                 and profile == "cn-cli" and configured <= {"cn-cli"} else [])
-    return [model for model in models if model.get("id") and model.get("supportsToolCall")
-            and not model.get("disabled")]
+    return _usable_models(models)
 
 
 def _upstream_model(model: str | None, profile: str) -> str | None:
     return "default-model" if model == "auto" and profile_region(profile) == "intl" else model
 
 
-def _model_profiles(model: str | None, region: str, configured=None) -> set[str]:
+def _model_profiles(model: str | None, region: str | None = None, configured=None) -> set[str]:
     configured = _configured_profiles(region) if configured is None else configured
-    profiles = {profile for profile in PROFILE_ENDPOINTS if profile_region(profile) == region}
+    profiles = {profile for profile in PROFILE_ENDPOINTS if _in_region(profile, region)}
     if not model:
         return profiles
     supported = {profile for profile in profiles
@@ -1635,12 +1642,14 @@ def _model_profiles(model: str | None, region: str, configured=None) -> set[str]
             return {"cn-work"}
         if "cn-cli" in configured and _models_for_profile("cn-cli", configured):
             return {"cn-cli"}
+    if model == "auto" and region is None and "cn-cli" in configured and _models_for_profile("cn-cli", configured):
+        supported.add("cn-cli")
     if model != "auto" and not supported and not CONFIG.get("model_guard") and len(configured) == 1:
         return configured
     return supported
 
 
-def _catalog_pending(region: str) -> bool:
+def _catalog_pending(region: str | None = None) -> bool:
     pool = CONFIG.get("cred_pool")
     if CONFIG.get("model_cache") is None and CONFIG.get("account_catalogs") is None:
         return False
@@ -1662,23 +1671,40 @@ def _profile_has_credits(profile: str) -> bool:
                for entry in pool.entries())
 
 
-def current_models(region: str = "cn") -> list[str]:
-    """只合并指定地域内、对应产品目录中可用的对话模型。"""
+def current_models(region: str | None = None) -> list[str]:
+    """合并账号可用的模型；客户端不用按地域改变请求地址。"""
     pool = CONFIG.get("cred_pool")
     if pool is not None:
         pool._rescan()
-    configured = _configured_profiles(region)
-    out = []
-    for profile in sorted(configured):
-        if not _profile_has_credits(profile):
-            continue
-        out.extend(model["id"] for model in _models_for_profile(profile, configured))
-    if out and _model_profiles("auto", region, configured) & configured:
-        out.append("auto")
-    return list(dict.fromkeys(out))
+    with pool._lock if pool is not None else nullcontext():
+        configured = _configured_profiles(region)
+        out, has_auto = [], False
+        auto_profiles = _model_profiles("auto", region, configured)
+        if pool is not None and (CONFIG.get("account_catalogs") is not None or CONFIG.get("model_cache") is not None):
+            accounts = CONFIG.get("account_catalogs") or {}
+            for entry in pool.entries():
+                profile = entry.get("profile")
+                if not profile or not _in_region(profile, region) or not pool._has_credit(entry, profile):
+                    continue
+                account = accounts.get(entry.get("account_key")) or {}
+                if account.get("profile") != profile:
+                    continue
+                models = _usable_models(account.get("models"))
+                out.extend(model["id"] for model in models)
+                if profile in auto_profiles and models:
+                    has_auto |= profile == "cn-cli" or any(model["id"] == _upstream_model("auto", profile) for model in models)
+        else:
+            for profile in sorted(configured):
+                if _profile_has_credits(profile):
+                    models = _models_for_profile(profile, configured)
+                    out.extend(model["id"] for model in models)
+                    has_auto |= bool(models) and profile in auto_profiles
+        if has_auto:
+            out.append("auto")
+        return list(dict.fromkeys(out))
 
 
-def _model_table(region: str = "cn") -> list[str]:
+def _model_table(region: str | None = None) -> list[str]:
     now = time.time()
     cached = _model_table_cache.get(region)
     if cached is None or now - cached[0] > _MODEL_TABLE_TTL:
@@ -1686,10 +1712,6 @@ def _model_table(region: str = "cn") -> list[str]:
     return _model_table_cache[region][1]
 
 
-def _request_region(request: Request) -> str:
-    scope = getattr(request, "scope", {})
-    path = getattr(scope.get("route"), "path", scope.get("path", ""))
-    return "intl" if path.startswith("/intl/") else "cn"
 
 
 def _prepare_payload(payload, field="messages") -> dict:
@@ -1726,7 +1748,7 @@ def _normalize_tool_choice(body):
     body["tools"], body["tool_choice"] = matches, "required"
 
 
-def _prepare_chat_body(body: dict, *, region="cn") -> dict:
+def _prepare_chat_body(body: dict, *, region=None) -> dict:
     """统一模型、首条 system、后端流式参数、脱敏与体积预算。"""
     body = dict(body)
     body.setdefault("model", "auto")
@@ -1767,8 +1789,8 @@ def _guard_request_size(body: dict) -> None:
             "message": "请求体包含无法序列化的 JSON 值", "type": "invalid_request_error"}}) from None
 
 
-def guard_model(name: str, *, region="cn") -> None:
-    """表外模型在指定地域内校验，不发送到另一地域尝试。"""
+def guard_model(name: str, *, region=None) -> None:
+    """表外模型本地拒绝；自动路由只考虑各账号明确支持的模型。"""
     if not isinstance(name, str) or not name.strip():
         raise HTTPException(status_code=400, detail={"error": {
             "message": "model must be a non-empty string", "type": "invalid_request_error", "param": "model"}})
@@ -1781,27 +1803,23 @@ def guard_model(name: str, *, region="cn") -> None:
         return
     if _catalog_pending(region):
         raise HTTPException(status_code=503, headers={"Retry-After": "3"}, detail={"error": {
-            "message": f"{region} 模型目录正在同步，请稍后重试", "type": "service_unavailable", "code": "catalog_syncing"}})
+            "message": "模型目录正在同步，请稍后重试", "type": "service_unavailable", "code": "catalog_syncing"}})
     raise HTTPException(status_code=404, detail={"error": {
-        "message": f"The model '{name}' is not available in {region}. See GET /{region}/v1/models.",
+        "message": f"The model '{name}' is not supported by this gateway. See GET /v1/models.",
         "type": "invalid_request_error", "param": "model", "code": "model_not_found"}})
 
 
 
 @app.get("/v1/models")
-@app.get("/cn/v1/models")
-@app.get("/intl/v1/models")
-def list_models(request: Request, authorization: Optional[str] = Header(default=None),
+def list_models(authorization: Optional[str] = Header(default=None),
                 x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     _check_auth(authorization, x_api_key)
     data = [{"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-            for m in current_models(_request_region(request))]
+            for m in current_models()]
     return {"object": "list", "data": data}
 
 
 @app.post("/v1/chat/completions")
-@app.post("/cn/v1/chat/completions")
-@app.post("/intl/v1/chat/completions")
 async def chat_completions(request: Request,
                            authorization: Optional[str] = Header(default=None),
                            x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
@@ -1821,8 +1839,7 @@ async def chat_completions(request: Request,
     # 构造后端 body：只透传已知的合法字段
     client_wants_stream = bool(payload.get("stream"))
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
-    region = _request_region(request)
-    body = _prepare_chat_body(body, region=region)
+    body = _prepare_chat_body(body)
 
     # 日志：请求摘要
     model_name = payload.get("model", "auto")
@@ -1833,7 +1850,7 @@ async def chat_completions(request: Request,
     _log(f"[{rid}] ▶ REQUEST {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
          + (f" | tools={tool_names}" if tool_names else "")
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
-    body, cred, headers, url = _route_chat(payload, body, region, rid)
+    body, cred, headers, url = _route_chat(payload, body, rid)
     _log_json(f"[{rid}] REQUEST BODY (发往后端，预览)", body)
     t0 = time.time()
 
@@ -2159,8 +2176,6 @@ async def _post_backend_with_filter_retry(url: str, headers: dict, body: dict,
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/responses")
-@app.post("/cn/v1/responses")
-@app.post("/intl/v1/responses")
 async def create_response(request: Request,
                           authorization: Optional[str] = Header(default=None),
                           x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
@@ -2185,8 +2200,7 @@ async def create_response(request: Request,
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
     chat_body, projection_stats = project_responses_chat_body(chat_body)
-    region = _request_region(request)
-    chat_body = _prepare_chat_body(chat_body, region=region)
+    chat_body = _prepare_chat_body(chat_body)
 
     client_wants_stream = payload.get("stream", True)  # Codex CLI 默认 stream
     model_name = payload.get("model", "auto")
@@ -2203,7 +2217,7 @@ async def create_response(request: Request,
         f"| dropped_harness={projection_stats.get('dropped_harness_messages', 0)} "
         f"| anchor_user={projection_stats.get('anchor_user_preserved', False)}"
     )
-    chat_body, cred, headers, url = _route_chat(payload, chat_body, region, rid)
+    chat_body, cred, headers, url = _route_chat(payload, chat_body, rid)
     _log_json(f"[{rid}] RESPONSES → CHAT BODY (预览)", chat_body)
     t0 = time.time()
 
@@ -2265,8 +2279,6 @@ async def _stream_responses(url: str, headers: dict, body: dict,
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/messages")
-@app.post("/cn/v1/messages")
-@app.post("/intl/v1/messages")
 async def create_message(request: Request,
                          authorization: Optional[str] = Header(default=None),
                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
@@ -2294,13 +2306,12 @@ async def create_message(request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
-    region = _request_region(request)
-    chat_body = _prepare_chat_body(chat_body, region=region)
+    chat_body = _prepare_chat_body(chat_body)
     model_name = payload.get("model", "auto")
     chat_messages = chat_body.get("messages", [])
     rid = os.urandom(4).hex()
     _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
-    chat_body, cred, headers, url = _route_chat(payload, chat_body, region, rid)
+    chat_body, cred, headers, url = _route_chat(payload, chat_body, rid)
     _log_json(f"[{rid}] ANTHROPIC → CHAT BODY (预览)", chat_body)
     t0 = time.time()
 
@@ -2321,8 +2332,6 @@ async def _stream_anthropic(url: str, headers: dict, body: dict,
 
 
 @app.post("/v1/messages/count_tokens")
-@app.post("/cn/v1/messages/count_tokens")
-@app.post("/intl/v1/messages/count_tokens")
 async def count_tokens(request: Request,
                        authorization: Optional[str] = Header(default=None),
                        x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):

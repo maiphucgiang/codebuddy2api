@@ -1,4 +1,4 @@
-"""地域/产品 HTTP 路由回归：临时合成凭据，所有 httpx 上游均由 MockTransport 接管。
+"""原 /v1 接口自动地域/产品路由回归：合成凭据，httpx 全部由 MockTransport 接管。
 
 运行：.venv/bin/python -B -m unittest -v test_region_routing
 不启动维护线程，不读取本机 auth/.env，不依赖在线目录或真实账号。
@@ -27,7 +27,6 @@ DOMAINS = {
     "intl-cli": "www.codebuddy.ai", "intl-work": "www.workbuddy.ai",
 }
 HOSTS = dict(DOMAINS, **{"cn-cli": "copilot.tencent.com"})
-BASES = (("/v1", "cn"), ("/cn/v1", "cn"), ("/intl/v1", "intl"))
 GENERATIONS = ("chat/completions", "responses", "messages")
 
 
@@ -60,7 +59,7 @@ class RegionRoutingTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"CODEBUDDY_AUTH_DIR": str(self.root)}))
         self.enterContext(patch.dict(converter.CONFIG, {
             "api_key": "", "cred": None, "cred_pool": None, "ledger": None,
-            "model_catalogs": {}, "model_cache": None, "model_guard": True,
+            "model_catalogs": {}, "account_catalogs": None, "model_cache": None, "model_guard": True,
             "models_remote": None, "models_intl": None,
             "max_images": 16, "image_policy": "truncate",
             "max_request_bytes": 32 * 1024 * 1024, "log_body_limit": 65536,
@@ -73,16 +72,9 @@ class RegionRoutingTests(unittest.TestCase):
         self.sequence = 0
         self.fixture_sequence = 0
         self.credentials = {}
-        now = time.time()
+        self.account_profiles = {}
         for profile in PROFILES:
-            value = {"account": {"uid": profile, "enterpriseId": "synthetic-enterprise"},
-                     "auth": {"domain": DOMAINS[profile],
-                              "accessToken": "synthetic-access-" + profile,
-                              "refreshToken": "synthetic-refresh-" + profile,
-                              "expiresAt": (now + 86400) * 1000,
-                              "lastRefreshTime": now * 1000}}
-            self.credentials[profile] = value
-            (self.root / (profile + ".info")).write_text(json.dumps(value), encoding="utf-8")
+            self.add_account(profile, profile)
         transport = httpx.MockTransport(self.handle_upstream)
         real_sync, real_async = httpx.Client, httpx.AsyncClient
 
@@ -94,11 +86,21 @@ class RegionRoutingTests(unittest.TestCase):
             kwargs["transport"] = transport
             return real_async(*args, **kwargs)
 
-        # Patch the shared module, covering chat, token refresh and catalog requests.
+        # Cover chat, token refresh and catalog requests, not just the generation client.
         self.enterContext(patch.object(httpx, "Client", side_effect=sync_client))
         self.enterContext(patch.object(httpx, "AsyncClient", side_effect=async_client))
         self.configure()
         self.client = self.enterContext(TestClient(converter.app))
+
+    def add_account(self, uid, profile):
+        now = time.time()
+        value = {"account": {"uid": uid, "enterpriseId": "synthetic-enterprise"},
+                 "auth": {"domain": DOMAINS[profile], "accessToken": "synthetic-access-" + uid,
+                          "refreshToken": "synthetic-refresh-" + uid,
+                          "expiresAt": (now + 86400) * 1000, "lastRefreshTime": now * 1000}}
+        self.account_profiles[uid] = profile
+        self.credentials[uid] = value
+        (self.root / (uid + ".info")).write_text(json.dumps(value), encoding="utf-8")
 
     def configure(self, profiles=PROFILES, tables=None, balances=None, guard=True):
         self.fixture_sequence += 1
@@ -106,26 +108,34 @@ class RegionRoutingTests(unittest.TestCase):
         self.entries = {entry["cm"].summary()["uid"]: entry for entry in self.pool.entries()}
         self.ledger = credits.CreditLedger(self.root / f"ledger-{self.fixture_sequence}.json")
         self.pool.set_ledger(self.ledger)
-        for profile, entry in self.entries.items():
-            balance = (balances or {}).get(profile, 100)
+        for uid, entry in self.entries.items():
+            balance = (balances or {}).get(uid, 100)
             if balance is not None:
                 self.ledger.update_credits(entry["id"], {
-                    "credits": balance, "intl": profile.startswith("intl-"),
+                    "credits": balance, "intl": self.account_profiles[uid].startswith("intl-"),
                     "segments": [], "soonest_expiry": None,
                 })
         converter.CONFIG.update(cred_pool=self.pool, ledger=self.ledger,
                                 model_catalogs=deepcopy(catalogs() if tables is None else tables),
-                                model_guard=guard, model_cache=None)
+                                model_guard=guard, model_cache=None, account_catalogs=None)
+        converter.invalidate_model_table()
+
+    def account_catalogs(self, tables):
+        converter.CONFIG["account_catalogs"] = {
+            self.entries[uid]["account_key"]: {"profile": self.account_profiles[uid], "models": items}
+            for uid, items in tables.items()
+        }
         converter.invalidate_model_table()
 
     def handle_upstream(self, request):
         self.requests.append(request)
-        profile = request.headers.get("x-user-id")
-        self.assertIn(profile, self.allowed_profiles, "unexpected selected UID")
+        uid = request.headers.get("x-user-id")
+        self.assertIn(uid, self.allowed_profiles, "unexpected selected UID")
+        profile = self.account_profiles[uid]
         self.assertEqual(request.url.scheme, "https")
         self.assertEqual(request.url.host, HOSTS[profile])
-        self.assertEqual(request.headers["x-domain"], self.credentials[profile]["auth"]["domain"])
-        self.assertEqual(request.headers["authorization"], "Bearer synthetic-access-" + profile)
+        self.assertEqual(request.headers["x-domain"], self.credentials[uid]["auth"]["domain"])
+        self.assertEqual(request.headers["authorization"], "Bearer synthetic-access-" + uid)
         for name, value in client_profiles.identity_headers(profile).items():
             self.assertEqual(request.headers[name], value, (profile, name))
         self.assertEqual(request.headers["x-ide-type"],
@@ -142,9 +152,9 @@ class RegionRoutingTests(unittest.TestCase):
             }})
         if request.url.path == "/v2/plugin/auth/token/refresh":
             self.assertEqual(request.method, "POST")
-            self.assertEqual(request.headers["x-refresh-token"], "synthetic-refresh-" + profile)
+            self.assertEqual(request.headers["x-refresh-token"], "synthetic-refresh-" + uid)
             return httpx.Response(200, json={"code": 0, "data": {
-                "accessToken": "synthetic-access-" + profile, "expiresIn": 86400}})
+                "accessToken": "synthetic-access-" + uid, "expiresIn": 86400}})
         self.assertEqual(request.url.path, "/v2/chat/completions")
         self.assertEqual(request.method, "POST")
         if self.response_status != 200:
@@ -169,321 +179,351 @@ class RegionRoutingTests(unittest.TestCase):
                     result["messages"].insert(0, {"role": "system", "content": system})
         return result
 
-    def post_ok(self, base, endpoint, payload, allowed):
+    def post_ok(self, endpoint, payload, allowed):
         self.allowed_profiles = set(allowed)
         before = len(self.requests)
-        response = self.client.post(base + "/" + endpoint, json=payload)
+        response = self.client.post("/v1/" + endpoint, json=payload)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("ok", response.text)
         if payload.get("stream"):
             self.assertIn({"chat/completions": "[DONE]", "responses": "response.completed",
                            "messages": "message_stop"}[endpoint], response.text)
+        else:
+            data = response.json()
+            if endpoint == "chat/completions":
+                self.assertEqual(data["object"], "chat.completion")
+                self.assertEqual(data["choices"][0]["message"]["content"], "ok")
+            elif endpoint == "responses":
+                self.assertEqual(data["object"], "response")
+                self.assertEqual(data["output"][0]["content"][0]["text"], "ok")
+            else:
+                self.assertEqual(data["type"], "message")
+                self.assertEqual(data["role"], "assistant")
+                self.assertEqual(data["content"][0]["text"], "ok")
         self.assertEqual(len(self.requests), before + 1, response.text)
         request = self.requests[-1]
         return request, json.loads(request.content)
 
-    def post_rejected(self, base, endpoint, payload, statuses=(404, 503)):
+    def post_rejected(self, endpoint, payload, statuses=(404, 503)):
         self.allowed_profiles = set()
         before = len(self.requests)
-        response = self.client.post(base + "/" + endpoint, json=payload)
+        response = self.client.post("/v1/" + endpoint, json=payload)
         self.assertIn(response.status_code, statuses, response.text)
         self.assertEqual(len(self.requests), before, "local rejection must not call any upstream")
         return response
 
-    def test_all_three_generation_apis_have_default_cn_and_intl_routes(self):
-        for base, region in BASES:
+    def test_original_generation_apis_preserve_shapes_for_all_four_profiles(self):
+        for profile in PROFILES:
             for endpoint in GENERATIONS:
                 for stream in (False, True):
-                    with self.subTest(base=base, endpoint=endpoint, stream=stream):
-                        _, body = self.post_ok(base, endpoint, self.payload(endpoint, stream=stream),
-                                               (region + "-cli", region + "-work"))
-                        self.assertEqual(body["model"], "shared-model")
+                    with self.subTest(profile=profile, endpoint=endpoint, stream=stream):
+                        selected = profile + "-only"
+                        _, body = self.post_ok(endpoint, self.payload(endpoint, selected, stream=stream),
+                                               {profile})
+                        self.assertEqual(body["model"], selected)
                         self.assertTrue(body["stream"])
 
-    def test_shared_model_rotates_only_between_same_region_products(self):
-        for base, region in BASES:
-            for endpoint in GENERATIONS:
-                with self.subTest(base=base, endpoint=endpoint):
-                    expected = {region + "-cli", region + "-work"}
-                    seen = set()
-                    for _ in range(4):
-                        request, _ = self.post_ok(base, endpoint, self.payload(endpoint), expected)
-                        seen.add(request.headers["x-user-id"])
-                    self.assertEqual(seen, expected)
+    def test_regional_prefixes_are_not_public_routes(self):
+        for prefix in ("/cn", "/intl"):
+            for endpoint in (*GENERATIONS, "messages/count_tokens", "models"):
+                with self.subTest(prefix=prefix, endpoint=endpoint):
+                    path = prefix + "/v1/" + endpoint
+                    response = (self.client.get(path) if endpoint == "models" else
+                                self.client.post(path, json=self.payload()))
+                    self.assertEqual(response.status_code, 404, response.text)
+        self.assertFalse(self.requests)
 
-    def test_product_exclusive_models_never_rotate_into_other_product(self):
-        for base, region in BASES:
-            for endpoint in GENERATIONS:
-                for product in ("cli", "work"):
-                    with self.subTest(base=base, endpoint=endpoint, product=product):
-                        for _ in range(2):
-                            _, body = self.post_ok(base, endpoint,
-                                                   self.payload(endpoint, product + "-exclusive"),
-                                                   {region + "-" + product})
-                            self.assertEqual(body["model"], product + "-exclusive")
+    def test_shared_model_rotates_across_regions_and_products(self):
+        for endpoint in GENERATIONS:
+            seen = set()
+            for _ in range(8):
+                request, body = self.post_ok(endpoint, self.payload(endpoint), PROFILES)
+                self.assertEqual(body["model"], "shared-model")
+                seen.add(request.headers["x-user-id"])
+            self.assertEqual(seen, set(PROFILES))
 
-    def test_default_root_rejects_international_only_model(self):
+    def test_product_exclusive_models_only_rotate_between_supporting_regions(self):
         for endpoint in GENERATIONS:
-            for base in ("/v1", "/cn/v1"):
-                self.post_rejected(base, endpoint, self.payload(endpoint, "intl-cli-only"))
+            for product in ("cli", "work"):
+                expected = {"cn-" + product, "intl-" + product}
+                seen = set()
+                for _ in range(4):
+                    request, body = self.post_ok(endpoint,
+                        self.payload(endpoint, product + "-exclusive"), expected)
+                    self.assertEqual(body["model"], product + "-exclusive")
+                    seen.add(request.headers["x-user-id"])
+                self.assertEqual(seen, expected)
+
+    def test_original_root_automatically_selects_international_only_models(self):
         for endpoint in GENERATIONS:
-            self.post_rejected("/intl/v1", endpoint, self.payload(endpoint, "cn-cli-only"))
+            for profile in ("intl-cli", "intl-work"):
+                self.post_ok(endpoint, self.payload(endpoint, profile + "-only"), {profile})
 
     def test_wrong_region_or_product_sticky_is_automatically_rebound(self):
-        for region in ("cn", "intl"):
-            for wrong in PROFILES:
-                right = region + "-cli"
-                if wrong == right:
-                    continue
-                with self.subTest(region=region, wrong=wrong):
-                    payload = self.payload(selected_model="cli-exclusive")
+        for right in PROFILES:
+            for wrong in set(PROFILES) - {right}:
+                with self.subTest(right=right, wrong=wrong):
+                    payload = self.payload(selected_model=right + "-only")
                     old_keys = set(self.pool._sticky)
-                    self.post_ok("/" + region + "/v1", "chat/completions", payload, {right})
+                    self.post_ok("chat/completions", payload, {right})
                     keys = set(self.pool._sticky) - old_keys
                     self.assertEqual(len(keys), 1)
                     key = keys.pop()
                     self.pool._sticky[key] = (self.entries[wrong]["id"], time.time())
-                    self.post_ok("/" + region + "/v1", "chat/completions", payload, {right})
+                    self.post_ok("chat/completions", payload, {right})
                     self.assertEqual(self.pool._sticky[key][0], self.entries[right]["id"])
 
-    def test_model_change_rechecks_sticky_product_availability(self):
-        for region in ("cn", "intl"):
-            payload = self.payload(selected_model="cli-exclusive")
-            base = "/" + region + "/v1"
-            self.post_ok(base, "chat/completions", payload, {region + "-cli"})
-            payload["model"] = "work-exclusive"
-            self.post_ok(base, "chat/completions", payload, {region + "-work"})
+    def test_model_change_rechecks_sticky_region_and_product_availability(self):
+        payload = self.payload(selected_model="cn-cli-only")
+        self.post_ok("chat/completions", payload, {"cn-cli"})
+        payload["model"] = "intl-work-only"
+        self.post_ok("chat/completions", payload, {"intl-work"})
 
-    def test_same_model_and_payload_do_not_share_cross_region_conversation_id(self):
+    def test_repeated_payload_preserves_account_sticky_and_conversation_id(self):
         for endpoint in GENERATIONS:
-            payload = self.payload(endpoint, text="identical conversation in both regions",
-                                   system="Preserve this caller instruction.")
-            ids = {}
-            for base, region in BASES:
-                request, _ = self.post_ok(base, endpoint, payload,
-                                          {region + "-cli", region + "-work"})
-                conversation = request.headers["x-conversation-id"]
-                self.assertTrue(conversation)
-                if region in ids:
-                    self.assertEqual(conversation, ids[region])
-                ids[region] = conversation
-                repeat, _ = self.post_ok(base, endpoint, payload,
-                                         {request.headers["x-user-id"]})
-                self.assertEqual(repeat.headers["x-conversation-id"], conversation)
-            self.assertNotEqual(ids["cn"], ids["intl"])
+            for profile in PROFILES:
+                payload = self.payload(endpoint, profile + "-only", system="Keep this instruction.")
+                first, _ = self.post_ok(endpoint, payload, {profile})
+                repeat, _ = self.post_ok(endpoint, payload, {profile})
+                self.assertTrue(first.headers["x-conversation-id"])
+                self.assertEqual(first.headers["x-conversation-id"], repeat.headers["x-conversation-id"])
+                self.assertEqual(first.headers["x-user-id"], repeat.headers["x-user-id"])
 
-    def test_single_region_pool_never_services_other_region(self):
+    def test_single_region_pool_uses_original_root_and_rejects_absent_sources(self):
         for present, absent in (("cn", "intl"), ("intl", "cn")):
-            self.configure(profiles=(present + "-cli", present + "-work"))
-            bases = ("/v1", "/cn/v1") if absent == "cn" else ("/intl/v1",)
-            for base in bases:
-                for endpoint in GENERATIONS:
-                    self.post_rejected(base, endpoint, self.payload(endpoint))
-            self.post_ok("/" + present + "/v1", "chat/completions", self.payload(),
-                         {present + "-cli", present + "-work"})
+            expected = {present + "-cli", present + "-work"}
+            self.configure(profiles=tuple(expected))
+            for endpoint in GENERATIONS:
+                self.post_ok(endpoint, self.payload(endpoint), expected)
+                self.post_rejected(endpoint, self.payload(endpoint, absent + "-cli-only"))
 
     def test_intl_requires_known_positive_balance_not_domestic_fallback(self):
         for balance in (None, 0, -1):
             with self.subTest(balance=balance):
                 self.configure(balances={"intl-cli": balance, "intl-work": balance})
                 for endpoint in GENERATIONS:
-                    self.post_rejected("/intl/v1", endpoint, self.payload(endpoint))
-                self.post_ok("/v1", "chat/completions", self.payload(), {"cn-cli", "cn-work"})
+                    self.post_rejected(endpoint, self.payload(endpoint, "intl-cli-only"))
+                    self.post_ok(endpoint, self.payload(endpoint), {"cn-cli", "cn-work"})
 
-    def test_unknown_or_zero_balance_product_is_not_a_rotation_candidate(self):
-        for unavailable in ("intl-cli", "intl-work"):
-            for balance in (None, 0):
+    def test_unknown_or_zero_balance_is_not_a_rotation_candidate(self):
+        for unavailable in PROFILES:
+            for balance in ((None, 0) if unavailable.startswith("intl-") else (0,)):
                 self.configure(balances={unavailable: balance})
-                expected = {"intl-cli", "intl-work"} - {unavailable}
-                for _ in range(3):
-                    self.post_ok("/intl/v1", "chat/completions", self.payload(), expected)
+                expected = set(PROFILES) - {unavailable}
+                for _ in range(6):
+                    self.post_ok("chat/completions", self.payload(), expected)
 
     def test_unknown_or_empty_catalog_never_borrows_other_profile_models(self):
-        for region in ("cn", "intl"):
+        for unavailable in PROFILES:
             for missing in (None, []):
-                with self.subTest(region=region, catalog=missing):
+                with self.subTest(profile=unavailable, catalog=missing):
                     tables = catalogs()
-                    tables[region + "-cli"] = missing
+                    tables[unavailable] = missing
                     self.configure(tables=tables)
                     for endpoint in GENERATIONS:
-                        self.post_rejected("/" + region + "/v1", endpoint,
-                                           self.payload(endpoint, "cli-exclusive"))
-                        self.post_ok("/" + region + "/v1", endpoint,
-                                     self.payload(endpoint), {region + "-work"})
-                    tables[region + "-work"] = missing
-                    self.configure(tables=tables)
-                    for endpoint in GENERATIONS:
-                        response = self.post_rejected("/" + region + "/v1", endpoint,
-                                                       self.payload(endpoint))
-                        if missing is None and response.status_code == 503:
-                            self.assertIn("retry-after", response.headers)
+                        self.post_rejected(endpoint, self.payload(endpoint, unavailable + "-only"))
+                        self.post_ok(endpoint, self.payload(endpoint), set(PROFILES) - {unavailable})
+        for missing in (None, []):
+            self.configure(tables={profile: missing for profile in PROFILES})
+            for endpoint in GENERATIONS:
+                response = self.post_rejected(endpoint, self.payload(endpoint))
+                if response.status_code == 503:
+                    self.assertIn("retry-after", response.headers)
 
-    def test_model_cooldown_rebinds_only_within_region_then_fails_locally(self):
-        for region in ("cn", "intl"):
-            with self.subTest(region=region):
+    def test_model_cooldown_rebinds_across_regions_then_fails_locally(self):
+        payload = self.payload()
+        remaining = set(PROFILES)
+        while remaining:
+            request, _ = self.post_ok("chat/completions", payload, remaining)
+            selected = request.headers["x-user-id"]
+            remaining.remove(selected)
+            self.pool.note_status(self.entries[selected]["cm"], 429, model="shared-model")
+        for endpoint in GENERATIONS:
+            self.post_rejected(endpoint, self.payload(endpoint), statuses=(429,))
+        # Model cooldown is per account and model, not an account-wide ban.
+        for profile in PROFILES:
+            self.post_ok("chat/completions", self.payload(selected_model=profile + "-only"), {profile})
+
+    def test_sent_post_is_not_replayed_even_when_another_source_is_available(self):
+        for status in (401, 429):
+            for endpoint in GENERATIONS:
                 self.configure()
-                base = "/" + region + "/v1"
-                payload = self.payload()
-                request, _ = self.post_ok(base, "chat/completions", payload,
-                                          {region + "-cli", region + "-work"})
-                first = request.headers["x-user-id"]
-                self.pool.note_status(self.entries[first]["cm"], 429, model="shared-model")
-                other = ({region + "-cli", region + "-work"} - {first}).pop()
-                self.post_ok(base, "chat/completions", payload, {other})
-                self.pool.note_status(self.entries[other]["cm"], 429, model="shared-model")
-                for endpoint in GENERATIONS:
-                    self.post_rejected(base, endpoint, self.payload(endpoint), statuses=(429,))
-                # Other models remain usable; the same ID in the other region was not cooled.
-                self.post_ok(base, "chat/completions", self.payload(selected_model="cli-exclusive"),
-                             {region + "-cli"})
-                remote = "intl" if region == "cn" else "cn"
-                self.post_ok("/" + remote + "/v1", "chat/completions", self.payload(),
-                             {remote + "-cli", remote + "-work"})
+                payload = self.payload(endpoint)
+                self.allowed_profiles = set(PROFILES)
+                self.response_status = status
+                before = len(self.requests)
+                try:
+                    response = self.client.post("/v1/" + endpoint, json=payload)
+                finally:
+                    self.response_status = 200
+                self.assertEqual(response.status_code, status, response.text)
+                self.assertEqual(len(self.requests), before + 1, "a sent POST must not be replayed")
+                failed = self.requests[-1].headers["x-user-id"]
+                self.post_ok(endpoint, payload, set(PROFILES) - {failed})
 
-    def test_upstream_exclusive_model_429_cannot_fallback_to_wrong_product(self):
-        for region in ("cn", "intl"):
+    def test_exclusive_model_429_cannot_fallback_to_unsupported_source(self):
+        for profile in PROFILES:
             self.configure()
-            base = "/" + region + "/v1"
-            payload = self.payload(selected_model="cli-exclusive")
-            self.allowed_profiles = {region + "-cli"}
+            payload = self.payload(selected_model=profile + "-only")
+            self.allowed_profiles = {profile}
             self.response_status = 429
             before = len(self.requests)
             try:
-                response = self.client.post(base + "/chat/completions", json=payload)
+                response = self.client.post("/v1/chat/completions", json=payload)
             finally:
                 self.response_status = 200
             self.assertEqual(response.status_code, 429, response.text)
             self.assertEqual(len(self.requests), before + 1)
-            self.post_rejected(base, "chat/completions", payload, statuses=(429,))
-            self.post_ok(base, "chat/completions", self.payload(selected_model="work-exclusive"),
-                         {region + "-work"})
+            self.post_rejected("chat/completions", payload, statuses=(429,))
+            self.post_ok("chat/completions", self.payload(), PROFILES)
 
-    def test_account_cooldown_never_uses_another_region(self):
+    def test_account_cooldown_rebinds_to_supported_other_region(self):
         for region in ("cn", "intl"):
             self.configure()
+            remote = "intl" if region == "cn" else "cn"
             for profile in (region + "-cli", region + "-work"):
                 self.pool.cooldown(self.entries[profile]["cm"], reason="synthetic cooldown")
             for endpoint in GENERATIONS:
-                self.post_rejected("/" + region + "/v1", endpoint, self.payload(endpoint), statuses=(503,))
-
-    def test_model_guard_false_only_allows_unknown_model_in_local_single_product(self):
-        for region in ("cn", "intl"):
-            for product in ("cli", "work"):
-                profile = region + "-" + product
-                # Keep both products in the other region: the restriction is region-local.
-                remote = "intl" if region == "cn" else "cn"
-                self.configure(profiles=(profile, remote + "-cli", remote + "-work"), guard=False)
-                for endpoint in GENERATIONS:
-                    _, body = self.post_ok("/" + region + "/v1", endpoint,
-                                           self.payload(endpoint, "unlisted-model"), {profile})
-                    self.assertEqual(body["model"], "unlisted-model")
-            self.configure(guard=False)
+                self.post_ok(endpoint, self.payload(endpoint), {remote + "-cli", remote + "-work"})
+            for profile in (remote + "-cli", remote + "-work"):
+                self.pool.cooldown(self.entries[profile]["cm"], reason="synthetic cooldown")
             for endpoint in GENERATIONS:
-                self.post_rejected("/" + region + "/v1", endpoint,
-                                   self.payload(endpoint, "unlisted-model"))
+                self.post_rejected(endpoint, self.payload(endpoint), statuses=(503,))
 
-    def test_models_and_count_tokens_are_local_and_region_scoped(self):
-        for base, region in BASES:
-            with self.subTest(base=base):
-                self.allowed_profiles = set()
-                before = len(self.requests)
-                response = self.client.get(base + "/models")
-                self.assertEqual(response.status_code, 200, response.text)
-                actual = {item["id"] for item in response.json()["data"]}
-                expected = {item["id"] for profile, items in catalogs().items()
-                            if profile.startswith(region + "-") for item in items}
-                self.assertEqual(actual - {"auto"}, expected)
-                response = self.client.post(base + "/messages/count_tokens", json=self.payload("messages"))
-                self.assertEqual(response.status_code, 200, response.text)
-                self.assertIsInstance(response.json()["input_tokens"], int)
-                self.assertGreaterEqual(response.json()["input_tokens"], 0)
-                self.assertEqual(len(self.requests), before)
+    def test_unknown_model_has_no_source_in_multi_product_pool_even_without_guard(self):
+        for guard in (True, False):
+            self.configure(guard=guard)
+            for endpoint in GENERATIONS:
+                self.post_rejected(endpoint, self.payload(endpoint, "unlisted-model"))
 
-    def test_models_does_not_publish_missing_or_unfunded_product_catalog(self):
-        self.configure(profiles=("cn-cli", "cn-work", "intl-cli"))
-        response = self.client.get("/intl/v1/models")
+    def test_models_is_merged_and_count_tokens_remains_local(self):
+        response = self.client.get("/v1/models")
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"},
-                         {m["id"] for m in catalogs()["intl-cli"]})
-        self.configure(balances={"intl-cli": None, "intl-work": 0})
-        response = self.client.get("/intl/v1/models")
-        self.assertIn(response.status_code, (200, 503), response.text)
-        if response.status_code == 200:
-            self.assertEqual(response.json()["data"], [])
+        self.assertEqual(response.json()["object"], "list")
+        actual = {item["id"] for item in response.json()["data"]}
+        expected = {item["id"] for items in catalogs().values() for item in items}
+        self.assertEqual(actual, expected | {"auto"})
+        for selected in ("shared-model", "intl-cli-only"):
+            response = self.client.post("/v1/messages/count_tokens",
+                                        json=self.payload("messages", selected))
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIsInstance(response.json()["input_tokens"], int)
+            self.assertGreaterEqual(response.json()["input_tokens"], 0)
         self.assertFalse(self.requests)
 
-    def test_international_auto_maps_to_declared_default_model(self):
-        tables = catalogs()
-        tables["intl-cli"].append(model("default-model"))
-        # Work has no equivalent default: shared unrelated IDs cannot make it eligible for auto.
-        self.configure(tables=tables)
-        for endpoint in GENERATIONS:
-            for _ in range(3):
-                _, body = self.post_ok("/intl/v1", endpoint, self.payload(endpoint, "auto"), {"intl-cli"})
-                self.assertEqual(body["model"], "default-model")
+    def test_models_does_not_publish_missing_or_unfunded_product_catalog(self):
+        for profiles, balances, eligible in (
+                (("cn-cli", "cn-work", "intl-cli"), {}, ("cn-cli", "cn-work", "intl-cli")),
+                (PROFILES, {"intl-cli": None, "intl-work": 0}, ("cn-cli", "cn-work")),
+                (("intl-cli", "intl-work"), {"intl-cli": None, "intl-work": 0}, ())):
+            self.configure(profiles=profiles, balances=balances)
+            response = self.client.get("/v1/models")
+            self.assertIn(response.status_code, (200, 503), response.text)
+            if eligible:
+                self.assertEqual(response.status_code, 200, response.text)
+            if response.status_code == 200:
+                expected = {m["id"] for profile in eligible for m in catalogs()[profile]}
+                self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"}, expected)
+                if not eligible:
+                    self.assertEqual(response.json()["data"], [])
+        self.assertFalse(self.requests)
 
-    def test_international_shared_default_alias_rotates_and_obeys_mapped_cooldown(self):
+    def test_same_profile_accounts_cannot_borrow_catalog_or_balance(self):
+        second = "intl-cli-second"
+        self.add_account(second, "intl-cli")
+        for balance in (None, 0, 100):
+            for missing in (None, [], [model("second-only")]):
+                with self.subTest(balance=balance, catalog=missing):
+                    self.configure(profiles=("intl-cli", second), balances={"intl-cli": balance})
+                    self.account_catalogs({"intl-cli": [model("first-only")], second: missing})
+                    if balance == 100:
+                        self.post_ok("chat/completions", self.payload(selected_model="first-only"), {"intl-cli"})
+                    else:
+                        self.post_rejected("chat/completions", self.payload(selected_model="first-only"))
+                    if missing:
+                        self.post_ok("chat/completions", self.payload(selected_model="second-only"), {second})
+                    else:
+                        self.post_rejected("chat/completions", self.payload(selected_model="second-only"))
+                    response = self.client.get("/v1/models")
+                    self.assertIn(response.status_code, (200, 503), response.text)
+                    if response.status_code == 200:
+                        expected = ({"first-only"} if balance == 100 else set()) | ({"second-only"} if missing else set())
+                        self.assertEqual({m["id"] for m in response.json()["data"]}, expected)
+
+    def test_auto_maps_to_each_accounts_declared_default_and_rotates(self):
         tables = catalogs()
+        tables["cn-work"].append(model("auto"))
         for profile in ("intl-cli", "intl-work"):
             tables[profile].append(model("default-model"))
         self.configure(tables=tables)
-        seen = set()
-        for _ in range(4):
-            request, body = self.post_ok("/intl/v1", "chat/completions",
-                                         self.payload(selected_model="auto"), {"intl-cli", "intl-work"})
-            seen.add(request.headers["x-user-id"])
+        for endpoint in GENERATIONS:
+            seen = set()
+            for _ in range(8):
+                request, body = self.post_ok(endpoint, self.payload(endpoint, "auto"), PROFILES)
+                selected = request.headers["x-user-id"]
+                seen.add(selected)
+                self.assertEqual(body["model"], "default-model" if selected.startswith("intl-") else "auto")
+            self.assertEqual(seen, set(PROFILES))
+
+    def test_international_auto_requires_declared_default_and_mapped_cooldown(self):
+        tables = catalogs()
+        tables["intl-cli"].append(model("default-model"))
+        self.configure(profiles=("intl-cli", "intl-work"), tables=tables)
+        for endpoint in GENERATIONS:
+            _, body = self.post_ok(endpoint, self.payload(endpoint, "auto"), {"intl-cli"})
             self.assertEqual(body["model"], "default-model")
-        self.assertEqual(seen, {"intl-cli", "intl-work"})
-        for profile in seen:
-            self.pool.note_status(self.entries[profile]["cm"], 429, model="default-model")
+        self.pool.note_status(self.entries["intl-cli"]["cm"], 429, model="default-model")
         for endpoint in GENERATIONS:
-            self.post_rejected("/intl/v1", endpoint, self.payload(endpoint, "auto"), statuses=(429,))
+            self.post_rejected(endpoint, self.payload(endpoint, "auto"), statuses=(429,))
 
-    def test_domestic_auto_prefers_actual_product_declaration(self):
-        tables = catalogs()
-        tables["cn-work"].append(model("auto"))
-        tables["cn-cli"].append(model("default-model"))
-        self.configure(tables=tables)
-        for base in ("/v1", "/cn/v1"):
+    def test_auto_never_borrows_other_accounts_default(self):
+        for profile in PROFILES:
+            second = profile + "-second"
+            self.add_account(second, profile)
+            self.configure(profiles=(profile, second))
+            declared = "default-model" if profile.startswith("intl-") else "auto"
+            self.account_catalogs({profile: [model(declared)], second: []})
             for endpoint in GENERATIONS:
-                for _ in range(2):
-                    _, body = self.post_ok(base, endpoint, self.payload(endpoint, "auto"), {"cn-work"})
-                    self.assertEqual(body["model"], "auto")
+                _, body = self.post_ok(endpoint, self.payload(endpoint, "auto"), {profile})
+                self.assertEqual(body["model"], declared)
 
-    def test_domestic_cli_only_keeps_legacy_auto_without_cross_product_alias(self):
-        self.configure(profiles=("cn-cli", "intl-cli", "intl-work"))
-        for endpoint in GENERATIONS:
-            _, body = self.post_ok("/v1", endpoint, self.payload(endpoint, "auto"), {"cn-cli"})
-            self.assertEqual(body["model"], "auto")
+    def test_auto_rejects_unknown_empty_and_unrelated_work_or_intl_catalogs(self):
+        for profile in PROFILES:
+            for items in (None, [], [model("unrelated")]):
+                if profile == "cn-cli" and items:
+                    continue  # Legacy CLI auto is valid only with a known nonempty catalog.
+                self.configure(profiles=(profile,))
+                self.account_catalogs({profile: items})
+                for endpoint in GENERATIONS:
+                    self.post_rejected(endpoint, self.payload(endpoint, "auto"))
+
+    def test_domestic_cli_retains_legacy_auto_without_borrowing_work_default(self):
         tables = catalogs()
-        tables["cn-cli"].append(model("default-model"))
         tables["cn-work"].append(model("default"))
         self.configure(tables=tables)
         for endpoint in GENERATIONS:
-            # WorkBuddy 未声明 Auto 时仍使用已有的 CLI 别名，不借用其 default。
-            _, body = self.post_ok("/cn/v1", endpoint, self.payload(endpoint, "auto"), {"cn-cli"})
+            _, body = self.post_ok(endpoint, self.payload(endpoint, "auto"), {"cn-cli"})
             self.assertEqual(body["model"], "auto")
 
     def test_system_is_only_added_when_needed_and_preserves_payload_and_parameters(self):
-        for base, region in BASES:
+        for profile in PROFILES:
             for endpoint in GENERATIONS:
                 for system in (None, "Original caller system; preserve verbatim."):
-                    with self.subTest(base=base, endpoint=endpoint, system=system):
-                        payload = self.payload(endpoint, system=system)
+                    with self.subTest(profile=profile, endpoint=endpoint, system=system):
+                        payload = self.payload(endpoint, profile + "-only", system=system)
                         original = deepcopy(payload)
 
                         async def original_json(request):
                             return payload
 
-                        # Return the actual caller object, so in-place mutation cannot hide behind JSON encoding.
+                        # Use the actual caller object to catch in-place mutation.
                         with patch.object(converter.Request, "json", new=original_json):
-                            _, body = self.post_ok(base, endpoint, payload,
-                                                   {region + "-cli", region + "-work"})
+                            _, body = self.post_ok(endpoint, payload, {profile})
                         self.assertEqual(payload, original)
                         self.assertEqual(body["temperature"], 0.25)
                         self.assertEqual(body["top_p"], 0.75)
                         self.assertEqual(body["max_tokens"], 37)
-                        self.assertEqual(body["model"], "shared-model")
+                        self.assertEqual(body["model"], profile + "-only")
                         messages = body["messages"]
                         users = [message for message in messages if message["role"] == "user"]
                         self.assertEqual(users, original.get("messages", original.get("input"))[-1:])
@@ -497,7 +537,7 @@ class RegionRoutingTests(unittest.TestCase):
                             self.assertEqual(len(systems), 1)
 
     def test_late_system_is_not_overwritten_when_intl_requires_first_system(self):
-        payload = self.payload()
+        payload = self.payload(selected_model="intl-cli-only")
         payload["messages"].append({"role": "system", "content": "Keep this late system intact."})
         original = deepcopy(payload)
 
@@ -505,10 +545,9 @@ class RegionRoutingTests(unittest.TestCase):
             return payload
 
         with patch.object(converter.Request, "json", new=original_json):
-            _, body = self.post_ok("/intl/v1", "chat/completions", payload, {"intl-cli", "intl-work"})
+            _, body = self.post_ok("chat/completions", payload, {"intl-cli"})
         self.assertEqual(payload, original)
-        self.assertEqual(body["messages"][0]["role"], "system")
-        self.assertTrue(body["messages"][0]["content"])
+        self.assertEqual(body["messages"][0], original["messages"][-1])
         for message in original["messages"]:
             self.assertIn(message, body["messages"])
 
@@ -546,7 +585,7 @@ class RegionRoutingTests(unittest.TestCase):
         path = self.root / "cn-cli.info"
         path.write_text(json.dumps(value), encoding="utf-8")
         self.configure()
-        self.post_ok("/v1", "chat/completions", self.payload(selected_model="cn-cli-only"), {"cn-cli"})
+        self.post_ok("chat/completions", self.payload(selected_model="cn-cli-only"), {"cn-cli"})
         value["auth"]["expiresAt"] = 1
         path.write_text(json.dumps(value), encoding="utf-8")
         before = len(self.requests)
