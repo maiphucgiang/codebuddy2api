@@ -1320,9 +1320,10 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
 async def _collect_stream(response: httpx.Response) -> dict:
     """消费后端的 OpenAI SSE 流，聚合成单个非流式 chat.completion 对象。
 
-    合并所有 chunk 的 delta（content / tool_calls），并取 usage / finish_reason。
+    合并所有 chunk 的 delta（content / reasoning_content / tool_calls），并取 usage / finish_reason。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     # tool_calls: index -> {id, name, arguments(分片拼接)}
     tool_calls: dict[int, dict] = {}
     model: str | None = None
@@ -1347,6 +1348,8 @@ async def _collect_stream(response: httpx.Response) -> dict:
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
             if delta.get("content"):
                 content_parts.append(delta["content"])
             for tc in delta.get("tool_calls") or []:
@@ -1370,6 +1373,9 @@ async def _collect_stream(response: httpx.Response) -> dict:
         finish_reason = finish_reason or "tool_calls"
 
     message = {"role": "assistant", "content": "".join(content_parts) or None}
+    reasoning = "".join(reasoning_parts)
+    if reasoning:
+        message["reasoning_content"] = reasoning
     if tcs:
         message["tool_calls"] = tcs
     return {
@@ -1403,8 +1409,9 @@ def _tool_calls_healthy(tool_calls) -> bool:
 
 
 def _merge_chat_sse_text(text: str) -> dict:
-    """把后端 Chat SSE 文本聚合成 {content, tool_calls, finish_reason, usage, model}。"""
+    """把后端 Chat SSE 文本聚合成 {content, reasoning_content, tool_calls, finish_reason, usage, model}"""
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     slots: dict[int, dict] = {}
     finish = usage = model = None
     for line in text.splitlines():
@@ -1425,6 +1432,8 @@ def _merge_chat_sse_text(text: str) -> dict:
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
             delta = choice.get("delta") or {}
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
             if delta.get("content"):
                 content_parts.append(delta["content"])
             for tc in delta.get("tool_calls") or []:
@@ -1439,13 +1448,14 @@ def _merge_chat_sse_text(text: str) -> dict:
     tcs = [{"id": s["id"], "type": "function",
             "function": {"name": s["name"], "arguments": s["arguments"]}}
            for _, s in sorted(slots.items())] if slots else None
-    return {"content": "".join(content_parts), "tool_calls": tcs,
+    return {"content": "".join(content_parts), "reasoning_content": "".join(reasoning_parts) or None, "tool_calls": tcs,
             "finish_reason": finish, "usage": usage, "model": model}
 
 
 def _chat_result_to_sse_lines(m: dict) -> list[str]:
-    """把聚合结果伪流式化为标准 OpenAI SSE 文本行（chat 直接转发，anthropic 喂转换器）。"""
+    """把聚合结果伪流式化为标准 OpenAI SSE 文本行（chat 直接转发，anthropic 喂转换器）；reasoning 先于正文重放。"""
     content = m.get("content") or ""
+    reasoning = m.get("reasoning_content") or ""
     tcs = m.get("tool_calls") or []
     finish = m.get("finish_reason") or "stop"
     model = m.get("model")
@@ -1457,6 +1467,8 @@ def _chat_result_to_sse_lines(m: dict) -> list[str]:
         return "data: " + json.dumps(payload, ensure_ascii=False)
 
     lines = [_line({"role": "assistant", "content": ""})]
+    for i in range(0, len(reasoning), 48):
+        lines.append(_line({"reasoning_content": reasoning[i:i + 48]}))
     for i in range(0, len(content), 48):
         lines.append(_line({"content": content[i:i + 48]}))
     for i, tc in enumerate(tcs):
@@ -1519,6 +1531,7 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
             _log(f"{prefix}▸ 流式 tool_calls 损坏（name 空/参数无效），重试 {attempt + 1}/{_TOOL_CALL_MAX_RETRY}")
         msg = (collected.get("choices") or [{}])[0].get("message") or {}
         m = {"content": msg.get("content") or "",
+             "reasoning_content": msg.get("reasoning_content"),
              "tool_calls": msg.get("tool_calls"),
              "finish_reason": (collected.get("choices") or [{}])[0].get("finish_reason"),
              "usage": collected.get("usage"), "model": collected.get("model")}

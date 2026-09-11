@@ -242,6 +242,11 @@ class AnthropicStreamConverter:
         self._text_block_open = False
         self._text_block_idx = 0
 
+        # thinking 内容块（上游 reasoning_content → Anthropic thinking block）
+        self._thinking_content = ""
+        self._thinking_block_open = False
+        self._thinking_block_idx = 0
+
         # tool_use 内容块（index → {id, name, args, block_idx, open}）
         self._tool_uses: dict[int, dict] = {}
         self._next_block_idx = 0
@@ -270,6 +275,13 @@ class AnthropicStreamConverter:
     def finish(self) -> str:
         """流结束，发出收尾事件。"""
         events: list[str] = []
+
+        # 关闭 thinking 块
+        if self._thinking_block_open:
+            events.append(self._evt(
+                "content_block_stop", {"index": self._thinking_block_idx}
+            ))
+            self._thinking_block_open = False
 
         # 关闭 text 块
         if self._text_block_open:
@@ -360,9 +372,32 @@ class AnthropicStreamConverter:
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
+            # thinking delta（reasoning_content → thinking block，位于正文之前）
+            thinking = delta.get("reasoning_content")
+            if thinking:
+                self._thinking_content += thinking
+                if not self._thinking_block_open:
+                    self._thinking_block_idx = self._next_block_idx
+                    self._next_block_idx += 1
+                    events.append(self._evt("content_block_start", {
+                        "index": self._thinking_block_idx,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }))
+                    self._thinking_block_open = True
+                events.append(self._evt("content_block_delta", {
+                    "index": self._thinking_block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": thinking},
+                }))
+
             # content delta
             content = delta.get("content")
             if content:
+                # 正文开始时关闭 thinking 块（thinking 必须位于正文之前）
+                if self._thinking_block_open:
+                    events.append(self._evt("content_block_stop", {
+                        "index": self._thinking_block_idx
+                    }))
+                    self._thinking_block_open = False
                 self._text_content += content
                 if not self._text_block_open:
                     self._text_block_idx = self._next_block_idx
@@ -398,6 +433,12 @@ class AnthropicStreamConverter:
                     slot["name"] = fn["name"]
 
                 if not slot["open"]:
+                    # thinking 块先于 tool_use 关闭（reasoning → tool_call 无正文时）
+                    if self._thinking_block_open:
+                        events.append(self._evt("content_block_stop", {
+                            "index": self._thinking_block_idx
+                        }))
+                        self._thinking_block_open = False
                     events.append(self._evt("content_block_start", {
                         "index": slot["block_idx"],
                         "content_block": {"type": "tool_use", "id": slot["id"], "name": slot["name"], "input": {}},
@@ -415,6 +456,12 @@ class AnthropicStreamConverter:
                 self._finish_reason = finish
 
                 # finish_reason 出现时关闭当前打开的块
+                if self._thinking_block_open:
+                    events.append(self._evt("content_block_stop", {
+                        "index": self._thinking_block_idx
+                    }))
+                    self._thinking_block_open = False
+
                 if self._text_block_open:
                     events.append(self._evt("content_block_stop", {
                         "index": self._text_block_idx
@@ -438,6 +485,10 @@ class AnthropicStreamConverter:
     def _build_content_blocks(self) -> list[dict]:
         """构造完整的 content blocks 数组（用于非流式响应）。"""
         blocks: list[dict] = []
+
+        # thinking block（须位于 text 之前）
+        if self._thinking_content:
+            blocks.append({"type": "thinking", "thinking": self._thinking_content})
 
         # text block
         if self._text_content or self._text_block_open:

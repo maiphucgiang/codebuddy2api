@@ -264,6 +264,10 @@ class ResponsesStreamConverter:
 
         # 累积内容
         self._content = ""
+        # reasoning item（上游 reasoning_content → Responses reasoning，位于 message 之前）
+        self._reasoning = ""
+        self._reasoning_item_id = _rand_id("rs_")
+        self._emitted_reasoning_item = False
         self._tool_calls: dict[int, dict] = {}  # index → {id, name, args, fc_id, output_idx, emitted}
         self._finish_reason: str | None = None
         self._usage: dict | None = None
@@ -288,19 +292,28 @@ class ResponsesStreamConverter:
         """流结束后，发出收尾事件（done + completed）。"""
         events: list[str] = []
 
+        # 关闭 reasoning item
+        if self._emitted_reasoning_item:
+            events.append(self._evt("response.reasoning_summary_text.done", {
+                "output_index": 0, "summary_index": 0, "text": self._reasoning
+            }))
+            events.append(self._evt("response.output_item.done", {
+                "output_index": 0, "item": self._reasoning_item("completed")
+            }))
+
         # 关闭 text content
         if self._emitted_content_part:
             events.append(self._evt("response.output_text.done", {
-                "output_index": 0, "content_index": 0, "text": self._content
+                "output_index": self._msg_idx(), "content_index": 0, "text": self._content
             }))
             events.append(self._evt("response.content_part.done", {
-                "output_index": 0, "content_index": 0,
+                "output_index": self._msg_idx(), "content_index": 0,
                 "part": {"type": "output_text", "text": self._content, "annotations": []}
             }))
 
         if self._emitted_msg_item:
             events.append(self._evt("response.output_item.done", {
-                "output_index": 0,
+                "output_index": self._msg_idx(),
                 "item": self._msg_item("completed")
             }))
 
@@ -350,34 +363,50 @@ class ResponsesStreamConverter:
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
+            # ---- reasoning delta（reasoning_content → reasoning item，位于 message 之前）----
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                if not self._emitted_reasoning_item:
+                    events.append(self._evt("response.output_item.added", {
+                        "output_index": 0,
+                        "item": {"type": "reasoning", "id": self._reasoning_item_id,
+                                 "summary": [], "status": "in_progress"}
+                    }))
+                    self._emitted_reasoning_item = True
+                self._reasoning += reasoning
+                events.append(self._evt("response.reasoning_summary_text.delta", {
+                    "output_index": 0, "summary_index": 0, "delta": reasoning
+                }))
+
             # ---- content delta ----
             content = delta.get("content")
             if content:
                 if not self._emitted_msg_item:
                     events.append(self._evt("response.output_item.added", {
-                        "output_index": 0,
+                        "output_index": self._msg_idx(),
                         "item": self._msg_item("in_progress", empty=True)
                     }))
                     self._emitted_msg_item = True
 
                 if not self._emitted_content_part:
                     events.append(self._evt("response.content_part.added", {
-                        "output_index": 0, "content_index": 0,
+                        "output_index": self._msg_idx(), "content_index": 0,
                         "part": {"type": "output_text", "text": "", "annotations": []}
                     }))
                     self._emitted_content_part = True
 
                 self._content += content
                 events.append(self._evt("response.output_text.delta", {
-                    "output_index": 0, "content_index": 0, "delta": content
+                    "output_index": self._msg_idx(), "content_index": 0, "delta": content
                 }))
 
             # ---- tool_calls delta ----
             for tc in delta.get("tool_calls", []):
                 idx = tc.get("index", 0)
                 if idx not in self._tool_calls:
-                    # 计算 output_index：msg 占 0，function_call 从 1 开始（如果有 msg）
-                    base = 1 if (self._emitted_msg_item or self._content) else 0
+                    # 计算 output_index：reasoning/msg item 在前，function_call 依次往后排
+                    base = (1 if self._emitted_reasoning_item else 0) + \
+                           (1 if (self._emitted_msg_item or self._content) else 0)
                     oi = base + len(self._tool_calls)
                     self._tool_calls[idx] = {
                         "id": tc.get("id", ""),
@@ -421,6 +450,15 @@ class ResponsesStreamConverter:
         payload = {"type": event_type, **data}
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+    def _msg_idx(self) -> int:
+        """message item 的 output_index；reasoning item 存在时占据 0，message 顺延到 1。"""
+        return 1 if self._emitted_reasoning_item else 0
+
+    def _reasoning_item(self, status: str) -> dict:
+        """Responses reasoning item：思考全文放在 summary 第一段。"""
+        return {"type": "reasoning", "id": self._reasoning_item_id, "status": status,
+                "summary": [{"type": "summary_text", "text": self._reasoning}]}
+
     def _msg_item(self, status: str = "in_progress", empty: bool = False) -> dict:
         content = [] if empty else [
             {"type": "output_text", "text": self._content, "annotations": []}
@@ -445,6 +483,8 @@ class ResponsesStreamConverter:
 
     def _response_obj(self, status: str) -> dict:
         output = []
+        if self._emitted_reasoning_item:
+            output.append(self._reasoning_item(status))
         if self._emitted_msg_item or self._content:
             output.append(self._msg_item(status))
         for idx in sorted(self._tool_calls):
@@ -455,11 +495,12 @@ class ResponsesStreamConverter:
         usage = None
         if self._usage:
             u = self._usage
+            reasoning_tokens = (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
             usage = {
                 "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)),
                 "input_tokens_details": {"cached_tokens": 0},
                 "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)),
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
                 "total_tokens": u.get("total_tokens", 0),
             }
 
