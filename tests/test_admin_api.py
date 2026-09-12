@@ -153,6 +153,20 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(self.store.snapshot()["settings"]["max_images"], 3)
 
 
+    def test_key_rotation_does_not_revive_pending_header_oauth(self):
+        started = self.client.post("/admin/oauth/start?site=cn", headers=self.headers)
+        self.assertEqual(started.status_code, 200)
+        task = started.json()["login_id"]
+        self.config["api_key"] = "rotated-synthetic-key"
+        response = self.client.get("/admin/session", headers={"Authorization": "Bearer rotated-synthetic-key"})
+        self.assertEqual(response.status_code, 200)
+        self.config["api_key"] = "synthetic-key"
+        response = self.client.get("/admin/oauth/poll", params={"login_id": task}, headers=self.headers)
+        self.assertEqual(response.status_code, 404)
+        self.gateway._OAUTH.poll.assert_not_called()
+        self.gateway._save_oauth_credential.assert_not_called()
+
+
     def test_settings_revision_locked_sources_and_secret_redaction(self):
         self.config["auth_dir"] = "/private-directory"
         self.config["settings_sources"] = {"max_images": "environment"}

@@ -16,6 +16,7 @@ Open `/dashboard` and sign in with the configured API key. Management is locked 
 - 管理 / management: `/admin/*`；原有接口方法和地址不迁移 / existing methods and paths remain.
 - 客户端 / clients: `/v1/*`；管理 Cookie 不授权推理请求 / management cookies do not authorize inference.
 - `/` 与不存在的页面跳转 `/dashboard`；未知 API、缺失资源返回 JSON/资源错误，不返回 SPA HTML。
+- 静态资源仅限 `web/dist/assets/`，路径及符号链接目标均不得越界 / static resources are confined to `web/dist/assets/`, including symlink targets.
 
 ## 数据目录 / Data directory
 
@@ -57,8 +58,10 @@ Precedence: explicit CLI > environment > persisted UI settings > defaults. The U
 - 请求处理、计费显示、目录 TTL、日志策略等可热更新。
 - host/port 等启动参数保存后等待重启；CLI 或环境已控制的字段只读。
 - API key、凭证目录、导入目录和兼容文本日志路径继续由启动来源管理；不通过 WebUI 改写 `.env` 或任意路径。
-- key 生效变化使旧会话失效。模型/设置保存遇到 409 时刷新后重新编辑。
+- key 生效变化使旧管理会话及待完成 OAuth 授权失效，恢复旧 key 不会恢复旧授权。模型/设置保存遇到 409 时刷新后重新编辑。
 - 若审计策略应用失败，接口返回 503，运行值保持不变；已保存值可在存储恢复后重试或重启应用。
+
+Effective key changes invalidate management sessions and pending OAuth authorization; restoring an old key does not restore access.
 
 ## 日志与统计 / Logs and statistics
 

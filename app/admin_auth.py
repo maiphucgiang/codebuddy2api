@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-import hashlib
 import hmac
 import secrets
 import threading
@@ -44,16 +43,18 @@ class AdminAuth:
         self.lock = threading.RLock()
         self.sessions = OrderedDict()
         self.failures = OrderedDict()
-        self._fingerprint = None
+        self._configured_key = None
+        self._identity = None
 
     def _key(self):
         key = self.config.get("api_key") or ""
         if not isinstance(key, str):
             key = ""
-        fingerprint = hashlib.sha256(key.encode()).digest()
-        if fingerprint != self._fingerprint:
+        if self._configured_key is None or not hmac.compare_digest(key.encode(), self._configured_key.encode()):
             self.sessions.clear()
-            self._fingerprint = fingerprint
+            self._configured_key = key
+            # Restoring a previous key must not restore that epoch's OAuth owner.
+            self._identity = secrets.token_urlsafe(32)
         return key
 
     def enabled(self):
@@ -68,9 +69,9 @@ class AdminAuth:
     def header_identity(self, request):
         authorization = request.headers.get("authorization", "")
         bearer = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-        if self.check_key(bearer) or self.check_key(request.headers.get("x-api-key")):
-            with self.lock:
-                return "key:" + self._fingerprint.hex()
+        with self.lock:
+            if self.check_key(bearer) or self.check_key(request.headers.get("x-api-key")):
+                return "key:" + self._identity
         return None
 
     def session(self, request):

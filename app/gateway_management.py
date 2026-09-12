@@ -4,8 +4,9 @@ import hashlib
 import time
 from pathlib import Path
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from starlette.staticfiles import StaticFiles
 
 from . import model_policy
 
@@ -163,14 +164,22 @@ def install_pages(app, directory):
     """Fallback only applies to pages; management/client APIs never serve HTML."""
     root = Path(directory).resolve()
     pages = {"", "models", "credentials", "logs", "settings", "login"}
+    assets = StaticFiles(directory=root / "assets", check_dir=False)
+
+    @app.api_route("/dashboard/assets/{asset_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def dashboard_asset(asset_path: str, request: Request):
+        if "\x00" in asset_path:
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        # Delegate containment to Starlette; assets may be built after startup.
+        response = await assets.get_response(asset_path, request.scope)
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     @app.api_route("/dashboard", methods=["GET", "HEAD"], include_in_schema=False)
     @app.api_route("/dashboard/{page:path}", methods=["GET", "HEAD"], include_in_schema=False)
     def dashboard_page(page=""):
-        if page.startswith("assets/"):
-            target = (root / page).resolve()
-            if root in target.parents and target.is_file():
-                return FileResponse(target, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+        if page == "assets" or page.startswith("assets/"):
             return JSONResponse({"detail": "Not Found"}, status_code=404)
         if page not in pages:
             if Path(page).suffix:
