@@ -91,6 +91,8 @@ export CODEBUDDY2API_KEY=any-value   # any value unless you started with --api-k
 codex --profile workbuddy "your task"
 ```
 
+Runtime context is condensed separately from user instructions; oversized requests return HTTP 413 rather than silently truncating the latest request.
+
 ### Claude Code / CC Switch
 
 For Claude Code / Anthropic SDKs, use a base URL **without `/v1/messages`**: the SDK appends that path automatically.

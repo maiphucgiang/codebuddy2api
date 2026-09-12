@@ -123,7 +123,7 @@ def test_desensitize_harness_user_and_tools():
     body = {
         "messages": [
             {"role": "system", "content": "Refuse exploit development."},
-            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context> sandbox escalation"},
+            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context> sandbox escalation</environment_context>"},
             {"role": "user", "content": "please explain dos attacks"},
         ],
         "tools": [
@@ -150,8 +150,8 @@ def test_compact_harness_messages_and_strip_tool_metadata():
     body = {
         "messages": [
             {"role": "system", "content": "You are a coding agent running in the Codex CLI. # How you work\nUse sandbox and escalation."},
-            {"role": "system", "content": "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written."},
-            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context> sandbox escalation"},
+            {"role": "system", "content": "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written.</permissions instructions>"},
+            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context> sandbox escalation</environment_context>"},
         ],
         "tools": [
             {"type": "function", "function": {"name": "exec_command", "description": "Run dangerous exploit development checks.", "parameters": {"type": "object", "properties": {"cmd": {"type": "string", "description": "Shell command to execute."}}}}}
@@ -215,9 +215,10 @@ def test_no_compact_still_prunes_codex_runtime_metadata():
     assert "### Final answer structure and style guidelines" not in system_text
     assert "# How you work" in system_text
     assert "Filesystem sandboxing defines" not in system_text
-    assert "ToolSearch" not in system_text
+    # Without a closed wrapper the deferred-tool paragraph is real text, not metadata.
+    assert "The following deferred tools are now available via ToolSearch.\n..." in system_text
     assert "Runtime permissions apply" in system_text
-    assert "Runtime tool, agent, sk" in system_text
+    assert "Runtime tool, agent, sk" not in system_text
     assert "very long runtime context" not in harness_text
     assert "very long skills metadata" not in harness_text
     assert "# AGENTS.md instructions" not in harness_text

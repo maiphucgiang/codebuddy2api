@@ -91,6 +91,8 @@ export CODEBUDDY2API_KEY=any-value   # 转换器未启用 --api-key 时随便填
 codex --profile workbuddy "你的任务描述"
 ```
 
+运行时上下文与真实用户指令分开处理；超限请求返回 HTTP 413，不静默截断最新用户请求。
+
 ### Claude Code / CC Switch
 
 Claude Code / Anthropic SDK 的 Base URL **不要带 `/v1/messages`**，SDK 会自动追加该路径。

@@ -10,20 +10,23 @@ Codex CLI 会把大量运行时提示、完整工具 schema、长历史、以及
 本模块在保持外部 OpenAI Responses 兼容的前提下，只对发往后端的 Chat body 做
 "最小语义闭包"投影：
 
-- 固定短 system 摘要替换 Codex/Claude Code harness
-- 保留最新用户意图
+- 添加短 system 基线，仅压缩有可信边界的 Codex/Claude Code harness
+- 完整保留自定义 system 和最新真实用户正文，harness 上下文独立限额
 - 保留最近一段真实 assistant/tool 链路
 - 把更早历史压缩成规则摘要
 - 把 tool schema 收敛成结构字段
 - 把超长 tool output / tool arguments 压缩成可继续推理的摘要
 
-含图片时保留消息历史与图片块，只压缩文本和工具元数据，避免限额内图片再次被摘要丢弃。
+含图片时保留消息历史与图片块，只压缩上下文、助手/工具文本及工具元数据。
+真实用户正文不做局部截断；超大请求由既有网关请求上限拒绝。
 """
 
 from __future__ import annotations
 
 import json
 from typing import Any
+
+from app.harness_context import parse_harness_text
 
 
 AGENTIC_TOOL_NAMES = {
@@ -73,7 +76,7 @@ BASE_SYSTEM_PROMPT = (
 HISTORY_PREFIX = "Earlier conversation summary (condensed):"
 
 MAX_SYSTEM_GUIDANCE_CHARS = 1200
-MAX_USER_CHARS = 3200
+MAX_USER_CONTEXT_CHARS = 3200
 MAX_ASSISTANT_CHARS = 1800
 MAX_TOOL_OUTPUT_CHARS = 1600
 MAX_TOOL_ARGS_CHARS = 900
@@ -132,71 +135,55 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
         }
 
     tool_name_by_call_id = _build_tool_call_name_map(messages)
-    preserved_guidance: list[str] = []
+    preserved_guidance: list[dict] = []
     conversation: list[dict] = []
+    # Provenance stays outside the wire messages; summaries are not new user turns.
+    context_only_indices: set[int] = set()
     dropped_harness_messages = 0
 
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
-        text = _content_to_text(msg.get("content", ""))
-
-        if role == "system":
-            if _looks_like_harness_system(text):
-                # 命中 harness 不再整段丢弃：只压缩运行时元数据，
-                # 保住真实行为规范与仓库约束，避免模型失去工作准则。
-                dropped_harness_messages += 1
-                text = _prune_runtime_fragments("system", text)
-            guidance = _truncate_text(text, MAX_SYSTEM_GUIDANCE_CHARS)
-            if guidance:
-                preserved_guidance.append(guidance)
-            continue
-
-        if role == "user" and _looks_like_harness_user(text):
-            # 只抽掉注入块，同条里的用户原话与 reminder 正文必须留下。
-            # 旧实现在这里直接 continue，整条消息连同用户真话一起消失，
-            # 且 anchor/history-summary 都在过滤后的列表上计算，救不回来。
-            dropped_harness_messages += 1
-            text = _prune_runtime_fragments("user", text)
-            if not text.strip():
+        if role in {"system", "user"}:
+            limit = MAX_SYSTEM_GUIDANCE_CHARS if role == "system" else MAX_USER_CONTEXT_CHARS
+            content, matched, has_user_text = _project_harness_content(msg.get("content", ""), limit)
+            dropped_harness_messages += int(matched)
+            projected_msg = {**msg, "content": content}
+            if role == "system":
+                # Custom guidance has no shared metadata budget or message-count cap.
+                preserved_guidance.append(projected_msg)
                 continue
-            msg = {**msg, "content": text}
-
-        projected_msg = _project_conversation_message(msg)
+            if matched and not has_user_text:
+                context_only_indices.add(len(conversation))
+        else:
+            projected_msg = _project_conversation_message(msg)
         if projected_msg is not None:
             conversation.append(projected_msg)
 
-    if not conversation:
-        # 兜底整段投影：丢掉的只是"抽取后没有任何用户内容"的纯 harness 消息，
-        # 夹带用户原话的消息必须留下，否则又会回到丢上下文的老问题。
-        conversation = [
-            m for m in _project_messages_conservative(messages)
-            if not _is_pure_harness_message(m)
-        ]
-
     tail_start = _choose_tail_start(conversation)
     tail_start = _expand_tail_for_tool_context(conversation, tail_start)
-    latest_user_idx = _latest_user_index(conversation)
+    latest_user_idx = _latest_user_index(conversation, context_only_indices)
 
     anchor_user = None
     if latest_user_idx is not None and latest_user_idx < tail_start:
         anchor_user = dict(conversation[latest_user_idx])
 
     omitted: list[dict] = []
+    omitted_context_indices: set[int] = set()
     for idx, msg in enumerate(conversation):
         if idx >= tail_start:
             break
         if latest_user_idx is not None and idx == latest_user_idx and anchor_user is not None:
             continue
+        if idx in context_only_indices:
+            omitted_context_indices.add(len(omitted))
         omitted.append(msg)
 
     final_messages: list[dict] = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
-    guidance_message = _merge_guidance_messages(preserved_guidance)
-    if guidance_message:
-        final_messages.append({"role": "system", "content": guidance_message})
+    final_messages.extend(preserved_guidance)
 
-    history_summary = _build_history_summary(omitted, tool_name_by_call_id)
+    history_summary = _build_history_summary(omitted, tool_name_by_call_id, omitted_context_indices)
     if history_summary:
         final_messages.append({"role": "system", "content": history_summary})
 
@@ -256,14 +243,9 @@ def _project_conversation_message(msg: dict, conservative: bool = False) -> dict
     role = msg.get("role")
     out = dict(msg)
 
-    if role == "system":
-        out["content"] = _project_content(msg.get("content", ""),
-                                          lambda text: _truncate_text(text, MAX_SYSTEM_GUIDANCE_CHARS))
-        return out
-
-    if role == "user":
-        out["content"] = _project_content(msg.get("content", ""),
-                                          lambda text: _truncate_text(text, MAX_USER_CHARS))
+    if role in {"system", "user"}:
+        limit = MAX_SYSTEM_GUIDANCE_CHARS if role == "system" else MAX_USER_CONTEXT_CHARS
+        out["content"], _, _ = _project_harness_content(msg.get("content", ""), limit)
         return out
 
     if role == "assistant":
@@ -299,14 +281,50 @@ def _has_image_content(content: Any) -> bool:
 
 
 def _project_content(content: Any, transform) -> Any:
-    """Only text is summarizable; image URLs/data and block order stay untouched."""
-    if not _has_image_content(content):
+    """Keep content blocks and their order, including text-only block lists."""
+    if not isinstance(content, list):
         return transform(_content_to_text(content))
     return [
         {**block, "text": transform(block.get("text", ""))}
-        if isinstance(block, dict) and block.get("type") == "text" else block
+        if isinstance(block, dict) and block.get("type") == "text"
+        else transform(block) if isinstance(block, str) else block
         for block in content
     ]
+
+
+def _project_harness_content(content: Any, context_limit: int) -> tuple[Any, bool, bool]:
+    """Budget only recognized context; never truncate real user/system text.
+
+    Parse each text block independently: a wrapper crossing block boundaries is
+    conservatively retained. Images and unknown blocks count as real content.
+    """
+    matched = False
+    has_user_text = isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") != "text" for block in content
+    )
+    remaining = context_limit
+
+    def budget_context(text: str) -> str:
+        nonlocal remaining
+        if remaining <= 0:
+            return ""
+        if len(text) <= remaining:
+            result = text
+        else:
+            suffix = f" ... [{len(text)} context chars condensed]"
+            result = text[:max(0, remaining - len(suffix))] + suffix[:remaining]
+        remaining -= len(result)
+        return result
+
+    def project_text(text: str) -> str:
+        nonlocal matched, has_user_text
+        parsed = parse_harness_text(text)
+        matched = matched or parsed.matched
+        has_user_text = has_user_text or bool(parsed.user_text.strip())
+        return parsed.render(context_transform=budget_context)
+
+    projected = _project_content(content, project_text)
+    return projected, matched, has_user_text
 
 
 def _project_tool_call(tool_call: dict) -> dict | None:
@@ -488,20 +506,21 @@ def _expand_tail_for_tool_context(messages: list[dict], start: int) -> int:
     return expanded
 
 
-def _latest_user_index(messages: list[dict]) -> int | None:
+def _latest_user_index(messages: list[dict], context_only_indices: set[int]) -> int | None:
     for idx in range(len(messages) - 1, -1, -1):
-        if messages[idx].get("role") == "user":
+        if messages[idx].get("role") == "user" and idx not in context_only_indices:
             return idx
     return None
 
 
-def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str, str]) -> str:
+def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str, str],
+                           context_only_indices: set[int]) -> str:
     lines: list[str] = []
     total_chars = 0
     summarized = 0
 
-    for msg in messages:
-        line = _history_line(msg, tool_name_by_call_id)
+    for idx, msg in enumerate(messages):
+        line = _history_line(msg, tool_name_by_call_id, idx in context_only_indices)
         if not line:
             continue
         if summarized >= MAX_HISTORY_ITEMS or total_chars + len(line) > MAX_HISTORY_SUMMARY_CHARS:
@@ -519,12 +538,13 @@ def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str,
     return HISTORY_PREFIX + "\n" + "\n".join(lines)
 
 
-def _history_line(msg: dict, tool_name_by_call_id: dict[str, str]) -> str:
+def _history_line(msg: dict, tool_name_by_call_id: dict[str, str], context_only: bool = False) -> str:
     role = msg.get("role")
     text = _content_to_text(msg.get("content", ""))
 
     if role == "user":
-        return f"User asked: {_truncate_text(text, 220)}"
+        label = "Harness context" if context_only else "User asked"
+        return f"{label}: {_truncate_text(text, 220)}"
 
     if role == "assistant":
         tool_names = [
@@ -565,26 +585,6 @@ def _build_tool_call_name_map(messages: list[dict]) -> dict[str, str]:
             if call_id and name:
                 mapping[call_id] = name
     return mapping
-
-
-def _merge_guidance_messages(messages: list[str]) -> str:
-    merged: list[str] = []
-    total = 0
-    for message in messages[:2]:
-        text = message.strip()
-        if not text:
-            continue
-        if total + len(text) > MAX_SYSTEM_GUIDANCE_CHARS:
-            text = _truncate_text(text, MAX_SYSTEM_GUIDANCE_CHARS - total)
-        merged.append(text)
-        total += len(text)
-        if total >= MAX_SYSTEM_GUIDANCE_CHARS:
-            break
-    if not merged:
-        return ""
-    if len(merged) == 1:
-        return merged[0]
-    return "Additional instructions:\n" + "\n\n".join(merged)
 
 
 def _summarize_tool_output(text: str) -> str:
@@ -687,48 +687,6 @@ def _looks_like_harness_user(text: str) -> bool:
 
 def _looks_like_harness_system(text: str) -> bool:
     return any(marker in text for marker in HARNESS_SYSTEM_MARKERS)
-
-
-def _prune_runtime_fragments(role: str, text: str) -> str:
-    """复用脱敏层的抽取逻辑：只去注入块，保留用户原话与 reminder 正文。
-
-    投影层与脱敏层必须行为一致，否则 /v1/responses(Codex CLI) 和
-    /v1/chat/completions 两条路径会拿到不同的上下文。这里直接复用同一份
-    实现，避免两处各自漂移；万一该模块不可用，原样返回也绝不丢弃内容。
-    """
-    if not text:
-        return text
-    try:
-        from desensitize import _prune_runtime_fragments as _impl
-    except Exception:
-        return text
-    return _impl(role, text)
-
-
-HARNESS_DOMINANT_RATIO = 0.5
-
-
-def _is_pure_harness_message(msg: dict) -> bool:
-    """判断投影后的消息是否只是 harness 载荷（可安全丢弃）。
-
-    用户原话与 harness 同条时，压缩后 harness 通常占大头、用户话只占末尾；
-    因此仅在第一条 harness 标记之前的 harness 前缀占比很高时才视为纯 harness。
-    """
-    text = _content_to_text(msg.get("content", ""))
-    stripped = text.strip()
-    if not stripped:
-        return True
-    positions = [stripped.find(marker) for marker in HARNESS_USER_MARKERS]
-    positions = [pos for pos in positions if pos >= 0]
-    if not positions:
-        return False
-    if min(positions) > 0:
-        return False
-    # 从最早出现的 harness 标记起到下一个空行（用户原话通常从这里开始）
-    rest = stripped[min(positions):]
-    boundary = rest.find("\n\n")
-    dominant = rest if boundary < 0 else rest[:boundary]
-    return len(dominant) / len(stripped) >= HARNESS_DOMINANT_RATIO
 
 
 def _message_cost(msg: dict) -> int:
