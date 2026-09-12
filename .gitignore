@@ -32,6 +32,9 @@ secrets.*
 # 自管凭证目录与凭据文件（敏感，绝不提交）
 auth/
 *.info
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 # 运行日志（含请求体，敏感）
 converter.log*
 
