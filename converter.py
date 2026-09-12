@@ -34,7 +34,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -45,36 +45,40 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 try:
-    from desensitize import desensitize_body
+    from app.desensitize import desensitize_body
 except ImportError:  # 模块缺失时降级为不脱敏
     def desensitize_body(body, roles=("system",), desensitize_harness_user=False,
                          desensitize_tools=False, compact_harness=False,
                          strip_tool_metadata=False):
         return body
 
-from responses_adapter import (
+from app.adapters.responses_adapter import (
     responses_request_to_chat,
     ResponsesStreamConverter,
 )
-from responses_projection import project_responses_chat_body
-from anthropic_adapter import (
+from app.adapters.responses_projection import project_responses_chat_body
+from app.adapters.anthropic_adapter import (
     anthropic_request_to_chat,
     AnthropicStreamConverter,
 )
 
-import auth_oauth
-import trial_rewards
-from credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
-                           credential_file_lock)
-from upstream_io import ChatSSEAccumulator, UpstreamResponseError, open_backend_stream
-from request_limits import ImageLimitError, apply_image_policy
-from safe_logging import format_log_body, sanitize_log_text
-from site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
-                          profile_for_auth, profile_for_headers, profile_region, profile_product, profile_site,
-                          chat_url_for_headers, refresh_url_for_auth)
-from client_profiles import CLI_VERSION, CLI_USER_AGENT, credential_headers, catalog_cache_key, account_key
+from app import auth_oauth
+from app import trial_rewards
+from app import model_policy
+from app.observability import (AuditMiddleware, observe_route, observe_usage,
+                               observe_attempt, observe_failure)
+from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
+                               credential_file_lock)
+from app.upstream_io import ChatSSEAccumulator, UpstreamResponseError, open_backend_stream
+from app.content_filter import ContentFilterDetector, is_filter_error
+from app.request_limits import ImageLimitError, apply_image_policy
+from app.safe_logging import format_log_body, sanitize_log_text
+from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
+                              profile_for_auth, profile_for_headers, profile_region, profile_product,
+                              profile_site, chat_url_for_headers, refresh_url_for_auth)
+from app.client_profiles import CLI_VERSION, CLI_USER_AGENT, credential_headers, catalog_cache_key, account_key
 try:
-    import credits as credits_mod
+    from app import credits as credits_mod
 except ImportError:  # 模块缺失时签到/积分/快过期优先调度不可用
     credits_mod = None
 
@@ -499,6 +503,9 @@ class CredentialPool:
                 self._queue_sync(cid)
 
     def _queue_sync(self, cid):
+        entry = next((entry for entry in self._entries if entry["id"] == cid), None)
+        if entry is not None and not model_policy.credential_enabled(CONFIG, entry):
+            return
         self._sync_pending.add(cid)
         self._sync_retry.pop(cid, None)
         self._sync_attempts.pop(cid, None)
@@ -511,9 +518,12 @@ class CredentialPool:
     def begin_sync(self, *, all_entries=False):
         """消费待刷队列；事件和队列在同一把锁下清除，避免丢失唤醒。"""
         with self._lock:
+            active = {entry["id"] for entry in self._entries if model_policy.credential_enabled(CONFIG, entry)}
+            self._sync_pending.intersection_update(active)
+            self._sync_retry = {cid: deadline for cid, deadline in self._sync_retry.items() if cid in active}
             due = {cid for cid, deadline in self._sync_retry.items() if deadline <= time.monotonic()}
             self._sync_pending.update(due)
-            ids = {entry["id"] for entry in self._entries} if all_entries else set(self._sync_pending)
+            ids = active if all_entries else set(self._sync_pending)
             self._sync_pending.difference_update(ids)
             if not self._sync_pending:
                 self._sync_event.clear()
@@ -523,7 +533,7 @@ class CredentialPool:
     def end_sync(self, ids, failed=()):
         with self._lock:
             self._syncing.difference_update(ids)
-            present = {entry["id"] for entry in self._entries}
+            present = {entry["id"] for entry in self._entries if model_policy.credential_enabled(CONFIG, entry)}
             for cid in ids:
                 if cid in failed and cid in present and cid not in self._sync_pending:
                     attempt = min(self._sync_attempts.get(cid, 0) + 1, 5)
@@ -549,7 +559,7 @@ class CredentialPool:
         """过期请求的额度或目录结果不能覆盖新登录态的缓存。"""
         with self._lock, cm._lock:
             entry = next((entry for entry in self._entries if entry["cm"] is cm), None)
-            if entry is None:
+            if entry is None or not model_policy.credential_enabled(CONFIG, entry):
                 return False
             if not self._lease_matches(cm, generation):
                 self._queue_sync(entry["id"])
@@ -619,7 +629,7 @@ class CredentialPool:
         self.reload(paths, reset=False)
 
     def _healthy(self, e: dict) -> bool:
-        return time.time() >= e["fail_until"]
+        return model_policy.credential_enabled(CONFIG, e) and time.time() >= e["fail_until"]
 
     @staticmethod
     def _entry_profile(entry):
@@ -655,6 +665,8 @@ class CredentialPool:
             return False
 
     def _eligible(self, entry, model, *, region=None, profile=None):
+        if not model_policy.route_allowed(CONFIG, entry, model):
+            return False
         actual = self._entry_profile(entry)
         profile = profile or actual
         if not profile or profile != actual or not _in_region(profile, region):
@@ -803,6 +815,8 @@ class CredentialPool:
             for e in self._entries:
                 if e["cm"] is cm:
                     e["fail_until"] = time.time() + CRED_COOLDOWN
+                    e["last_error"] = sanitize_log_text(reason, 256)
+                    e["last_failure_at"] = time.time()
         _log(f"[cred] 凭证熔断 {CRED_COOLDOWN}s: {Path(cm.path).name} {reason}")
 
     def note_status(self, cm: CredentialManager | None, status: int,
@@ -851,7 +865,7 @@ class CredentialPool:
             entries = list(self._entries)
         now = time.time()
         for entry in entries:
-            if now < entry.get("fail_until", 0.0):
+            if now < entry.get("fail_until", 0.0) or not model_policy.credential_enabled(CONFIG, entry):
                 continue
             cm = entry["cm"]
             failure = None
@@ -964,6 +978,8 @@ def _sync_trial(headers):
 
 
 def _sync_credits(pool, ledger, entry, *, checkin, failed):
+    if not model_policy.credential_enabled(CONFIG, entry):
+        return None
     cm, cid = entry["cm"], entry["id"]
     generation = None
     try:
@@ -985,7 +1001,11 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed):
                 _log(f"[checkin] {Path(cid).name}: ok={result['ok']} already={result.get('already')} code={result.get('code')}")
             except Exception as error:
                 _sync_error(pool, ledger, entry, generation, "checkin", error)
+        if not model_policy.credential_enabled(CONFIG, entry):
+            return None
         _sync_trial(headers)
+        if not model_policy.credential_enabled(CONFIG, entry):
+            return None
         balance = credits_mod.fetch_credits(token, uid=uid, domain=domain)
         if bool(balance.get("intl")) != (site == INTERNATIONAL):
             raise ValueError("积分响应与凭据站点不一致")
@@ -1034,6 +1054,8 @@ def _sync_model_catalogs(pool, ledger, refs, failed):
         return
     for entry, generation, headers, profile in refs.values():
         identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
+        if not model_policy.credential_enabled(CONFIG, entry):
+            continue
         key = catalog_cache_key(profile, identity)
         if cache.fresh(key) and not entry.get("catalog_dirty"):
             continue
@@ -1061,6 +1083,8 @@ def _sync_usage(pool):
     by_day, groups = {}, {}
     used, count, any_success = 0.0, 0, False
     for entry in pool.entries():
+        if not model_policy.credential_enabled(CONFIG, entry):
+            continue
         try:
             cm = entry["cm"]
             with cm._lock:
@@ -1195,6 +1219,12 @@ LOG_BACKUPS = 2                    # 轮转保留份数（log.1、log.2，最老
 
 def _log(msg: str):
     """写入脱敏有界日志，在同一把锁内检查大小与轮转。"""
+    audit = CONFIG.get("audit_store")
+    component = re.match(r"\[(cred|credits|models|usage|trial|checkin|housekeeper)\]", msg)
+    if audit is not None and component:
+        # Persist event codes, not free-form lines which may contain upstream data.
+        code = "cooldown" if "熔断" in msg or "冷却" in msg else "failure" if "失败" in msg or "异常" in msg else "updated"
+        audit.event("runtime", component.group(1), {"code": code})
     path = CONFIG.get("log_path")
     if not path:
         return
@@ -1245,18 +1275,26 @@ def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
     if not key:
         return
     token = ""
-    if authorization and authorization.startswith("Bearer "):
+    if isinstance(authorization, str) and authorization.startswith("Bearer "):
         token = authorization[7:].strip()
-    if not token and x_api_key:
+    if not token and isinstance(x_api_key, str):
         token = x_api_key
-    if token != key:
+    if not secrets.compare_digest(token.encode(), key.encode()):
         raise HTTPException(status_code=401, detail={"error": {"message": "invalid api key", "type": "auth_error"}})
+
+
+def _check_admin_auth(authorization: Optional[str], x_api_key: Optional[str]):
+    if not CONFIG.get("api_key"):
+        raise HTTPException(status_code=503, detail={"error": {"message": "管理接口需要配置 API key",
+                                                             "type": "management_locked"}})
+    _check_auth(authorization, x_api_key)
 
 
 def _cred_for(payload: dict, model: str | None = None, *, region=None):
     """返回 ((凭据管理器, 代次), headers)；无可用凭据返回 503，模型冷却返回 429。"""
     raw_key = session_key(payload)
     skey = f"{region}:{raw_key}" if raw_key and region is not None else raw_key
+    skey = model_policy.sticky_scope(CONFIG, skey, model)
     pool = CONFIG.get("cred_pool")
     if pool is not None:
         picked = pool.headers_for(skey, model, region=region, with_generation=True)
@@ -1294,6 +1332,9 @@ def _route_chat(payload, body, rid):
         body = {**body, "model": routed_model}
         _guard_request_size(body)
     url = chat_url_for_headers(headers)
+    observe_route(public_model=payload.get("model", "auto"), upstream_model=routed_model,
+                  profile=profile, credential=account_key(profile, headers.get("X-User-Id"),
+                                                         headers.get("X-Enterprise-Id")))
     _log(f"[{rid}] ROUTE | region={profile_region(profile)} | profile={profile} | model={routed_model} | url={url}")
     return body, cred, headers, url
 
@@ -1315,8 +1356,10 @@ def health():
 def admin_list_credentials(authorization: Optional[str] = Header(default=None),
                            x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """凭证池状态：账号、过期时间、健康度、黏绑会话数。"""
-    _check_auth(authorization, x_api_key)
+    _check_admin_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
+    if CONFIG.get("management") is not None:
+        return {"credentials": CONFIG["management"].admin_credential_inventory()}
     return {"credentials": pool.snapshot() if pool else []}
 
 
@@ -1324,7 +1367,8 @@ class CredentialConflictError(CredentialFileError):
     """同一账号已由其他凭据文件持有。"""
 
 
-def _store_credential(directory: Path, name: str, content: bytes, uid: str, *, replace_identity=True) -> Path:
+def _store_credential(directory: Path, name: str, content: bytes, uid: str, *, replace_identity=True,
+                      replace_existing=True) -> Path:
     """导入和登录共用的写入临界区，与后台刷新及独立 CLI 协调。"""
     pool = CONFIG.get("cred_pool")
     identity = _credential_identity(json.loads(content))
@@ -1342,6 +1386,8 @@ def _store_credential(directory: Path, name: str, content: bytes, uid: str, *, r
             cm = CONFIG["cred"]
         with cm._lock if cm is not None else nullcontext():
             with credential_file_lock(directory, name):
+                if not replace_existing and target.exists():
+                    raise CredentialConflictError("文件已存在，需明确允许替换")
                 if not replace_identity and target.exists() and _cred_identity(target) != identity:
                     raise CredentialConflictError("OAuth 不可覆盖其他产品或账号的凭据")
                 target = atomic_write_credential(directory, name, content)
@@ -1357,7 +1403,7 @@ async def admin_add_credential(request: Request,
                                authorization: Optional[str] = Header(default=None),
                                x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """从允许目录导入已校验的凭据，原子更新并热加入池。"""
-    _check_auth(authorization, x_api_key)
+    _check_admin_auth(authorization, x_api_key)
     try:
         body = await request.json()
     except (ValueError, UnicodeError):
@@ -1397,8 +1443,10 @@ def admin_del_credential(name: str,
                          authorization: Optional[str] = Header(default=None),
                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """按文件名移除池内凭据（会删除该 *.info 文件）。"""
-    _check_auth(authorization, x_api_key)
+    _check_admin_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
+    if CONFIG.get("management") is not None:
+        CONFIG["management"].admin_delete_guard(os.path.basename(name))
     if pool is None or not pool.remove_file(os.path.basename(name)):
         raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
     return {"removed": os.path.basename(name)}
@@ -1438,7 +1486,7 @@ def admin_oauth_start(site: str = "cn",
                       authorization: Optional[str] = Header(default=None),
                       x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """无感登录第一步：申请 OAuth state + 授权链接（浏览器扫码即可，无需桌面端）。site=cn|intl。"""
-    _check_auth(authorization, x_api_key)
+    _check_admin_auth(authorization, x_api_key)
     try:
         return _OAUTH.start(site=site)
     except ValueError as e:
@@ -1452,7 +1500,7 @@ def admin_oauth_poll(login_id: str = "",
                      authorization: Optional[str] = Header(default=None),
                      x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """无感登录第二步：轮询授权结果；完成后自动入库并热加入凭证池（同 uid 覆盖更新）。"""
-    _check_auth(authorization, x_api_key)
+    _check_admin_auth(authorization, x_api_key)
     try:
         r = _OAUTH.poll(login_id)
     except Exception as e:
@@ -1476,7 +1524,7 @@ def admin_oauth_poll(login_id: str = "",
 def admin_credits(authorization: Optional[str] = Header(default=None),
                   x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """各凭证积分余额/分段过期时间/今日签到状态（CreditLedger 缓存快照）。"""
-    _check_auth(authorization, x_api_key)
+    _check_admin_auth(authorization, x_api_key)
     ledger = CONFIG.get("ledger")
     return {"credits": ledger.snapshot() if ledger else {}}
 
@@ -1485,7 +1533,7 @@ def admin_credits(authorization: Optional[str] = Header(default=None),
 def admin_checkin(authorization: Optional[str] = Header(default=None),
                   x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """手动触发一轮签到 + 积分刷新（签到按日幂等，已签则只刷积分）。"""
-    _check_auth(authorization, x_api_key)
+    _check_admin_auth(authorization, x_api_key)
     pool, ledger = CONFIG.get("cred_pool"), CONFIG.get("ledger")
     if pool is None or ledger is None:
         raise HTTPException(status_code=503, detail={"error": {"message": "签到调度未启用", "type": "invalid_request_error"}})
@@ -1504,9 +1552,15 @@ def _billing_totals() -> dict:
     empty_grp = {"remaining": 0.0, "used_by_quota": 0.0, "soonest_expiry": None}
     ledger = CONFIG.get("ledger")
     snap = ledger.snapshot() if ledger else {}
-    price_cny = CONFIG.get("credit_price_cny") or (credits_mod.CREDIT_PRICE_CNY if credits_mod else 0.014)
-    price_usd = CONFIG.get("credit_price_usd") or (credits_mod.CREDIT_PRICE_USD if credits_mod else 0.03)
-    rate = CONFIG.get("usd_rate") or (credits_mod.USD_RATE_CNY if credits_mod else 7.15)
+    price_cny = CONFIG.get("credit_price_cny")
+    price_usd = CONFIG.get("credit_price_usd")
+    rate = CONFIG.get("usd_rate")
+    if price_cny is None:
+        price_cny = credits_mod.CREDIT_PRICE_CNY if credits_mod else 0.014
+    if price_usd is None:
+        price_usd = credits_mod.CREDIT_PRICE_USD if credits_mod else 0.03
+    if rate is None:
+        rate = credits_mod.USD_RATE_CNY if credits_mod else 7.15
     agg = (credits_mod.aggregate_credits(snap) if credits_mod else
            {"remaining": 0.0, "used_by_quota": 0.0, "soonest_expiry": None,
             "groups": {"domestic": dict(empty_grp), "international": dict(empty_grp)}})
@@ -1636,7 +1690,7 @@ def _configured_profiles(region: str | None) -> set[str]:
     pool = CONFIG.get("cred_pool")
     if pool is not None:
         return {profile for entry in pool.entries() if (profile := pool._entry_profile(entry))
-                and _in_region(profile, region)}
+                and model_policy.credential_enabled(CONFIG, entry) and _in_region(profile, region)}
     cm = CONFIG.get("cred")
     if cm is not None:
         profile = cm.summary()["profile"]
@@ -1736,7 +1790,7 @@ def _profile_has_credits(profile: str) -> bool:
                                    and float((entry.get("credits") or {}).get("credits") or 0) > 0
                                    for entry in ledger.snapshot().values()))
     return any(pool._entry_profile(entry) == profile and pool._has_credit(entry, profile)
-               for entry in pool.entries())
+               for entry in pool.entries() if model_policy.credential_enabled(CONFIG, entry))
 
 
 def current_models(region: str | None = None) -> list[str]:
@@ -1751,6 +1805,8 @@ def current_models(region: str | None = None) -> list[str]:
         if pool is not None and (CONFIG.get("account_catalogs") is not None or CONFIG.get("model_cache") is not None):
             accounts = CONFIG.get("account_catalogs") or {}
             for entry in pool.entries():
+                if not model_policy.credential_enabled(CONFIG, entry):
+                    continue
                 profile = entry.get("profile")
                 if not profile or not _in_region(profile, region):
                     continue
@@ -1811,6 +1867,8 @@ def current_model_details(region: str | None = None) -> list[dict]:
         if CONFIG.get("account_catalogs") is not None or CONFIG.get("model_cache") is not None:
             accounts = CONFIG.get("account_catalogs") or {}
             for entry in pool.entries():
+                if not model_policy.credential_enabled(CONFIG, entry):
+                    continue
                 profile = entry.get("profile")
                 if not profile or not _in_region(profile, region):
                     continue
@@ -1871,8 +1929,8 @@ def _normalize_tool_choice(body):
 def _prepare_chat_body(body: dict, *, region=None) -> dict:
     """统一模型、首条 system、后端流式参数、脱敏与体积预算。"""
     body = dict(body)
-    body.setdefault("model", "auto")
-    guard_model(body["model"], region=region)
+    body["model"] = model_policy.resolve(CONFIG, body.get("model", "auto"))
+    guard_model(body["model"], region=region, resolved=True)
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages or any(not isinstance(message, dict) for message in messages):
         raise HTTPException(status_code=400, detail={"error": {
@@ -1892,8 +1950,8 @@ def _prepare_chat_body(body: dict, *, region=None) -> dict:
     return body
 
 
-def _guard_request_size(body: dict) -> None:
-    """限制处理后发往上游的 JSON 字节数，不截断文本或工具参数。"""
+def _guard_request_size(body: dict) -> int:
+    """校验并返回上游 JSON 字节数，不截断文本或工具参数。"""
     size = 0
     limit = CONFIG["max_request_bytes"]
     try:
@@ -1907,13 +1965,17 @@ def _guard_request_size(body: dict) -> None:
     except (ValueError, UnicodeError) as error:
         raise HTTPException(status_code=400, detail={"error": {
             "message": "请求体包含无法序列化的 JSON 值", "type": "invalid_request_error"}}) from None
+    return size
 
 
-def guard_model(name: str, *, region=None) -> None:
+def guard_model(name: str, *, region=None, resolved=False) -> None:
     """表外模型本地拒绝；自动路由只考虑各账号明确支持的模型。"""
     if not isinstance(name, str) or not name.strip():
         raise HTTPException(status_code=400, detail={"error": {
             "message": "model must be a non-empty string", "type": "invalid_request_error", "param": "model"}})
+    if not resolved:
+        name = model_policy.resolve(CONFIG, name)
+    model_policy.check_resolved(CONFIG, name)
     if not CONFIG.get("model_guard"):
         return
     pool = CONFIG.get("cred_pool")
@@ -1936,7 +1998,7 @@ def list_models(authorization: Optional[str] = Header(default=None),
     _check_auth(authorization, x_api_key)
     data = [{"id": item["id"], "object": "model", "created": 1700000000, "owned_by": "codebuddy",
              "credits": item["credits"], "credits_by_profile": item["credits_by_profile"]}
-            for item in current_model_details()]
+            for item in model_policy.public_details(sys.modules[__name__])]
     return {"object": "list", "data": data}
 
 
@@ -1984,11 +2046,13 @@ async def chat_completions(request: Request,
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred)
+        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=True)
     except (httpx.HTTPError, UpstreamResponseError) as error:
         status, raw = _upstream_failure(error, model_name, t0, rid)
         raise HTTPException(status_code=status, detail=_safe_err_raw(raw, status)) from None
     _log_finish(model_name, t0, collected, rid)
+    if CONFIG.get("control_store") is not None:
+        collected = {**collected, "model": model_name}
     return JSONResponse(content=collected)
 
 
@@ -2014,13 +2078,14 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
     choice = (result.get("choices") or [{}])[0]
     finish = choice.get("finish_reason")
     msg = choice.get("message") or {}
+    detector = ContentFilterDetector()
+    detector.feed(msg, finish)
+    if detector.detected:
+        return  # 审核只记录分类，不把可能回显输入的正文/思考写入预览。
     tcs = msg.get("tool_calls") or []
     usage = result.get("usage") or {}
-    tag = ""
-    if finish == "content-filter":
-        tag = " ⚠️内容审核拦截"
     tc_names = [t.get("function", {}).get("name") for t in tcs]
-    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
+    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | finish={finish}"
          + (f" | tool_calls={tc_names}" if tc_names else "")
          + f" | tokens={usage.get('total_tokens', '?')}")
     _log_json(f"{prefix}RESPONSE BODY (预览)", result)
@@ -2046,9 +2111,9 @@ def _completion_to_merged(result: dict) -> dict:
             "model": result.get("model"), "usage": result.get("usage")}
 
 
-async def _collect_stream(response: httpx.Response) -> dict:
+async def _collect_stream(response: httpx.Response, *, accumulator=None) -> dict:
     """使用公共聚合器保留正文、思考和工具调用，并验证流完整性。"""
-    accumulator = ChatSSEAccumulator()
+    accumulator = accumulator if accumulator is not None else ChatSSEAccumulator()
     async for line in response.aiter_lines():
         accumulator.feed_line(line)
         if accumulator.done:
@@ -2129,13 +2194,36 @@ def _chat_result_to_sse_lines(m: dict) -> list[str]:
 def _network_error_text(error: Exception) -> str:
     return sanitize_log_text(f"{type(error).__name__}: {str(error).strip() or 'upstream transport failed'}", 512)
 
+def _public_sse_line(line, model_name):
+    if CONFIG.get("control_store") is not None and line.startswith("data:"):
+        try:
+            event = json.loads(line[5:].strip())
+            if isinstance(event, dict) and ("model" in event or "choices" in event):
+                event["model"] = model_name
+                return "data: " + json.dumps(event, ensure_ascii=False)
+        except (ValueError, TypeError):
+            pass
+    return line
 
-def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name="?"):
-    return open_backend_stream(
-        url, headers, body, read_timeout=timeout,
-        on_retry=lambda error: _log(
-            f"[{rid}] 建连失败，重试 1/1 | {model_name} | {_network_error_text(error)}"),
-    )
+
+@asynccontextmanager
+async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name="?"):
+    started, opened = time.monotonic(), False
+    def retry(error):
+        observe_attempt("connect_retry", error_code=type(error).__name__,
+                        duration_ms=(time.monotonic() - started) * 1000)
+        _log(f"[{rid}] 建连失败，重试 1/1 | {model_name} | {_network_error_text(error)}")
+    try:
+        async with open_backend_stream(url, headers, body, read_timeout=timeout, on_retry=retry) as response:
+            opened = True
+            observe_attempt("upstream_http", status_code=response.status_code,
+                            duration_ms=(time.monotonic() - started) * 1000)
+            yield response
+    except (httpx.HTTPError, UpstreamResponseError) as error:
+        if not opened:
+            observe_attempt("transport", error_code=type(error).__name__,
+                            duration_ms=(time.monotonic() - started) * 1000)
+        raise
 
 
 def _safe_err_raw(raw: bytes, status: int) -> dict:
@@ -2147,7 +2235,8 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
 
 def _check_upstream_status(status, raw, cred, model):
     if status != 200:
-        _note_cred_status(cred, status, model=model, raw=raw)
+        if not is_filter_error(raw):
+            _note_cred_status(cred, status, model=model, raw=raw)
         raise UpstreamResponseError(status, raw)
 
 
@@ -2159,6 +2248,11 @@ def _upstream_failure(error, model_name, t0, rid):
     else:
         status, raw = 502, _network_error_text(error).encode("utf-8")
         category = "网络错误"
+    if isinstance(error, UpstreamResponseError) and is_filter_error(raw):
+        _note_content_filter(rid, model_name, final=True)
+        return status, raw
+    else:
+        observe_failure(f"upstream_{status}" if isinstance(error, UpstreamResponseError) else type(error).__name__)
     elapsed = time.time() - t0 if t0 else 0
     _log(f"[{rid}] ✗ {category} | {model_name} | {elapsed:.1f}s | {sanitize_log_text(raw.decode('utf-8', 'replace'), 512)}")
     _log_text_body(f"[{rid}] ERROR BODY", raw.decode("utf-8", "replace"))
@@ -2166,30 +2260,59 @@ def _upstream_failure(error, model_name, t0, rid):
 
 
 async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *, filter_retry=False):
-    """统一聚合与工具校验；仅工具损坏可重新生成，网络错误不整单重放。"""
-    attempts = _TOOL_CALL_MAX_RETRY + 1 if body.get("tools") else 1
-    for attempt in range(attempts):
-        if filter_retry:
-            status, raw, _ = await _post_backend_with_filter_retry(url, headers, body, rid, model_name)
-            _check_upstream_status(status, raw, cred, body.get("model"))
-            result = _chat_completion(_merge_chat_sse_text(raw.decode("utf-8", "replace")))
-        else:
-            async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
-                if response.status_code != 200:
-                    _check_upstream_status(response.status_code, await response.aread(), cred, body.get("model"))
-                result = await _collect_stream(response)
+    """统一聚合与校验；非流式纯审核拒绝最多压缩兜底一次，网络错误不重放。"""
+    tool_attempt = 0
+    filter_retried = False
+    while True:
+        accumulator = ChatSSEAccumulator()
+        rejection = None
+        async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
+            if response.status_code != 200:
+                _check_upstream_status(response.status_code, await response.aread(), cred, body.get("model"))
+            try:
+                result = await _collect_stream(response, accumulator=accumulator)
+            except UpstreamResponseError as error:
+                if (not accumulator.done or not accumulator.filter_detector.detected
+                        or accumulator.saw_output):
+                    raise
+                rejection = error
+                result = None
+
+        detector = accumulator.filter_detector
+        if detector.detected:
+            retry_body = body
+            if (filter_retry and not filter_retried and detector.retry_safe
+                    and CONFIG.get("desensitize") and CONFIG.get("no_compact")):
+                retry_body = _chat_body_desensitize(body, force_compact=True)
+                try:
+                    if _guard_request_size(retry_body) >= _guard_request_size(body):
+                        retry_body = body
+                except HTTPException:
+                    retry_body = body
+            if retry_body != body:
+                _note_content_filter(rid, model_name, final=False)
+                body = retry_body
+                filter_retried = True
+                continue
+            if rejection is not None:
+                raise rejection
+            _note_content_filter(rid, model_name, final=True)
+
         calls = result["choices"][0]["message"].get("tool_calls")
-        if _tool_calls_healthy(calls) and _tool_choice_satisfied(calls, body):
+        if _tool_calls_healthy(calls) and (detector.detected or _tool_choice_satisfied(calls, body)):
+            observe_usage(result.get("usage") or {})
             return result
-        if attempt + 1 < attempts:
-            _log(f"[{rid}] tool_calls 损坏，重试 {attempt + 1}/{attempts - 1} | {model_name}")
-    raise UpstreamResponseError(502, b"Invalid upstream tool_calls after retries")
+        # 审核拒绝不是工具损坏，不因 required 工具选择而重复生成。
+        if detector.detected or not body.get("tools") or tool_attempt >= _TOOL_CALL_MAX_RETRY:
+            raise UpstreamResponseError(502, b"Invalid upstream tool_calls after retries")
+        tool_attempt += 1
+        _log(f"[{rid}] tool_calls 损坏，重试 {tool_attempt}/{_TOOL_CALL_MAX_RETRY} | {model_name}")
 
 
-async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *, aggregate=False, filter_retry=False):
-    """提供公共 Chat SSE 行流；日志仅缓存预览，透传分支不缓存完整正文。"""
+async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *, aggregate=False):
+    """提供公共 Chat SSE 行流；流式请求不做审核重试，正文检测缓冲有界。"""
     if aggregate:
-        result = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=filter_retry)
+        result = await _fetch_checked_chat(url, headers, body, model_name, rid, cred)
         for line in _chat_result_to_sse_lines(_completion_to_merged(result)):
             yield line
             yield ""
@@ -2213,6 +2336,10 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
                 yield ""
                 break
     merged = tracker.result()
+    observe_usage(merged.get("usage") or {})
+    if tracker.filter_detector.detected:
+        _note_content_filter(rid, model_name, final=True)
+        return
     _log(f"[{rid}] ◀ RESPONSE {model_name} | {time.time() - t0:.1f}s | stream finish={merged['finish_reason']}"
          + f" | tokens={(merged['usage'] or {}).get('total_tokens', '?')}")
     _log_text_body(f"[{rid}] RESPONSE SSE PREVIEW", preview.decode("utf-8", "replace"))
@@ -2222,7 +2349,7 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = "", cred=None):
     try:
         async for line in _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, aggregate=bool(body.get("tools"))):
-            yield (line + "\n").encode("utf-8")
+            yield (_public_sse_line(line, model_name) + "\n").encode("utf-8")
     except (httpx.HTTPError, UpstreamResponseError) as error:
         status, raw = _upstream_failure(error, model_name, t0, rid)
         yield _err_event(raw, status)
@@ -2236,15 +2363,13 @@ def _err_event(msg: bytes, status: int) -> bytes:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-def _looks_like_content_filter_text(text: str) -> bool:
-    text = (text or "").lower()
-    return (
-        "content-filter" in text
-        or "content_filter" in text
-        or "敏感内容" in text
-        or "内容审核" in text
-        or "无法响应您的请求" in text
-    )
+def _note_content_filter(rid, model_name, *, final):
+    stage = "content_filter" if final else "content_filter_retry"
+    observe_attempt(stage, error_code="content_filter")
+    if final:
+        observe_failure("content_filter")
+    action = "保留上游拒绝，不切换账号" if final else "纯审核拒绝，压缩模板重试 1/1"
+    _log(f"[{rid}] 内容审核拦截 | {model_name} | {action}")
 
 
 def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
@@ -2258,38 +2383,6 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
         compact_harness=(force_compact or not CONFIG.get("no_compact")),
         strip_tool_metadata=True,
     )
-
-
-async def _post_backend_once(url: str, headers: dict, body: dict, *, rid="") -> tuple[int, bytes]:
-    async with _backend_stream(url, headers, body, timeout=120, rid=rid, model_name=body.get("model", "?")) as r:
-        if r.status_code != 200:
-            return r.status_code, await r.aread()
-        lines = []
-        async for line in r.aiter_lines():
-            lines.append(line)
-            if line.strip().startswith("data:") and line.strip()[5:].strip() == "[DONE]":
-                break
-        return r.status_code, ("\n".join(lines) + "\n").encode("utf-8")
-
-
-async def _post_backend_with_filter_retry(url: str, headers: dict, body: dict,
-                                          rid: str = "", model_name: str = "?") -> tuple[int, bytes, dict]:
-    prefix = f"[{rid}] " if rid else ""
-    status, raw = await _post_backend_once(url, headers, body, rid=rid)
-    text = raw.decode("utf-8", "replace")
-    if status == 200 and _looks_like_content_filter_text(text) and CONFIG.get("desensitize") and CONFIG.get("no_compact"):
-        retry_body = _chat_body_desensitize(body, force_compact=True)
-        _log(f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness")
-        try:
-            _guard_request_size(retry_body)
-        except HTTPException:
-            return status, raw, body
-        _log_json(f"{prefix}RESPONSES RETRY CHAT BODY (预览)", retry_body)
-        retry_status, retry_raw = await _post_backend_once(url, headers, retry_body, rid=rid)
-        retry_text = retry_raw.decode("utf-8", "replace")
-        if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
-            return retry_status, retry_raw, retry_body
-    return status, raw, body
 
 
 # ---------------------------------------------------------------------------
@@ -2355,9 +2448,9 @@ async def create_response(request: Request,
 async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False):
     converter = AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name)
     try:
-        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=not anthropic)
+        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=True)
         for line in _chat_result_to_sse_lines(_completion_to_merged(collected)):
-            converter.feed_line(line)
+            converter.feed_line(_public_sse_line(line, model_name))
         converter.finish()
     except (httpx.HTTPError, UpstreamResponseError) as error:
         status, raw = _upstream_failure(error, model_name, t0, rid)
@@ -2373,8 +2466,8 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
     try:
         async for line in _chat_sse_lines(
                 url, headers, body, model_name, t0, rid, cred,
-                aggregate=not anthropic or bool(body.get("tools")), filter_retry=not anthropic):
-            events = converter.feed_line(line)
+                aggregate=not anthropic or bool(body.get("tools"))):
+            events = converter.feed_line(_public_sse_line(line, model_name))
             if events:
                 yield events.encode("utf-8")
         events = converter.finish()
@@ -2578,15 +2671,13 @@ def main():
     ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2API_KEY", ""),
                     help="可选：要求客户端携带的 API key（默认不校验）")
     ap.add_argument("--log", default=None, metavar="PATH",
-                    help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
-                         "不传则不记日志。")
+                    help="额外写入兼容文本日志（如 --log converter.log 或 --log /tmp/cb.log）。"
+                         "不传仍记录 SQLite 审计，但不输出文本文件。")
     ap.add_argument("--desensitize", action="store_true",
-                    help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
-                         "插入零宽空格，缓解被后端内容审核误拦。默认关闭。")
+                    help="适配固定 CLI 模板、压缩运行时提示并零宽脱敏关键词。默认关闭。")
     ap.add_argument("--no-compact", action="store_true",
-                    help="配合 --desensitize 使用：跳过 system/harness 压缩，仅做零宽脱敏。"
-                         "保留原始 system prompt 完整内容（如 Claude Code 的行为指令），"
-                         "但审核误拦风险略高于默认压缩模式。")
+                    help="配合 --desensitize 保留主要行为指令，仍适配固定模板并裁剪运行时元数据；"
+                         "非流式纯审核拒绝最多压缩兜底一次。")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     ap.add_argument("--auth-file", action="append", default=[], metavar="PATH",
                     help="凭据文件（可重复传入组成凭证池；默认自动扫描 auth 目录全部 *.info）")
@@ -2624,8 +2715,6 @@ def main():
     for key in ("max_images", "image_policy", "max_request_bytes", "log_body_limit", "auto_trial"):
         CONFIG[key] = getattr(args, key)
     CONFIG["api_key"] = args.api_key
-    CONFIG["trial_ledger"] = (trial_rewards.TrialLedger(managed_auth_dir() / "trial-ledger.json")
-                              if args.auto_trial else None)
     CONFIG["desensitize"] = args.desensitize
     CONFIG["no_compact"] = args.no_compact
     CONFIG["credit_price_cny"] = args.credit_price_cny or None
@@ -2634,6 +2723,8 @@ def main():
     CONFIG["model_guard"] = not args.no_model_guard
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2API_LOG")
+    from app import runtime_management
+    runtime_management.initialize(sys.modules[__name__], args)
     files = [Path(p) for p in args.auth_file]
     if not files:
         seed_credentials()  # 自管模式：启动时把桌面端缺失凭据复制进 auth/
@@ -2647,6 +2738,7 @@ def main():
             managed_auth_dir() / "model-catalog.json", ttl=args.model_catalog_ttl)
         CONFIG["cred_pool"].set_ledger(ledger)  # 先验证持久余额所属身份，再发布目录（包括空表）。
     _publish_model_cache()
+    runtime_management.install(sys.modules[__name__])
     threading.Thread(target=_refresher_loop, args=(CONFIG["cred_pool"],),
                      daemon=True, name="cred-refresher").start()
     if credits_mod is not None:
@@ -2657,6 +2749,8 @@ def main():
         preflight()
 
     sys.stderr.write(f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n")
+    sys.stderr.write(f"   WebUI     : http://{args.host}:{args.port}/dashboard\n")
+    sys.stderr.write("   SQLite 审计默认开启，凭证仍以 .info 文件保存\n")
     sys.stderr.write("   GET  /v1/models\n")
     sys.stderr.write("   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n")
     sys.stderr.write("   POST /v1/responses          (Responses API，Codex CLI 兼容)\n")
@@ -2681,7 +2775,10 @@ def main():
     # 启动时写一条标记
     _log(f"==== converter 启动 ====")
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    finally:
+        runtime_management.close(CONFIG)
 
 
 if __name__ == "__main__":

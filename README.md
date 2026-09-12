@@ -47,7 +47,7 @@ Copy and edit the configuration before the first start; do not overwrite an exis
 ```bash
 cp .env.example .env
 # Edit .env: API key, image policy, and other settings
-uv run --env-file .env converter.py --desensitize --log converter.log
+uv run --env-file .env converter.py --desensitize
 ```
 
 Listening on `http://127.0.0.1:8787` means it is up.
@@ -65,6 +65,18 @@ curl http://127.0.0.1:8787/health
 curl http://127.0.0.1:8787/v1/models
 # Lists available models across accounts; add Authorization if a key is set
 ```
+
+## Management UI
+
+For a source checkout, build the UI with `cd web && vp install && vp build`, then start the server from the repository root. Docker builds include the UI automatically.
+
+Open `http://127.0.0.1:8787/dashboard` and sign in with the configured API key; management is locked when no key is set. Pages use `/dashboard/*`, management endpoints remain under `/admin/*`, and client APIs retain `/v1/*`.
+
+Manage model switches, public IDs, region/account bindings, credential switches, OAuth and file imports/exports. Inspect credential cooldowns, model rate limits, request audits and historical statistics. Settings precedence is CLI > environment > WebUI > defaults; external overrides remain locked.
+
+Credentials remain `auth/*.info`. Metadata lives in `auth/control.sqlite3`; the separate `auth/logs.sqlite3` audit database is enabled by default (256 MiB detail budget, 30-day detail retention). Detail cleanup preserves aggregates. Clearing all logs and statistics requires explicit confirmation and never removes credentials or gateway settings. Existing text logs are retained, not backfilled as precise statistics.
+
+See [WebUI and data management](docs/webui.md).
 
 ## Client setup
 
@@ -91,6 +103,8 @@ export CODEBUDDY2API_KEY=any-value   # any value unless you started with --api-k
 codex --profile workbuddy "your task"
 ```
 
+Runtime context is condensed separately from user instructions; oversized requests return HTTP 413 rather than silently truncating the latest request.
+
 ### Claude Code / CC Switch
 
 For Claude Code / Anthropic SDKs, use a base URL **without `/v1/messages`**: the SDK appends that path automatically.
@@ -104,7 +118,7 @@ claude
 
 In CC Switch, use `http://127.0.0.1:8787` for the Anthropic provider's Base URL, for both domestic and international accounts. Only clients asking for a complete endpoint should use `/v1/messages`; Anthropic SDKs append that path themselves.
 
-Model names must be real Tencent-backend model names (no Anthropic→Tencent mapping). Keep `--desensitize` on for Claude Code.
+Use IDs published by `/v1/models`, including public aliases configured in the UI; Anthropic model names are not automatically guessed or mapped. Enable `--desensitize` to adapt known Claude Code identity and Git-branch templates for WorkBuddy. `/v1/messages` also uses upstream Chat Completions.
 
 ### Other OpenAI-compatible clients
 
@@ -135,7 +149,7 @@ These original paths serve all supported regions and products. `/cn` and `/intl`
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | Seamless login (see above) |
 | `GET /admin/credits` · `POST /admin/checkin` | Credit balances / manual daily check-in |
 
-Admin endpoints require `--api-key` when it is set. Use `/admin/credentials` for detailed pool status; `/health` never returns account, path or exception details.
+Admin endpoints require a configured API key; an empty key locks management. The UI uses the same key to establish a management session. Use `/admin/credentials` for detailed pool status; `/health` never returns account, path or exception details.
 
 ### Credential imports
 
@@ -150,9 +164,9 @@ Send `POST /admin/credentials` with `{"path":"account.info"}` or the file's abso
 | `--host` | `127.0.0.1` | Listen address |
 | `--port` | `8787` | Listen port |
 | `--api-key` | — | Require this key from local clients |
-| `--log` | — | Write request/response logs (50 MB rotation, 2 backups) |
-| `--desensitize` | off | Compact runtime prompts and mask high-risk keywords (recommended for agent clients) |
-| `--no-compact` | off | With `--desensitize`: keep fuller system prompts |
+| `--log` | — | Optional additional text logs (50 MiB rotation, 2 backups); SQLite auditing is enabled by default |
+| `--desensitize` | off | Adapt known CLI templates, compact runtime prompts and mask keywords |
+| `--no-compact` | off | With `--desensitize`: retain fuller instructions; template adaptation and runtime-metadata pruning remain active |
 | `--auth-file` | scan `auth/` | Explicit credential file(s), repeatable |
 | `--credit-price-cny` | `0.014` | CNY per credit for balance conversion |
 | `--credit-price-usd` | `0.03` | USD per credit (international) |
@@ -250,7 +264,7 @@ A concrete model can be scheduled across any region or product, but only among a
 - **Network errors**: connection setup failures receive one delayed retry. Disconnects after sending, read/write timeouts, and HTTP errors are not replayed, to avoid duplicate billing. Logs include exception type and elapsed time.
 - **Malformed tool calls**: failed aggregate validation permits up to three regenerations, then returns an error instead of broken calls. Regeneration may consume additional credits.
 - **Empty upstream stream**: a stream containing only `stop` / `[DONE]` without content is treated as an error, not a successful empty answer.
-- **Content-filter blocks**: usually triggered by agent runtime text; start with `--desensitize`, or `--desensitize --no-compact`.
+- **Content-filter blocks**: enable `--desensitize`. With `--no-compact`, a complete filter-only non-stream response may trigger one retry with a shorter template. Streaming requests are not retried for content filtering; accounts are not rotated.
 - **Slow**: switch to a faster model, e.g. `deepseek-v4-flash`.
 - **Same account used elsewhere**: a credential copied from a desktop client refreshes independently — with rolling refresh tokens they can kick each other off; prefer seamless-login accounts or stop using the account in the client.
 

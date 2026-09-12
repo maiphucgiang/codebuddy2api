@@ -47,7 +47,7 @@ uv run converter.py login
 ```bash
 cp .env.example .env
 # 编辑 .env 中的密钥、图片策略等配置
-uv run --env-file .env converter.py --desensitize --log converter.log
+uv run --env-file .env converter.py --desensitize
 ```
 
 看到监听 `http://127.0.0.1:8787` 即启动成功。
@@ -65,6 +65,18 @@ curl http://127.0.0.1:8787/health
 curl http://127.0.0.1:8787/v1/models
 # 自动合并可用账号的模型；启用密钥时添加 Authorization 头
 ```
+
+## 管理界面
+
+源码运行前构建界面：`cd web && vp install && vp build`，然后回仓库根目录启动服务。Docker 构建会自动打包界面。
+
+访问 `http://127.0.0.1:8787/dashboard`，使用当前 API key 登录；未设置 key 时管理界面锁定。页面统一位于 `/dashboard/*`，管理接口仍为 `/admin/*`，客户端仍使用 `/v1/*`。
+
+可管理模型启停、对外 ID、区域/凭证绑定、凭证启停及 OAuth/文件导入导出，并查看熔断、模型冷却、请求审计与历史统计。配置优先级为 CLI > 环境变量 > WebUI > 默认值，外部锁定项不会被页面覆盖。
+
+凭证仍保存在 `auth/*.info`。管理元数据保存于 `auth/control.sqlite3`，日志默认保存于独立的 `auth/logs.sqlite3`；默认明细预算 256 MiB、保留 30 天，聚合统计不随明细清理。全部清空日志与统计需要危险操作确认，不删除凭证和网关配置。旧文本日志保留，不自动回填精确统计。
+
+详见 [WebUI 与数据管理](docs/webui.md)。
 
 ## 客户端接入
 
@@ -91,6 +103,8 @@ export CODEBUDDY2API_KEY=any-value   # 转换器未启用 --api-key 时随便填
 codex --profile workbuddy "你的任务描述"
 ```
 
+运行时上下文与真实用户指令分开处理；超限请求返回 HTTP 413，不静默截断最新用户请求。
+
 ### Claude Code / CC Switch
 
 Claude Code / Anthropic SDK 的 Base URL **不要带 `/v1/messages`**，SDK 会自动追加该路径。
@@ -104,7 +118,7 @@ claude
 
 CC Switch 的 Anthropic 提供商 Base URL 填写 `http://127.0.0.1:8787`，国内、国际账号通用。只有明确要求完整端点的客户端才填写 `/v1/messages`；Anthropic SDK 会自行追加此路径。
 
-模型名必须填腾讯后端真实模型名（不做 Anthropic→腾讯映射）。Claude Code 场景建议保持 `--desensitize` 开启。
+模型名使用 `/v1/models` 发布的 ID，可在管理界面设置对外别名；不自动猜测 Anthropic→腾讯模型映射。开启 `--desensitize` 可适配 WorkBuddy 对 Claude Code 固定身份、Git 分支提示的兼容要求；`/v1/messages` 同样转为上游 Chat Completions。
 
 ### 其他 OpenAI 兼容客户端
 
@@ -135,7 +149,7 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | 无感登录（见上文） |
 | `GET /admin/credits` · `POST /admin/checkin` | 积分余额 / 手动签到 |
 
-启用 `--api-key` 后，admin 接口均需携带该 key。详细凭证池状态请查 `/admin/credentials`；`/health` 不返回账号、路径或异常信息。
+管理接口必须配置 API key，空 key 时锁定；WebUI 使用同 key 建立管理会话。详细凭证池状态请查 `/admin/credentials`；`/health` 不返回账号、路径或异常信息。
 
 ### 凭据文件导入
 
@@ -150,9 +164,9 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 | `--host` | `127.0.0.1` | 监听地址 |
 | `--port` | `8787` | 监听端口 |
 | `--api-key` | 无 | 要求本地客户端携带该 key |
-| `--log` | 无 | 记录请求与响应日志（单文件 50MB 轮转，保留 2 份） |
-| `--desensitize` | 关 | 压缩运行时提示、零宽脱敏高风险词（agent 客户端建议开启） |
-| `--no-compact` | 关 | 配合 `--desensitize`，保留更完整的 system prompt |
+| `--log` | 无 | 额外输出兼容文本日志（50 MiB 轮转，保留 2 份）；SQLite 审计默认开启 |
+| `--desensitize` | 关 | 适配固定 CLI 模板、压缩运行时提示、零宽脱敏关键词 |
+| `--no-compact` | 关 | 配合 `--desensitize` 保留主要行为指令；仍适配固定模板、裁剪运行时元数据 |
 | `--auth-file` | 扫描 `auth/` | 显式指定凭据文件，可重复传入 |
 | `--credit-price-cny` | `0.014` | 积分折算单价（元/Credit） |
 | `--credit-price-usd` | `0.03` | 国际站积分折算单价（美元/Credit） |
@@ -250,7 +264,7 @@ docker exec -it codebuddy2api python3 converter.py login --no-browser
 - **网络错误**：只对建连失败自动退避重试一次；发送后断连、读写超时及 HTTP 错误不整单重放，避免重复计费。日志包含异常类型与耗时。
 - **工具参数损坏**：聚合校验失败最多重新生成 3 次，耗尽后返回错误而非损坏的调用；重新生成可能额外消耗额度。
 - **上游空流**：只有 `stop` / `[DONE]`、没有内容的流按错误处理，不作为成功的空回答。
-- **被内容审核拦截**：多为 agent runtime 文本触发，开 `--desensitize`，仍不稳再试 `--desensitize --no-compact`。
+- **被内容审核拦截**：开启 `--desensitize`。配合 `--no-compact` 时，完整的非流式纯审核拒绝可在模板确实缩短后重试一次；流式请求不做审核重试，不因审核切换账号。
 - **响应慢**：换更快的模型，如 `deepseek-v4-flash`。
 - **同一账号多处使用**：从桌面端复制的凭据与桌面端各自刷新 token，滚动刷新场景可能互相顶掉；优先用无感登录账号，或让桌面端停用该账号。
 

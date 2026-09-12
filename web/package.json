@@ -1,0 +1,33 @@
+{
+  "name": "codebuddy-admin",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vp dev",
+    "check": "vp check",
+    "test": "vp test run",
+    "build": "vp build",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "axios": "1.20.0",
+    "fflate": "0.8.3",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "react-router": "7.13.1",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "22.20.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "jsdom": "30.0.1",
+    "sass": "1.104.1",
+    "typescript": "6.0.2",
+    "vite-plus": "0.3.1"
+  },
+  "packageManager": "pnpm@10.32.1"
+}
