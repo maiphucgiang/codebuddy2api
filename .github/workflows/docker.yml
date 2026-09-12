@@ -43,8 +43,54 @@ jobs:
             python -B "$script"
           done
 
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOMAXPROCS: '2'
+      GOMEMLIMIT: 512MiB
+      RAYON_NUM_THREADS: '2'
+      WEBUI_PYTHON: python
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.21.0'
+      - name: Install pinned vp
+        run: |
+          curl -fsSL https://github.com/voidzero-dev/vite-plus/releases/download/v0.3.1/vp-x86_64-unknown-linux-gnu.tar.gz -o "$RUNNER_TEMP/vp.tar.gz"
+          echo "a3a728816a5937fbfd06d9987c8d8a1152c6a90de22a827b840079140021d030  $RUNNER_TEMP/vp.tar.gz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/vp"
+          tar -xzf "$RUNNER_TEMP/vp.tar.gz" -C "$RUNNER_TEMP/vp"
+          echo "$RUNNER_TEMP/vp" >> "$GITHUB_PATH"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/codebuddy-browser" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/vp/vp" env off
+      - name: Install backend fixture dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Check and build WebUI
+        working-directory: web
+        run: |
+          vp install --frozen-lockfile
+          vp check
+          vp test run
+          vp build
+      - name: Browser regression tests
+        working-directory: web
+        run: |
+          vp exec playwright install --with-deps chromium-headless-shell
+          vp exec playwright test
+          vp exec playwright test -c playwright.integration.config.ts
+
   image:
-    needs: test
+    needs: [test, web]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:

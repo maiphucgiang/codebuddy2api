@@ -7,3 +7,10 @@
 !converter.py
 !app/*.py
 !app/adapters/*.py
+!web/package.json
+!web/pnpm-lock.yaml
+!web/index.html
+!web/tsconfig.json
+!web/vite.config.ts
+!web/src/**
+!web/.gitignore

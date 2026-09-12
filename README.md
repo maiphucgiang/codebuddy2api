@@ -66,6 +66,18 @@ curl http://127.0.0.1:8787/v1/models
 # Lists available models across accounts; add Authorization if a key is set
 ```
 
+## Management UI
+
+For a source checkout, build the UI with `cd web && vp install && vp build`, then start the server from the repository root. Docker builds include the UI automatically.
+
+Open `http://127.0.0.1:8787/dashboard` and sign in with the configured API key; management is locked when no key is set. Pages use `/dashboard/*`, management endpoints remain under `/admin/*`, and client APIs retain `/v1/*`.
+
+Manage model switches, public IDs, region/account bindings, credential switches, OAuth and file imports/exports. Inspect credential cooldowns, model rate limits, request audits and historical statistics. Settings precedence is CLI > environment > WebUI > defaults; external overrides remain locked.
+
+Credentials remain `auth/*.info`. Metadata lives in `auth/control.sqlite3`; the separate `auth/logs.sqlite3` audit database is enabled by default (256 MiB detail budget, 30-day detail retention). Detail cleanup preserves aggregates. Clearing all logs and statistics requires explicit confirmation and never removes credentials or gateway settings. Existing text logs are retained, not backfilled as precise statistics.
+
+See [WebUI and data management](docs/webui.md).
+
 ## Client setup
 
 Keep the OpenAI / Responses base URL at `http://127.0.0.1:8787/v1`. The backend automatically chooses an eligible account that supports the requested model, then uses that account's region and product. International-only models work at the same URL; no region prefix or new client parameter is needed.

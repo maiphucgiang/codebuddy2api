@@ -27,11 +27,14 @@ API_ENDPOINTS = {
 
 
 def docker_sources():
-    """展开 Dockerfile 的 COPY 源：目录项按 .dockerignore 允许的 *.py 展开。"""
+    """Inspect local runtime-stage COPY sources, excluding frontend build artifacts."""
     files = set()
+    runtime = False
     for line in (ROOT / "Dockerfile").read_text().splitlines():
         parts = shlex.split(line)
-        if not parts or parts[0] != "COPY":
+        if parts and parts[0] == "FROM":
+            runtime = parts[-1] == "runtime" or parts[1].startswith("python:")
+        if not runtime or not parts or parts[0] != "COPY" or any(p.startswith("--from=") for p in parts):
             continue
         for source in parts[1:-1]:
             path = ROOT / source
