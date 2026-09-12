@@ -396,6 +396,62 @@ def test_responses_projection_shrinks_large_tool_arguments():
     print("✅ test_responses_projection_shrinks_large_tool_arguments")
 
 
+def _agentic_tool():
+    return [{
+        "type": "function",
+        "function": {
+            "name": "exec_command",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        },
+    }]
+
+
+def test_responses_projection_keeps_user_text_sharing_harness_message():
+    """测试：harness 与用户原话同条时，用户原文和 reminder 正文必须保留。
+
+    回归：旧实现在 user 命中 harness 标记时直接 continue，整条消息连同
+    用户真话一起被丢掉，后端完全看不到用户这一轮说了什么。
+    """
+    body = {
+        "model": "auto",
+        "tools": _agentic_tool(),
+        "messages": [
+            {"role": "system", "content": "You are a coding agent running in the Codex CLI. # How you work"},
+            {"role": "user", "content": "# AGENTS.md instructions\n<INSTRUCTIONS>\nUse tabs\n</INSTRUCTIONS>"},
+            {"role": "user", "content": "<system-reminder>\n剩余任务：改看板\n</system-reminder>\n\n继续之前的前端改造工程，把登录页也改了"},
+            {"role": "assistant", "content": "好的，我来改登录页"},
+            {"role": "user", "content": "另外把看板的按钮也加上"},
+        ],
+    }
+    out, stats = project_responses_chat_body(body)
+    assert stats["mode"] == "aggressive"
+    blob = "\n".join(str(m.get("content", "")) for m in out["messages"])
+    assert "继续之前的前端改造工程" in blob, "与 harness 同条的用户原话被丢弃"
+    assert "剩余任务：改看板" in blob, "system-reminder 正文被丢弃"
+    assert "另外把看板的按钮也加上" in blob
+    assert "# AGENTS.md instructions" not in blob, "纯 harness 载荷应以摘要出现"
+    assert stats["anchor_user_preserved"] or "继续之前的前端改造工程" in blob
+    print("✅ test_responses_projection_keeps_user_text_sharing_harness_message")
+
+
+def test_responses_projection_keeps_last_user_when_it_carries_harness():
+    """测试：最坏情况下（含真话的 harness 恰为最后一条 user）用户真话仍保留。"""
+    body = {
+        "model": "auto",
+        "tools": _agentic_tool(),
+        "messages": [
+            {"role": "system", "content": "You are a coding agent running in the Codex CLI."},
+            {"role": "assistant", "content": "上一轮的答复"},
+            {"role": "user", "content": "<system-reminder>\n剩余任务：改看板\n</system-reminder>\n\n继续之前的前端改造工程，把登录页也改了"},
+        ],
+    }
+    out, stats = project_responses_chat_body(body)
+    blob = "\n".join(str(m.get("content", "")) for m in out["messages"])
+    assert "继续之前的前端改造工程" in blob, "最后一轮用户真话丢失"
+    assert "剩余任务：改看板" in blob, "reminder 正文丢失"
+    print("✅ test_responses_projection_keeps_last_user_when_it_carries_harness")
+
+
 def test_stream_converter_text():
     """测试：Chat SSE 文本流 → Responses 事件流。"""
     conv = ResponsesStreamConverter(model="glm-5.2")
@@ -517,7 +573,9 @@ if __name__ == "__main__":
     test_responses_projection_compacts_codex_harness_and_tools()
     test_responses_projection_preserves_recent_tool_chain_and_summarizes_history()
     test_responses_projection_shrinks_large_tool_arguments()
+    test_responses_projection_keeps_user_text_sharing_harness_message()
+    test_responses_projection_keeps_last_user_when_it_carries_harness()
     test_stream_converter_text()
     test_stream_converter_function_call()
     test_nonstream_response()
-    print(f"\n🎉 All {15} tests passed!")
+    print(f"\n🎉 All {17} tests passed!")
