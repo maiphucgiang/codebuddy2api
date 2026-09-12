@@ -162,6 +162,8 @@ _SKILLS_MARKERS = (
     "### How to use skills",
 )
 
+# 第三段为 None 表示保留标签内正文（system-reminder 里是任务/记忆，不能整段丢掉）。
+_KEEP_INNER = None
 _RUNTIME_BLOCK_REPLACEMENTS = (
     (
         "<environment_context>",
@@ -194,13 +196,25 @@ _RUNTIME_BLOCK_REPLACEMENTS = (
     (
         "<system-reminder>",
         "</system-reminder>",
-        "Runtime reminder context is provided by the harness.",
+        _KEEP_INNER,
+    ),
+)
+
+_USER_HEADING_REPLACEMENTS = (
+    (
+        "# AGENTS.md instructions",
+        "Repository instructions and durable user context are provided.",
+    ),
+    (
+        "# claudeMd",
+        "Repository CLAUDE.md instructions are provided.",
     ),
 )
 
 _RUNTIME_TAIL_MARKERS = (
     "The following deferred tools are now available via ToolSearch.",
     "Available agent types for the Agent tool:",
+    "The following skills are available for use with the Skill tool:",
     "The following sk​ills are available for use with the Sk​ill tool:",
     "## MCP Server Instructions",
 )
@@ -254,27 +268,77 @@ def _content_to_text(content) -> str:
 
 
 def _looks_like_harness_user_message(content) -> bool:
-    """判断 user 消息是否其实是 Codex/CLI 注入的上下文，而非用户自然输入。"""
+    """判断 user 消息是否夹带了 Codex/CLI 注入的上下文。"""
     text = _content_to_text(content)
     return any(marker in text for marker in _HARNESS_USER_MARKERS)
 
 
-def _prune_runtime_fragments(role: str, text: str) -> str:
-    """轻量裁掉冗长的运行时元数据，保留主要行为指令。
+def _block_stop_pattern(start_tag: str) -> str:
+    """未闭合标签截到下一个已知注入块/标题，避免把后面的用户原文一起吃掉。"""
+    stops = [re.escape(tag) for tag, _, _ in _RUNTIME_BLOCK_REPLACEMENTS if tag != start_tag]
+    stops.extend(re.escape(heading) for heading, _ in _USER_HEADING_REPLACEMENTS)
+    return "(?:" + "|".join(stops) + ")" if stops else r"(?!)"
 
-    用于 --no-compact 场景：尽量保留 Codex / Claude Code 的核心提示，
-    但移除重复的 environment / permissions / skills / tool inventory 大段文本。
+
+def _apply_runtime_block_replacements(text: str) -> str:
+    """替换 environment/permissions 等注入块；system-reminder 只去标签、保留正文。"""
+    pruned = text
+    for start_tag, end_tag, replacement in _RUNTIME_BLOCK_REPLACEMENTS:
+        closed = re.compile(
+            r"\s*" + re.escape(start_tag) + r"(.*?)" + re.escape(end_tag) + r"\s*",
+            re.DOTALL,
+        )
+        unclosed = re.compile(
+            r"\s*" + re.escape(start_tag) + r"(.*?)(?=" + _block_stop_pattern(start_tag) + r"|\Z)",
+            re.DOTALL,
+        )
+
+        def _fill(inner: str) -> str:
+            inner = inner.strip()
+            if replacement is _KEEP_INNER:
+                return f"\n\n{inner}\n\n" if inner else "\n\n"
+            return "\n\n" + replacement + "\n\n"
+
+        pruned = closed.sub(lambda match: _fill(match.group(1)), pruned)
+        if start_tag in pruned:
+            pruned = unclosed.sub(lambda match: _fill(match.group(1)), pruned)
+    return pruned
+
+
+def _heading_stop_pattern(heading: str) -> str:
+    stops = [re.escape(tag) for tag, _, _ in _RUNTIME_BLOCK_REPLACEMENTS]
+    stops.extend(re.escape(other) for other, _ in _USER_HEADING_REPLACEMENTS if other != heading)
+    stops.extend(re.escape(summary) for _, _, summary in _RUNTIME_BLOCK_REPLACEMENTS if isinstance(summary, str))
+    stops.extend(re.escape(summary) for other, summary in _USER_HEADING_REPLACEMENTS if other != heading)
+    named = "(?:" + "|".join(stops) + ")" if stops else r"(?!)"
+    # 空行后的普通段落视为用户原话，不要跟 AGENTS.md / CLAUDE.md 一起吃掉。
+    plain_tail = r"\n\n(?!\s*(?:#|<[A-Za-z/]|[-*] ))"
+    return f"(?:{named}|{plain_tail})"
+
+
+def _replace_user_heading_sections(text: str) -> str:
+    """把 AGENTS.md / CLAUDE.md 注入标题段换成短句，后面的用户原话留下。"""
+    pruned = text
+    for heading, replacement in _USER_HEADING_REPLACEMENTS:
+        if heading not in pruned:
+            continue
+        pattern = re.compile(
+            r"\s*" + re.escape(heading) + r".*?(?=" + _heading_stop_pattern(heading) + r"|\Z)",
+            re.DOTALL,
+        )
+        pruned = pattern.sub("\n\n" + replacement + "\n\n", pruned)
+    return pruned
+
+
+def _prune_runtime_fragments(role: str, text: str) -> str:
+    """裁掉冗长运行时元数据，保留行为指令、reminder 正文，以及夹在注入块里的用户原话。
+
+    compact 与 --no-compact 的 user 路径共用：只抽 harness，不整段替换。
     """
     if not text:
         return text
 
-    pruned = text
-    for start_tag, end_tag, replacement in _RUNTIME_BLOCK_REPLACEMENTS:
-        pattern = re.compile(
-            r"\s*" + re.escape(start_tag) + r".*?" + re.escape(end_tag) + r"\s*",
-            re.DOTALL,
-        )
-        pruned = pattern.sub("\n\n" + replacement + "\n\n", pruned)
+    pruned = _apply_runtime_block_replacements(text)
 
     tail_indexes = [pruned.find(marker) for marker in _RUNTIME_TAIL_MARKERS if marker in pruned]
     if tail_indexes:
@@ -310,23 +374,18 @@ def _prune_runtime_fragments(role: str, text: str) -> str:
         else:
             pruned = _CODEX_CORE_SUMMARY
 
-    if role == "user" and _looks_like_harness_user_message(pruned):
-        if (
-            "# AGENTS.md instructions" in pruned
-            or "<environment_context>" in text
-            or "<skills_instructions>" in text
-        ):
-            return (
-                "Repository instructions and durable user context are provided. "
-                "Follow repository guidance while answering the user's actual request."
-            )
+    if role == "user":
+        pruned = _replace_user_heading_sections(pruned)
 
     pruned = re.sub(r"\n{3,}", "\n\n", pruned).strip()
     return pruned
 
 
 def _compact_harness_message(role: str, content) -> str | None:
-    """把 Codex / Claude Code 注入的超长运行时提示压缩成短摘要，降低审核误伤。"""
+    """把 Codex / Claude Code 注入的超长运行时提示压缩成短摘要，降低审核误伤。
+
+    user 消息不再整段替换：只抽 harness 块，system-reminder 正文和用户原话留下。
+    """
     text = _content_to_text(content)
     if not text:
         return None
@@ -340,20 +399,17 @@ def _compact_harness_message(role: str, content) -> str | None:
             "You are a coding assistant in Codex CLI. Be precise, helpful, concise, and safe. "
             "Use available tools when needed, follow repository instructions, and keep the user informed."
         )
-    if any(marker in text for marker in _PERMISSIONS_MARKERS):
+    if role == "system" and any(marker in text for marker in _PERMISSIONS_MARKERS):
         return (
             "Runtime permissions apply: filesystem access may be sandboxed, network may be restricted, "
             "and some commands may require user approval."
         )
-    if any(marker in text for marker in _SKILLS_MARKERS):
+    if role == "system" and any(marker in text for marker in _SKILLS_MARKERS):
         return (
             "Runtime skill metadata is available. Use relevant skills only when explicitly requested or clearly applicable."
         )
     if role == "user" and _looks_like_harness_user_message(content):
-        return (
-            "Repository instructions and environment context are provided. Follow repository guidance "
-            "while answering the user's actual request."
-        )
+        return _prune_runtime_fragments("user", text)
     return None
 
 

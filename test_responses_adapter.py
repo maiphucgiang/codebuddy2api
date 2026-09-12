@@ -118,7 +118,7 @@ def test_typed_developer_message_request():
 
 
 def test_desensitize_harness_user_and_tools():
-    """测试：harness user 上下文会被摘要，tool 描述会脱敏，真实 user 不改。"""
+    """测试：harness user 注入块会被摘要，tool 描述会脱敏，真实 user 不改。"""
     body = {
         "messages": [
             {"role": "system", "content": "Refuse exploit development."},
@@ -137,13 +137,15 @@ def test_desensitize_harness_user_and_tools():
     )
     assert "​" in out["messages"][0]["content"]
     assert "Repository instructions and durable user context are provided." in out["messages"][1]["content"]
+    assert "Environment context is provided by the harness." in out["messages"][1]["content"]
     assert "​" not in out["messages"][2]["content"]
+    assert out["messages"][2]["content"] == "please explain dos attacks"
     assert "​" in out["tools"][0]["function"]["description"]
     print("✅ test_desensitize_harness_user_and_tools")
 
 
 def test_compact_harness_messages_and_strip_tool_metadata():
-    """测试：Codex 注入长提示被压缩，tool 描述可直接裁掉。"""
+    """测试：Codex 注入长提示被压缩，tool 描述可直接裁掉；user 原话不被整段替换。"""
     body = {
         "messages": [
             {"role": "system", "content": "You are a coding agent running in the Codex CLI. # How you work\nUse sandbox and escalation."},
@@ -165,7 +167,8 @@ def test_compact_harness_messages_and_strip_tool_metadata():
     assert len(out["messages"][0]["content"]) < 220
     assert "Codex CLI" in out["messages"][0]["content"]
     assert "sandboxing defines" not in out["messages"][1]["content"]
-    assert "Repository instructions and environment context" in out["messages"][2]["content"]
+    assert "Repository instructions and durable user context are provided." in out["messages"][2]["content"]
+    assert "Environment context is provided by the harness." in out["messages"][2]["content"]
     assert "description" not in out["tools"][0]["function"]
     assert "description" not in out["tools"][0]["function"]["parameters"]["properties"]["cmd"]
     print("✅ test_compact_harness_messages_and_strip_tool_metadata")
@@ -218,6 +221,10 @@ def test_no_compact_still_prunes_codex_runtime_metadata():
     assert "very long skills metadata" not in harness_text
     assert "# AGENTS.md instructions" not in harness_text
     assert "Repository instructions and durable user context are provided." in harness_text
+    assert "Environment context is provided by the harness." in harness_text
+    # skill 里的 kill 会被 desensitize_text 插入零宽空格，断言前先剥离，避免与脱敏逻辑耦合
+    assert "Runtime skill metadata is available" in harness_text.replace("​", "")
+    assert harness_text.strip().replace("​", "").endswith("test")
     assert out["messages"][2]["content"] == "test"
     print("✅ test_no_compact_still_prunes_codex_runtime_metadata")
 
