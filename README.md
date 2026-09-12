@@ -106,7 +106,7 @@ claude
 
 In CC Switch, use `http://127.0.0.1:8787` for the Anthropic provider's Base URL, for both domestic and international accounts. Only clients asking for a complete endpoint should use `/v1/messages`; Anthropic SDKs append that path themselves.
 
-Model names must be real Tencent-backend model names (no Anthropic→Tencent mapping). Keep `--desensitize` on for Claude Code.
+Model names must be real Tencent-backend model names (no Anthropic→Tencent mapping). Enable `--desensitize` to adapt known Claude Code identity and Git-branch templates for WorkBuddy. `/v1/messages` also uses upstream Chat Completions.
 
 ### Other OpenAI-compatible clients
 
@@ -153,8 +153,8 @@ Send `POST /admin/credentials` with `{"path":"account.info"}` or the file's abso
 | `--port` | `8787` | Listen port |
 | `--api-key` | — | Require this key from local clients |
 | `--log` | — | Write request/response logs (50 MB rotation, 2 backups) |
-| `--desensitize` | off | Compact runtime prompts and mask high-risk keywords (recommended for agent clients) |
-| `--no-compact` | off | With `--desensitize`: keep fuller system prompts |
+| `--desensitize` | off | Adapt known CLI templates, compact runtime prompts and mask keywords |
+| `--no-compact` | off | With `--desensitize`: retain fuller instructions; template adaptation and runtime-metadata pruning remain active |
 | `--auth-file` | scan `auth/` | Explicit credential file(s), repeatable |
 | `--credit-price-cny` | `0.014` | CNY per credit for balance conversion |
 | `--credit-price-usd` | `0.03` | USD per credit (international) |
@@ -252,7 +252,7 @@ A concrete model can be scheduled across any region or product, but only among a
 - **Network errors**: connection setup failures receive one delayed retry. Disconnects after sending, read/write timeouts, and HTTP errors are not replayed, to avoid duplicate billing. Logs include exception type and elapsed time.
 - **Malformed tool calls**: failed aggregate validation permits up to three regenerations, then returns an error instead of broken calls. Regeneration may consume additional credits.
 - **Empty upstream stream**: a stream containing only `stop` / `[DONE]` without content is treated as an error, not a successful empty answer.
-- **Content-filter blocks**: usually triggered by agent runtime text; start with `--desensitize`, or `--desensitize --no-compact`.
+- **Content-filter blocks**: enable `--desensitize`. With `--no-compact`, a complete filter-only non-stream response may trigger one retry with a shorter template. Streaming requests are not retried for content filtering; accounts are not rotated.
 - **Slow**: switch to a faster model, e.g. `deepseek-v4-flash`.
 - **Same account used elsewhere**: a credential copied from a desktop client refreshes independently — with rolling refresh tokens they can kick each other off; prefer seamless-login accounts or stop using the account in the client.
 

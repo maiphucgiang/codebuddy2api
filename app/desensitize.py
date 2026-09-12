@@ -1,28 +1,7 @@
-"""
-desensitize — 针对 CodeBuddy 后端内容审核的脱敏模块（独立、可选）。
+"""可选的客户端模板适配：固定句替换、运行时摘要与零宽词表。
 
-背景
-----
-CodeBuddy 后端（copilot.tencent.com）有内容审核，会拦截含"攻击/漏洞/凭证"
-等含义的英文术语。但这些词经常出现在客户端**固定的合规 system 模板**里
-（例如 ZCode 的 agent 声明：「Refuse requests for DoS attacks, exploit
-development, credential testing, C2 frameworks ...」），属于**拒绝作恶**
-的合规声明，并非用户的有害输入，却被后端误判为敏感词，导致整条请求被拦。
-
-本模块做的事
-------------
-对这些"合规声明高频词"做轻量处理：在词内部插入零宽空格（U+200B），
-
-    "DoS" -> "Do\u200bS"        （人/模型读仍是 DoS，后端关键词匹配失效）
-
-只处理一个明确的词表，默认只作用于 system 角色的消息（这是模板合规声明的
-集中地）。不改动其它角色内容，避免影响真实对话。
-
-设计原则
---------
-- 独立模块，可单独 import / 单独测试。
-- 保守：词表小而明确；只默认处理 system 消息；可关闭。
-- 不试图、也不可能绕过对用户真实有害输入的审核——只缓解客户端模板被误伤。
+默认只处理 system，可选 developer 和已识别的 harness user；真实对话不改写。
+只缓解固定模板误拦，不保证上游接受请求，也不改变对真实输入的审核。
 """
 
 from __future__ import annotations
@@ -133,6 +112,73 @@ _PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# 只改已知客户端模板；不全局清除空白或零宽字符。
+def _template_pattern(text: str) -> re.Pattern:
+    words = [(_ZWSP + "*").join(re.escape(char) for char in word) for word in text.split(" ")]
+    return re.compile(r"(?<!\w)" + r"[\s\u200b]+".join(words) + _ZWSP + r"*(?!\w)", re.IGNORECASE)
+
+
+_WORKBUDDY_IDENTITY = "You are CodeBuddy, Tencent's official CLI"
+_CLAUDE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude"
+_TEMPLATE_REPLACEMENTS = tuple(
+    (_template_pattern(source), target) for source, target in (
+        (_CLAUDE_IDENTITY + ", running within the Claude Agent SDK", _WORKBUDDY_IDENTITY),
+        (_CLAUDE_IDENTITY, _WORKBUDDY_IDENTITY),
+        ("You are a Claude agent, built on Anthropic's Claude Agent SDK", _WORKBUDDY_IDENTITY),
+        ("Main branch (you will usually use this for PRs)",
+         "Main branch (you will usually use this for PR)"),
+    )
+)
+_WORKBUDDY_IDENTITY_PATTERN = _template_pattern(_WORKBUDDY_IDENTITY)
+_GIT_STATUS_CONTEXT = re.compile(
+    r"^\s*(?:gitStatus:\s*|#\s*gitStatus\s*\n)"
+    r"This is the git status at the start of the conversation\.", re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _replace_git_status_text(text: str, protected: bool = False) -> tuple[str, bool]:
+    lines = []
+    for line in text.splitlines(keepends=True):
+        label = line.lstrip(" \t")
+        if re.match(r"(?:Status|Recent commits):", label, re.IGNORECASE):
+            protected = True
+        if not protected:
+            for index, (pattern, target) in enumerate(_TEMPLATE_REPLACEMENTS):
+                match = pattern.match(label)
+                if match and (label[match.end():].lstrip().startswith(":") if index == 3
+                              else label[match.end():].strip() in ("", ".")):
+                    indent = line[:len(line) - len(label)]
+                    line = indent + target + label[match.end():]
+                    break
+        lines.append(line)
+    return "".join(lines), protected
+
+
+def _replace_git_status_content(content):
+    if isinstance(content, str):
+        return _replace_git_status_text(content)[0]
+    blocks, protected = [], False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text, protected = _replace_git_status_text(block.get("text", ""), protected)
+            block = {**block, "text": text}
+        blocks.append(block)
+    return blocks
+
+
+
+def _replace_workbuddy_templates(text: str) -> str:
+    for pattern, replacement in _TEMPLATE_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _is_claude_system(text: str) -> bool:
+    return (any(pattern.search(text) for pattern, _ in _TEMPLATE_REPLACEMENTS[:3])
+            or bool(_WORKBUDDY_IDENTITY_PATTERN.search(text))
+            or "You are Claude Code" in text)
+
+
 # Codex CLI 会把大量运行时上下文包装进一条 user 消息里；这些不是用户真正提问，
 # 里面常含 permissions / sandbox / skills 等说明，也会触发后端审核。
 _HARNESS_USER_MARKERS = (
@@ -174,9 +220,13 @@ def _zero_width_split(term: str) -> str:
 
 
 def desensitize_text(text: str) -> str:
-    """对文本中的触发词插入零宽空格。无触发词则原样返回。"""
+    """先替换已知客户端模板，再对词表插入零宽空格。"""
     if not text:
         return text
+    context = _GIT_STATUS_CONTEXT.search(text)
+    if context:
+        return desensitize_text(text[:context.start()]) + _replace_git_status_text(text[context.start():])[0]
+    text = _replace_workbuddy_templates(text)
     return _PATTERN.sub(lambda m: _zero_width_split(m.group(0)), text)
 
 
@@ -203,7 +253,7 @@ def _content_to_text(content) -> str:
 
 
 def _looks_like_harness_user_message(content) -> bool:
-    """判断 user 消息是否夹带了 Codex/CLI 注入的上下文。"""
+    """判断 user 消息是否其实是 Codex/CLI 注入的上下文，而非用户自然输入。"""
     text = _content_to_text(content)
     return any(marker in text for marker in _HARNESS_USER_MARKERS)
 
@@ -215,11 +265,15 @@ def _prune_runtime_fragments(role: str, text: str) -> str:
 
 def _compact_harness_message(role: str, content) -> str | None:
     """保留既有 system 压缩策略；user 由结构化提取路径单独处理。"""
+    if isinstance(content, list) and any(
+            not isinstance(block, dict) or block.get("type") != "text" for block in content):
+        return None  # 摘要不能吞掉图片或未知内容块。
     text = _content_to_text(content)
     if not text:
         return None
-    if role == "system" and any(marker in text for marker in _CODEX_SYSTEM_MARKERS):
-        if "You are Claude Code" in text:
+    if role in ("system", "developer") and (
+            _is_claude_system(text) or any(marker in text for marker in _CODEX_SYSTEM_MARKERS)):
+        if _is_claude_system(text):
             return (
                 "You are a coding assistant. Be precise, helpful, concise, and safe. "
                 "Use available tools when needed, follow repository instructions, and keep the user informed."
@@ -289,6 +343,13 @@ def desensitize_messages(messages: Iterable[dict],
             should_desensitize = _looks_like_harness_user_message(m.get("content"))
 
         nm = dict(m)  # 浅拷贝，不污染调用方
+        content = m.get("content")
+        text = _content_to_text(content) if role == "user" and desensitize_harness_user else ""
+        if _GIT_STATUS_CONTEXT.match(text) and re.search(r"(?m)^Current branch:", text):
+            # 官方 gitStatus 是上下文，不压缩分支/状态，也不改其中的普通词。
+            nm["content"] = _replace_git_status_content(content)
+            out.append(nm)
+            continue
         if should_desensitize and role == "user":
             nm["content"] = _desensitize_harness_content(m.get("content"))
             out.append(nm)
@@ -302,10 +363,21 @@ def desensitize_messages(messages: Iterable[dict],
                 nm["content"] = desensitize_text(_prune_runtime_fragments(role, content))
             elif isinstance(content, list):
                 new_blocks = []
+                git_context = git_data = False
                 for blk in content:
                     if isinstance(blk, dict) and blk.get("type") == "text":
                         nb = dict(blk)
-                        nb["text"] = desensitize_text(_prune_runtime_fragments(role, blk.get("text", "")))
+                        text = blk.get("text", "")
+                        context = _GIT_STATUS_CONTEXT.search(text) if isinstance(text, str) else None
+                        if git_context and isinstance(text, str):
+                            nb["text"], git_data = _replace_git_status_text(text, git_data)
+                        elif context:
+                            head = desensitize_text(_prune_runtime_fragments(role, text[:context.start()]))
+                            tail, git_data = _replace_git_status_text(text[context.start():])
+                            nb["text"] = head + tail
+                            git_context = True
+                        else:
+                            nb["text"] = desensitize_text(_prune_runtime_fragments(role, text))
                         new_blocks.append(nb)
                     else:
                         new_blocks.append(blk)

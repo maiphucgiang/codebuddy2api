@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 import json
 import httpx
 
+from app.content_filter import ContentFilterDetector
+
 
 class UpstreamResponseError(Exception):
     """保留上游 HTTP 状态与错误体，由端点映射为对应协议。"""
@@ -27,6 +29,7 @@ class ChatSSEAccumulator:
         self.tools = {}
         self.model = self.finish_reason = self.usage = None
         self.done = self.saw_choice = self.saw_output = False
+        self.filter_detector = ContentFilterDetector()
 
     def feed_line(self, line):
         line = line.strip()
@@ -116,12 +119,13 @@ class ChatSSEAccumulator:
                 slot["name"] = function.get("name") or slot["name"]
                 if self.collect:
                     slot["arguments"] += function.get("arguments") or ""
+            self.filter_detector.feed(delta, choice.get("finish_reason"))
 
     def result(self):
         if not self.saw_choice or not (self.done or self.finish_reason):
             raise httpx.RemoteProtocolError("Upstream SSE ended without a completion marker")
         if not self.saw_output:
-            if self.finish_reason in ("content_filter", "refusal"):
+            if self.finish_reason in ("content_filter", "content-filter", "refusal"):
                 raw = {"error": {"type": "upstream_error", "code": self.finish_reason,
                                  "message": "Upstream rejected the response without output"}}
                 raise UpstreamResponseError(502, json.dumps(raw).encode("utf-8"))

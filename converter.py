@@ -67,6 +67,8 @@ from app import trial_rewards
 from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
                                credential_file_lock)
 from app.upstream_io import ChatSSEAccumulator, UpstreamResponseError, open_backend_stream
+from app.content_filter import ContentFilterDetector, is_filter_error
+from app.observability import observe_attempt, observe_failure, observe_usage
 from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
 from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
@@ -1892,8 +1894,8 @@ def _prepare_chat_body(body: dict, *, region=None) -> dict:
     return body
 
 
-def _guard_request_size(body: dict) -> None:
-    """限制处理后发往上游的 JSON 字节数，不截断文本或工具参数。"""
+def _guard_request_size(body: dict) -> int:
+    """校验并返回上游 JSON 字节数，不截断文本或工具参数。"""
     size = 0
     limit = CONFIG["max_request_bytes"]
     try:
@@ -1907,6 +1909,7 @@ def _guard_request_size(body: dict) -> None:
     except (ValueError, UnicodeError) as error:
         raise HTTPException(status_code=400, detail={"error": {
             "message": "请求体包含无法序列化的 JSON 值", "type": "invalid_request_error"}}) from None
+    return size
 
 
 def guard_model(name: str, *, region=None) -> None:
@@ -1984,7 +1987,7 @@ async def chat_completions(request: Request,
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     try:
-        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred)
+        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=True)
     except (httpx.HTTPError, UpstreamResponseError) as error:
         status, raw = _upstream_failure(error, model_name, t0, rid)
         raise HTTPException(status_code=status, detail=_safe_err_raw(raw, status)) from None
@@ -2014,13 +2017,14 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
     choice = (result.get("choices") or [{}])[0]
     finish = choice.get("finish_reason")
     msg = choice.get("message") or {}
+    detector = ContentFilterDetector()
+    detector.feed(msg, finish)
+    if detector.detected:
+        return  # 审核只记录分类，不把可能回显输入的正文/思考写入预览。
     tcs = msg.get("tool_calls") or []
     usage = result.get("usage") or {}
-    tag = ""
-    if finish == "content-filter":
-        tag = " ⚠️内容审核拦截"
     tc_names = [t.get("function", {}).get("name") for t in tcs]
-    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | finish={finish}{tag}"
+    _log(f"{prefix}◀ RESPONSE {model_name} | {elapsed:.1f}s | finish={finish}"
          + (f" | tool_calls={tc_names}" if tc_names else "")
          + f" | tokens={usage.get('total_tokens', '?')}")
     _log_json(f"{prefix}RESPONSE BODY (预览)", result)
@@ -2046,9 +2050,9 @@ def _completion_to_merged(result: dict) -> dict:
             "model": result.get("model"), "usage": result.get("usage")}
 
 
-async def _collect_stream(response: httpx.Response) -> dict:
+async def _collect_stream(response: httpx.Response, *, accumulator=None) -> dict:
     """使用公共聚合器保留正文、思考和工具调用，并验证流完整性。"""
-    accumulator = ChatSSEAccumulator()
+    accumulator = accumulator if accumulator is not None else ChatSSEAccumulator()
     async for line in response.aiter_lines():
         accumulator.feed_line(line)
         if accumulator.done:
@@ -2147,7 +2151,8 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
 
 def _check_upstream_status(status, raw, cred, model):
     if status != 200:
-        _note_cred_status(cred, status, model=model, raw=raw)
+        if not is_filter_error(raw):
+            _note_cred_status(cred, status, model=model, raw=raw)
         raise UpstreamResponseError(status, raw)
 
 
@@ -2159,6 +2164,11 @@ def _upstream_failure(error, model_name, t0, rid):
     else:
         status, raw = 502, _network_error_text(error).encode("utf-8")
         category = "网络错误"
+    if isinstance(error, UpstreamResponseError) and is_filter_error(raw):
+        _note_content_filter(rid, model_name, final=True)
+        return status, raw
+    else:
+        observe_failure(f"upstream_{status}" if isinstance(error, UpstreamResponseError) else type(error).__name__)
     elapsed = time.time() - t0 if t0 else 0
     _log(f"[{rid}] ✗ {category} | {model_name} | {elapsed:.1f}s | {sanitize_log_text(raw.decode('utf-8', 'replace'), 512)}")
     _log_text_body(f"[{rid}] ERROR BODY", raw.decode("utf-8", "replace"))
@@ -2166,30 +2176,59 @@ def _upstream_failure(error, model_name, t0, rid):
 
 
 async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *, filter_retry=False):
-    """统一聚合与工具校验；仅工具损坏可重新生成，网络错误不整单重放。"""
-    attempts = _TOOL_CALL_MAX_RETRY + 1 if body.get("tools") else 1
-    for attempt in range(attempts):
-        if filter_retry:
-            status, raw, _ = await _post_backend_with_filter_retry(url, headers, body, rid, model_name)
-            _check_upstream_status(status, raw, cred, body.get("model"))
-            result = _chat_completion(_merge_chat_sse_text(raw.decode("utf-8", "replace")))
-        else:
-            async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
-                if response.status_code != 200:
-                    _check_upstream_status(response.status_code, await response.aread(), cred, body.get("model"))
-                result = await _collect_stream(response)
+    """统一聚合与校验；非流式纯审核拒绝最多压缩兜底一次，网络错误不重放。"""
+    tool_attempt = 0
+    filter_retried = False
+    while True:
+        accumulator = ChatSSEAccumulator()
+        rejection = None
+        async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
+            if response.status_code != 200:
+                _check_upstream_status(response.status_code, await response.aread(), cred, body.get("model"))
+            try:
+                result = await _collect_stream(response, accumulator=accumulator)
+            except UpstreamResponseError as error:
+                if (not accumulator.done or not accumulator.filter_detector.detected
+                        or accumulator.saw_output):
+                    raise
+                rejection = error
+                result = None
+
+        detector = accumulator.filter_detector
+        if detector.detected:
+            retry_body = body
+            if (filter_retry and not filter_retried and detector.retry_safe
+                    and CONFIG.get("desensitize") and CONFIG.get("no_compact")):
+                retry_body = _chat_body_desensitize(body, force_compact=True)
+                try:
+                    if _guard_request_size(retry_body) >= _guard_request_size(body):
+                        retry_body = body
+                except HTTPException:
+                    retry_body = body
+            if retry_body != body:
+                _note_content_filter(rid, model_name, final=False)
+                body = retry_body
+                filter_retried = True
+                continue
+            if rejection is not None:
+                raise rejection
+            _note_content_filter(rid, model_name, final=True)
+
         calls = result["choices"][0]["message"].get("tool_calls")
-        if _tool_calls_healthy(calls) and _tool_choice_satisfied(calls, body):
+        if _tool_calls_healthy(calls) and (detector.detected or _tool_choice_satisfied(calls, body)):
+            observe_usage(result.get("usage") or {})
             return result
-        if attempt + 1 < attempts:
-            _log(f"[{rid}] tool_calls 损坏，重试 {attempt + 1}/{attempts - 1} | {model_name}")
-    raise UpstreamResponseError(502, b"Invalid upstream tool_calls after retries")
+        # 审核拒绝不是工具损坏，不因 required 工具选择而重复生成。
+        if detector.detected or not body.get("tools") or tool_attempt >= _TOOL_CALL_MAX_RETRY:
+            raise UpstreamResponseError(502, b"Invalid upstream tool_calls after retries")
+        tool_attempt += 1
+        _log(f"[{rid}] tool_calls 损坏，重试 {tool_attempt}/{_TOOL_CALL_MAX_RETRY} | {model_name}")
 
 
-async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *, aggregate=False, filter_retry=False):
-    """提供公共 Chat SSE 行流；日志仅缓存预览，透传分支不缓存完整正文。"""
+async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *, aggregate=False):
+    """提供公共 Chat SSE 行流；流式请求不做审核重试，正文检测缓冲有界。"""
     if aggregate:
-        result = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=filter_retry)
+        result = await _fetch_checked_chat(url, headers, body, model_name, rid, cred)
         for line in _chat_result_to_sse_lines(_completion_to_merged(result)):
             yield line
             yield ""
@@ -2213,6 +2252,10 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
                 yield ""
                 break
     merged = tracker.result()
+    observe_usage(merged.get("usage") or {})
+    if tracker.filter_detector.detected:
+        _note_content_filter(rid, model_name, final=True)
+        return
     _log(f"[{rid}] ◀ RESPONSE {model_name} | {time.time() - t0:.1f}s | stream finish={merged['finish_reason']}"
          + f" | tokens={(merged['usage'] or {}).get('total_tokens', '?')}")
     _log_text_body(f"[{rid}] RESPONSE SSE PREVIEW", preview.decode("utf-8", "replace"))
@@ -2236,15 +2279,13 @@ def _err_event(msg: bytes, status: int) -> bytes:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-def _looks_like_content_filter_text(text: str) -> bool:
-    text = (text or "").lower()
-    return (
-        "content-filter" in text
-        or "content_filter" in text
-        or "敏感内容" in text
-        or "内容审核" in text
-        or "无法响应您的请求" in text
-    )
+def _note_content_filter(rid, model_name, *, final):
+    stage = "content_filter" if final else "content_filter_retry"
+    observe_attempt(stage, error_code="content_filter")
+    if final:
+        observe_failure("content_filter")
+    action = "保留上游拒绝，不切换账号" if final else "纯审核拒绝，压缩模板重试 1/1"
+    _log(f"[{rid}] 内容审核拦截 | {model_name} | {action}")
 
 
 def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
@@ -2260,36 +2301,8 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
     )
 
 
-async def _post_backend_once(url: str, headers: dict, body: dict, *, rid="") -> tuple[int, bytes]:
-    async with _backend_stream(url, headers, body, timeout=120, rid=rid, model_name=body.get("model", "?")) as r:
-        if r.status_code != 200:
-            return r.status_code, await r.aread()
-        lines = []
-        async for line in r.aiter_lines():
-            lines.append(line)
-            if line.strip().startswith("data:") and line.strip()[5:].strip() == "[DONE]":
-                break
-        return r.status_code, ("\n".join(lines) + "\n").encode("utf-8")
 
 
-async def _post_backend_with_filter_retry(url: str, headers: dict, body: dict,
-                                          rid: str = "", model_name: str = "?") -> tuple[int, bytes, dict]:
-    prefix = f"[{rid}] " if rid else ""
-    status, raw = await _post_backend_once(url, headers, body, rid=rid)
-    text = raw.decode("utf-8", "replace")
-    if status == 200 and _looks_like_content_filter_text(text) and CONFIG.get("desensitize") and CONFIG.get("no_compact"):
-        retry_body = _chat_body_desensitize(body, force_compact=True)
-        _log(f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness")
-        try:
-            _guard_request_size(retry_body)
-        except HTTPException:
-            return status, raw, body
-        _log_json(f"{prefix}RESPONSES RETRY CHAT BODY (预览)", retry_body)
-        retry_status, retry_raw = await _post_backend_once(url, headers, retry_body, rid=rid)
-        retry_text = retry_raw.decode("utf-8", "replace")
-        if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
-            return retry_status, retry_raw, retry_body
-    return status, raw, body
 
 
 # ---------------------------------------------------------------------------
@@ -2355,7 +2368,7 @@ async def create_response(request: Request,
 async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False):
     converter = AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name)
     try:
-        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=not anthropic)
+        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=True)
         for line in _chat_result_to_sse_lines(_completion_to_merged(collected)):
             converter.feed_line(line)
         converter.finish()
@@ -2373,7 +2386,7 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
     try:
         async for line in _chat_sse_lines(
                 url, headers, body, model_name, t0, rid, cred,
-                aggregate=not anthropic or bool(body.get("tools")), filter_retry=not anthropic):
+                aggregate=not anthropic or bool(body.get("tools"))):
             events = converter.feed_line(line)
             if events:
                 yield events.encode("utf-8")
@@ -2581,12 +2594,10 @@ def main():
                     help="开启日志并写到该文件（如 --log converter.log 或 --log /tmp/cb.log）。"
                          "不传则不记日志。")
     ap.add_argument("--desensitize", action="store_true",
-                    help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
-                         "插入零宽空格，缓解被后端内容审核误拦。默认关闭。")
+                    help="适配固定 CLI 模板、压缩运行时提示并零宽脱敏关键词。默认关闭。")
     ap.add_argument("--no-compact", action="store_true",
-                    help="配合 --desensitize 使用：跳过 system/harness 压缩，仅做零宽脱敏。"
-                         "保留原始 system prompt 完整内容（如 Claude Code 的行为指令），"
-                         "但审核误拦风险略高于默认压缩模式。")
+                    help="配合 --desensitize 保留主要行为指令，仍适配固定模板并裁剪运行时元数据；"
+                         "非流式纯审核拒绝最多压缩兜底一次。")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     ap.add_argument("--auth-file", action="append", default=[], metavar="PATH",
                     help="凭据文件（可重复传入组成凭证池；默认自动扫描 auth 目录全部 *.info）")

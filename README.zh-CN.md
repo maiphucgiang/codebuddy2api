@@ -106,7 +106,7 @@ claude
 
 CC Switch 的 Anthropic 提供商 Base URL 填写 `http://127.0.0.1:8787`，国内、国际账号通用。只有明确要求完整端点的客户端才填写 `/v1/messages`；Anthropic SDK 会自行追加此路径。
 
-模型名必须填腾讯后端真实模型名（不做 Anthropic→腾讯映射）。Claude Code 场景建议保持 `--desensitize` 开启。
+模型名必须填腾讯后端真实模型名（不做 Anthropic→腾讯映射）。开启 `--desensitize` 可适配 WorkBuddy 对 Claude Code 固定身份、Git 分支提示的兼容要求；`/v1/messages` 同样转为上游 Chat Completions。
 
 ### 其他 OpenAI 兼容客户端
 
@@ -153,8 +153,8 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 | `--port` | `8787` | 监听端口 |
 | `--api-key` | 无 | 要求本地客户端携带该 key |
 | `--log` | 无 | 记录请求与响应日志（单文件 50MB 轮转，保留 2 份） |
-| `--desensitize` | 关 | 压缩运行时提示、零宽脱敏高风险词（agent 客户端建议开启） |
-| `--no-compact` | 关 | 配合 `--desensitize`，保留更完整的 system prompt |
+| `--desensitize` | 关 | 适配固定 CLI 模板、压缩运行时提示、零宽脱敏关键词 |
+| `--no-compact` | 关 | 配合 `--desensitize` 保留主要行为指令；仍适配固定模板、裁剪运行时元数据 |
 | `--auth-file` | 扫描 `auth/` | 显式指定凭据文件，可重复传入 |
 | `--credit-price-cny` | `0.014` | 积分折算单价（元/Credit） |
 | `--credit-price-usd` | `0.03` | 国际站积分折算单价（美元/Credit） |
@@ -252,7 +252,7 @@ docker exec -it codebuddy2api python3 converter.py login --no-browser
 - **网络错误**：只对建连失败自动退避重试一次；发送后断连、读写超时及 HTTP 错误不整单重放，避免重复计费。日志包含异常类型与耗时。
 - **工具参数损坏**：聚合校验失败最多重新生成 3 次，耗尽后返回错误而非损坏的调用；重新生成可能额外消耗额度。
 - **上游空流**：只有 `stop` / `[DONE]`、没有内容的流按错误处理，不作为成功的空回答。
-- **被内容审核拦截**：多为 agent runtime 文本触发，开 `--desensitize`，仍不稳再试 `--desensitize --no-compact`。
+- **被内容审核拦截**：开启 `--desensitize`。配合 `--no-compact` 时，完整的非流式纯审核拒绝可在模板确实缩短后重试一次；流式请求不做审核重试，不因审核切换账号。
 - **响应慢**：换更快的模型，如 `deepseek-v4-flash`。
 - **同一账号多处使用**：从桌面端复制的凭据与桌面端各自刷新 token，滚动刷新场景可能互相顶掉；优先用无感登录账号，或让桌面端停用该账号。
 
