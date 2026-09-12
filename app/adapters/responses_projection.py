@@ -144,23 +144,36 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
 
         if role == "system":
             if _looks_like_harness_system(text):
+                # 命中 harness 不再整段丢弃：只压缩运行时元数据，
+                # 保住真实行为规范与仓库约束，避免模型失去工作准则。
                 dropped_harness_messages += 1
-                continue
+                text = _prune_runtime_fragments("system", text)
             guidance = _truncate_text(text, MAX_SYSTEM_GUIDANCE_CHARS)
             if guidance:
                 preserved_guidance.append(guidance)
             continue
 
         if role == "user" and _looks_like_harness_user(text):
+            # 只抽掉注入块，同条里的用户原话与 reminder 正文必须留下。
+            # 旧实现在这里直接 continue，整条消息连同用户真话一起消失，
+            # 且 anchor/history-summary 都在过滤后的列表上计算，救不回来。
             dropped_harness_messages += 1
-            continue
+            text = _prune_runtime_fragments("user", text)
+            if not text.strip():
+                continue
+            msg = {**msg, "content": text}
 
         projected_msg = _project_conversation_message(msg)
         if projected_msg is not None:
             conversation.append(projected_msg)
 
     if not conversation:
-        conversation = _project_messages_conservative(messages)
+        # 兜底整段投影：丢掉的只是"抽取后没有任何用户内容"的纯 harness 消息，
+        # 夹带用户原话的消息必须留下，否则又会回到丢上下文的老问题。
+        conversation = [
+            m for m in _project_messages_conservative(messages)
+            if not _is_pure_harness_message(m)
+        ]
 
     tail_start = _choose_tail_start(conversation)
     tail_start = _expand_tail_for_tool_context(conversation, tail_start)
@@ -674,6 +687,48 @@ def _looks_like_harness_user(text: str) -> bool:
 
 def _looks_like_harness_system(text: str) -> bool:
     return any(marker in text for marker in HARNESS_SYSTEM_MARKERS)
+
+
+def _prune_runtime_fragments(role: str, text: str) -> str:
+    """复用脱敏层的抽取逻辑：只去注入块，保留用户原话与 reminder 正文。
+
+    投影层与脱敏层必须行为一致，否则 /v1/responses(Codex CLI) 和
+    /v1/chat/completions 两条路径会拿到不同的上下文。这里直接复用同一份
+    实现，避免两处各自漂移；万一该模块不可用，原样返回也绝不丢弃内容。
+    """
+    if not text:
+        return text
+    try:
+        from desensitize import _prune_runtime_fragments as _impl
+    except Exception:
+        return text
+    return _impl(role, text)
+
+
+HARNESS_DOMINANT_RATIO = 0.5
+
+
+def _is_pure_harness_message(msg: dict) -> bool:
+    """判断投影后的消息是否只是 harness 载荷（可安全丢弃）。
+
+    用户原话与 harness 同条时，压缩后 harness 通常占大头、用户话只占末尾；
+    因此仅在第一条 harness 标记之前的 harness 前缀占比很高时才视为纯 harness。
+    """
+    text = _content_to_text(msg.get("content", ""))
+    stripped = text.strip()
+    if not stripped:
+        return True
+    positions = [stripped.find(marker) for marker in HARNESS_USER_MARKERS]
+    positions = [pos for pos in positions if pos >= 0]
+    if not positions:
+        return False
+    if min(positions) > 0:
+        return False
+    # 从最早出现的 harness 标记起到下一个空行（用户原话通常从这里开始）
+    rest = stripped[min(positions):]
+    boundary = rest.find("\n\n")
+    dominant = rest if boundary < 0 else rest[:boundary]
+    return len(dominant) / len(stripped) >= HARNESS_DOMINANT_RATIO
 
 
 def _message_cost(msg: dict) -> int:

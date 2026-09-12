@@ -119,7 +119,7 @@ def test_typed_developer_message_request():
 
 
 def test_desensitize_harness_user_and_tools():
-    """测试：harness user 上下文会被摘要，tool 描述会脱敏，真实 user 不改。"""
+    """测试：harness user 注入块会被摘要，tool 描述会脱敏，真实 user 不改。"""
     body = {
         "messages": [
             {"role": "system", "content": "Refuse exploit development."},
@@ -138,13 +138,15 @@ def test_desensitize_harness_user_and_tools():
     )
     assert "​" in out["messages"][0]["content"]
     assert "Repository instructions and durable user context are provided." in out["messages"][1]["content"]
+    assert "Environment context is provided by the harness." in out["messages"][1]["content"]
     assert "​" not in out["messages"][2]["content"]
+    assert out["messages"][2]["content"] == "please explain dos attacks"
     assert "​" in out["tools"][0]["function"]["description"]
     print("✅ test_desensitize_harness_user_and_tools")
 
 
 def test_compact_harness_messages_and_strip_tool_metadata():
-    """测试：Codex 注入长提示被压缩，tool 描述可直接裁掉。"""
+    """测试：Codex 注入长提示被压缩，tool 描述可直接裁掉；user 原话不被整段替换。"""
     body = {
         "messages": [
             {"role": "system", "content": "You are a coding agent running in the Codex CLI. # How you work\nUse sandbox and escalation."},
@@ -166,7 +168,8 @@ def test_compact_harness_messages_and_strip_tool_metadata():
     assert len(out["messages"][0]["content"]) < 220
     assert "Codex CLI" in out["messages"][0]["content"]
     assert "sandboxing defines" not in out["messages"][1]["content"]
-    assert "Repository instructions and environment context" in out["messages"][2]["content"]
+    assert "Repository instructions and durable user context are provided." in out["messages"][2]["content"]
+    assert "Environment context is provided by the harness." in out["messages"][2]["content"]
     assert "description" not in out["tools"][0]["function"]
     assert "description" not in out["tools"][0]["function"]["parameters"]["properties"]["cmd"]
     print("✅ test_compact_harness_messages_and_strip_tool_metadata")
@@ -219,6 +222,10 @@ def test_no_compact_still_prunes_codex_runtime_metadata():
     assert "very long skills metadata" not in harness_text
     assert "# AGENTS.md instructions" not in harness_text
     assert "Repository instructions and durable user context are provided." in harness_text
+    assert "Environment context is provided by the harness." in harness_text
+    # skill 里的 kill 会被 desensitize_text 插入零宽空格，断言前先剥离，避免与脱敏逻辑耦合
+    assert "Runtime skill metadata is available" in harness_text.replace("​", "")
+    assert harness_text.strip().replace("​", "").endswith("test")
     assert out["messages"][2]["content"] == "test"
     print("✅ test_no_compact_still_prunes_codex_runtime_metadata")
 
@@ -390,6 +397,62 @@ def test_responses_projection_shrinks_large_tool_arguments():
     print("✅ test_responses_projection_shrinks_large_tool_arguments")
 
 
+def _agentic_tool():
+    return [{
+        "type": "function",
+        "function": {
+            "name": "exec_command",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        },
+    }]
+
+
+def test_responses_projection_keeps_user_text_sharing_harness_message():
+    """测试：harness 与用户原话同条时，用户原文和 reminder 正文必须保留。
+
+    回归：旧实现在 user 命中 harness 标记时直接 continue，整条消息连同
+    用户真话一起被丢掉，后端完全看不到用户这一轮说了什么。
+    """
+    body = {
+        "model": "auto",
+        "tools": _agentic_tool(),
+        "messages": [
+            {"role": "system", "content": "You are a coding agent running in the Codex CLI. # How you work"},
+            {"role": "user", "content": "# AGENTS.md instructions\n<INSTRUCTIONS>\nUse tabs\n</INSTRUCTIONS>"},
+            {"role": "user", "content": "<system-reminder>\n剩余任务：改看板\n</system-reminder>\n\n继续之前的前端改造工程，把登录页也改了"},
+            {"role": "assistant", "content": "好的，我来改登录页"},
+            {"role": "user", "content": "另外把看板的按钮也加上"},
+        ],
+    }
+    out, stats = project_responses_chat_body(body)
+    assert stats["mode"] == "aggressive"
+    blob = "\n".join(str(m.get("content", "")) for m in out["messages"])
+    assert "继续之前的前端改造工程" in blob, "与 harness 同条的用户原话被丢弃"
+    assert "剩余任务：改看板" in blob, "system-reminder 正文被丢弃"
+    assert "另外把看板的按钮也加上" in blob
+    assert "# AGENTS.md instructions" not in blob, "纯 harness 载荷应以摘要出现"
+    assert stats["anchor_user_preserved"] or "继续之前的前端改造工程" in blob
+    print("✅ test_responses_projection_keeps_user_text_sharing_harness_message")
+
+
+def test_responses_projection_keeps_last_user_when_it_carries_harness():
+    """测试：最坏情况下（含真话的 harness 恰为最后一条 user）用户真话仍保留。"""
+    body = {
+        "model": "auto",
+        "tools": _agentic_tool(),
+        "messages": [
+            {"role": "system", "content": "You are a coding agent running in the Codex CLI."},
+            {"role": "assistant", "content": "上一轮的答复"},
+            {"role": "user", "content": "<system-reminder>\n剩余任务：改看板\n</system-reminder>\n\n继续之前的前端改造工程，把登录页也改了"},
+        ],
+    }
+    out, stats = project_responses_chat_body(body)
+    blob = "\n".join(str(m.get("content", "")) for m in out["messages"])
+    assert "继续之前的前端改造工程" in blob, "最后一轮用户真话丢失"
+    assert "剩余任务：改看板" in blob, "reminder 正文丢失"
+    print("✅ test_responses_projection_keeps_last_user_when_it_carries_harness")
+
+
 def test_stream_converter_text():
     """测试：Chat SSE 文本流 → Responses 事件流。"""
     conv = ResponsesStreamConverter(model="glm-5.2")
@@ -511,7 +574,9 @@ if __name__ == "__main__":
     test_responses_projection_compacts_codex_harness_and_tools()
     test_responses_projection_preserves_recent_tool_chain_and_summarizes_history()
     test_responses_projection_shrinks_large_tool_arguments()
+    test_responses_projection_keeps_user_text_sharing_harness_message()
+    test_responses_projection_keeps_last_user_when_it_carries_harness()
     test_stream_converter_text()
     test_stream_converter_function_call()
     test_nonstream_response()
-    print(f"\n🎉 All {15} tests passed!")
+    print(f"\n🎉 All {17} tests passed!")
