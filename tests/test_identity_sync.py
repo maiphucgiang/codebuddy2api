@@ -45,6 +45,8 @@ def balance(token, **kwargs):
 
 class IdentitySyncTests(unittest.TestCase):
     def setUp(self):
+        from fastapi import FastAPI
+        self.enterContext(patch.object(c, "app", FastAPI()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"CODEBUDDY_AUTH_DIR": str(self.root),
             "CODEBUDDY2API_LOG": "", "CODEBUDDY2API_KEY": ""}))

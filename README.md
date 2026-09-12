@@ -47,7 +47,7 @@ Copy and edit the configuration before the first start; do not overwrite an exis
 ```bash
 cp .env.example .env
 # Edit .env: API key, image policy, and other settings
-uv run --env-file .env converter.py --desensitize --log converter.log
+uv run --env-file .env converter.py --desensitize
 ```
 
 Listening on `http://127.0.0.1:8787` means it is up.
@@ -106,7 +106,7 @@ claude
 
 In CC Switch, use `http://127.0.0.1:8787` for the Anthropic provider's Base URL, for both domestic and international accounts. Only clients asking for a complete endpoint should use `/v1/messages`; Anthropic SDKs append that path themselves.
 
-Model names must be real Tencent-backend model names (no Anthropic→Tencent mapping). Enable `--desensitize` to adapt known Claude Code identity and Git-branch templates for WorkBuddy. `/v1/messages` also uses upstream Chat Completions.
+Use IDs published by `/v1/models`, including public aliases configured in the UI; Anthropic model names are not automatically guessed or mapped. Enable `--desensitize` to adapt known Claude Code identity and Git-branch templates for WorkBuddy. `/v1/messages` also uses upstream Chat Completions.
 
 ### Other OpenAI-compatible clients
 
@@ -137,7 +137,7 @@ These original paths serve all supported regions and products. `/cn` and `/intl`
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | Seamless login (see above) |
 | `GET /admin/credits` · `POST /admin/checkin` | Credit balances / manual daily check-in |
 
-Admin endpoints require `--api-key` when it is set. Use `/admin/credentials` for detailed pool status; `/health` never returns account, path or exception details.
+Admin endpoints require a configured API key; an empty key locks management. The UI uses the same key to establish a management session. Use `/admin/credentials` for detailed pool status; `/health` never returns account, path or exception details.
 
 ### Credential imports
 
@@ -152,7 +152,7 @@ Send `POST /admin/credentials` with `{"path":"account.info"}` or the file's abso
 | `--host` | `127.0.0.1` | Listen address |
 | `--port` | `8787` | Listen port |
 | `--api-key` | — | Require this key from local clients |
-| `--log` | — | Write request/response logs (50 MB rotation, 2 backups) |
+| `--log` | — | Optional additional text logs (50 MiB rotation, 2 backups); SQLite auditing is enabled by default |
 | `--desensitize` | off | Adapt known CLI templates, compact runtime prompts and mask keywords |
 | `--no-compact` | off | With `--desensitize`: retain fuller instructions; template adaptation and runtime-metadata pruning remain active |
 | `--auth-file` | scan `auth/` | Explicit credential file(s), repeatable |

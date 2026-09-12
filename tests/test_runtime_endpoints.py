@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 import httpx
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import converter
@@ -355,6 +356,9 @@ class TransportBoundaryTests(unittest.IsolatedAsyncioTestCase):
 class ConfigurationTests(unittest.TestCase):
     def configure(self, env=None, flags=(), invalid=False):
         with contextlib.ExitStack() as stack:
+            directory = stack.enter_context(tempfile.TemporaryDirectory())
+            stack.enter_context(patch.object(converter, "managed_auth_dir", return_value=Path(directory)))
+            stack.enter_context(patch.object(converter, "app", FastAPI()))
             stack.enter_context(patch.dict(os.environ, env or {}, clear=True))
             stack.enter_context(patch.dict(converter.CONFIG))
             stack.enter_context(patch("sys.argv", ["converter.py", "--skip-check", *flags]))

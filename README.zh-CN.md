@@ -47,7 +47,7 @@ uv run converter.py login
 ```bash
 cp .env.example .env
 # 编辑 .env 中的密钥、图片策略等配置
-uv run --env-file .env converter.py --desensitize --log converter.log
+uv run --env-file .env converter.py --desensitize
 ```
 
 看到监听 `http://127.0.0.1:8787` 即启动成功。
@@ -106,7 +106,7 @@ claude
 
 CC Switch 的 Anthropic 提供商 Base URL 填写 `http://127.0.0.1:8787`，国内、国际账号通用。只有明确要求完整端点的客户端才填写 `/v1/messages`；Anthropic SDK 会自行追加此路径。
 
-模型名必须填腾讯后端真实模型名（不做 Anthropic→腾讯映射）。开启 `--desensitize` 可适配 WorkBuddy 对 Claude Code 固定身份、Git 分支提示的兼容要求；`/v1/messages` 同样转为上游 Chat Completions。
+模型名使用 `/v1/models` 发布的 ID，可在管理界面设置对外别名；不自动猜测 Anthropic→腾讯模型映射。开启 `--desensitize` 可适配 WorkBuddy 对 Claude Code 固定身份、Git 分支提示的兼容要求；`/v1/messages` 同样转为上游 Chat Completions。
 
 ### 其他 OpenAI 兼容客户端
 
@@ -137,7 +137,7 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | 无感登录（见上文） |
 | `GET /admin/credits` · `POST /admin/checkin` | 积分余额 / 手动签到 |
 
-启用 `--api-key` 后，admin 接口均需携带该 key。详细凭证池状态请查 `/admin/credentials`；`/health` 不返回账号、路径或异常信息。
+管理接口必须配置 API key，空 key 时锁定；WebUI 使用同 key 建立管理会话。详细凭证池状态请查 `/admin/credentials`；`/health` 不返回账号、路径或异常信息。
 
 ### 凭据文件导入
 
@@ -152,7 +152,7 @@ Cherry Studio / ZCode / LobeChat / NextChat / Open WebUI 或自写 SDK 客户端
 | `--host` | `127.0.0.1` | 监听地址 |
 | `--port` | `8787` | 监听端口 |
 | `--api-key` | 无 | 要求本地客户端携带该 key |
-| `--log` | 无 | 记录请求与响应日志（单文件 50MB 轮转，保留 2 份） |
+| `--log` | 无 | 额外输出兼容文本日志（50 MiB 轮转，保留 2 份）；SQLite 审计默认开启 |
 | `--desensitize` | 关 | 适配固定 CLI 模板、压缩运行时提示、零宽脱敏关键词 |
 | `--no-compact` | 关 | 配合 `--desensitize` 保留主要行为指令；仍适配固定模板、裁剪运行时元数据 |
 | `--auth-file` | 扫描 `auth/` | 显式指定凭据文件，可重复传入 |

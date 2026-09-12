@@ -52,7 +52,7 @@ class SecurityTests(unittest.TestCase):
                                       "CODEBUDDY_IMPORT_DIR": str(self.imports)})
         env.start()
         self.addCleanup(env.stop)
-        config = patch.dict(converter.CONFIG, {"api_key": "", "cred_pool": self.pool,
+        config = patch.dict(converter.CONFIG, {"api_key": "synthetic-admin-key", "cred_pool": self.pool,
                                                "cred": None, "log_path": None})
         config.start()
         self.addCleanup(config.stop)
@@ -63,7 +63,8 @@ class SecurityTests(unittest.TestCase):
         return path
 
     def post(self, path, authorization=None):
-        return asyncio.run(converter.admin_add_credential(Request({"path": path}), authorization, None))
+        return asyncio.run(converter.admin_add_credential(
+            Request({"path": path}), authorization or "Bearer synthetic-admin-key", None))
 
     def assert_http(self, code, call):
         with self.assertRaises(converter.HTTPException) as caught:
@@ -112,13 +113,13 @@ class SecurityTests(unittest.TestCase):
                 self.assert_http(400, lambda: self.post(value))
         for body in [None, [], "path", 123]:
             self.assert_http(400, lambda: asyncio.run(
-                converter.admin_add_credential(Request(body), None, None)))
+                converter.admin_add_credential(Request(body), "Bearer synthetic-admin-key", None)))
         request = Mock()
         async def invalid_json():
             raise ValueError("synthetic-secret")
         request.json = invalid_json
         self.assert_http(400, lambda: asyncio.run(
-            converter.admin_add_credential(request, None, None)))
+            converter.admin_add_credential(request, "Bearer synthetic-admin-key", None)))
 
     def test_non_info_and_directory_rejected(self):
         self.source("account.json")
@@ -265,6 +266,15 @@ class SecurityTests(unittest.TestCase):
             request.json.assert_not_called()
         source = self.source()
         self.post(source.name, "Bearer test-only-api-key")
+
+    def test_empty_key_locks_legacy_admin_without_management_middleware(self):
+        request = Mock()
+        with patch.dict(converter.CONFIG, {"api_key": ""}):
+            self.assert_http(503, lambda: asyncio.run(converter.admin_add_credential(request, None, None)))
+            self.assert_http(503, lambda: converter.admin_list_credentials(None, None))
+            request.json.assert_not_called()
+            self.assertIsNone(converter._check_auth(None, None))
+
 
     def test_public_health_never_touches_credentials(self):
         converter.CONFIG["api_key"] = "test-only-api-key"
