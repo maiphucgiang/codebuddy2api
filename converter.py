@@ -1877,6 +1877,16 @@ def _prepare_chat_body(body: dict, *, region=None) -> dict:
     if not isinstance(messages, list) or not messages or any(not isinstance(message, dict) for message in messages):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "messages must be a non-empty array of objects", "type": "invalid_request_error"}})
+    # Upstream risk control (copilot.tencent.com / workbuddy.ai) treats the
+    # "developer" role as an unofficial-client fingerprint and rejects the whole
+    # request with HTTP 400 / code 11128 "Illegal API invocation from an
+    # unapproved channel". Official CLI/WorkBuddy clients only ever send
+    # "system", while pi and other OpenAI-compatible harnesses send the system
+    # prompt as "developer". Normalize to "system" before the leading-system
+    # reordering below.
+    for _message in messages:
+        if _message.get("role") == "developer":
+            _message["role"] = "system"
     if messages[0].get("role") != "system":
         system_index = next((index for index, message in enumerate(messages) if message.get("role") == "system"), None)
         if system_index is None:
