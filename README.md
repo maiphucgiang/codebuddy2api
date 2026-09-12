@@ -76,7 +76,7 @@ Manage model switches, public IDs, region/account bindings, credential switches,
 
 Credentials remain `auth/*.info`. Metadata lives in `auth/control.sqlite3`; the separate `auth/logs.sqlite3` audit database is enabled by default (256 MiB detail budget, 30-day detail retention). Detail cleanup preserves aggregates. Clearing all logs and statistics requires explicit confirmation and never removes credentials or gateway settings. Existing text logs are retained, not backfilled as precise statistics.
 
-See [WebUI and data management](docs/webui.md).
+See the [WebUI guide](docs/webui.md).
 
 ## Client setup
 

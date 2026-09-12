@@ -76,7 +76,7 @@ curl http://127.0.0.1:8787/v1/models
 
 凭证仍保存在 `auth/*.info`。管理元数据保存于 `auth/control.sqlite3`，日志默认保存于独立的 `auth/logs.sqlite3`；默认明细预算 256 MiB、保留 30 天，聚合统计不随明细清理。全部清空日志与统计需要危险操作确认，不删除凭证和网关配置。旧文本日志保留，不自动回填精确统计。
 
-详见 [WebUI 与数据管理](docs/webui.md)。
+详见 [WebUI 使用指南](docs/webui.zh-CN.md)。
 
 ## 客户端接入
 
