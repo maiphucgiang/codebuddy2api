@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_auth_oauth.py — 验证 auth_oauth.py 的入库校验/.info 拼装/OAuth 状态机与 converter 保活调度。
 
-直接运行：python3 test_auth_oauth.py
+直接运行：python3 tests/test_auth_oauth.py
 """
 
 import base64
@@ -12,10 +12,10 @@ import time
 import threading
 from pathlib import Path
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
-import auth_oauth
-from auth_oauth import (
+from app import auth_oauth
+from app.auth_oauth import (
     OAuthManager, build_auth_file, merge_existing_accounts, validate_cred_data,
     _norm_ts, _normalize_origin, _token_issuer_origin,
 )

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_credits.py — 验证 credits.py 的签到判定/域名选择/积分分段/ledger 与快过期优先调度。
 
-直接运行：python3 test_credits.py
+直接运行：python3 tests/test_credits.py
 """
 
 import base64
@@ -15,10 +15,10 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
-import credits
-from credits import (
+from app import credits
+from app.credits import (
     AuthExpiredError, CreditLedger,
     classify_checkin_result, token_issuer_origin, hosts_for_token,
     extract_segments, merge_segments, soonest_expiry,
@@ -73,7 +73,7 @@ def test_financial_hints_rejected_before_network():
         (_jwt("https://www.workbuddy.ai/x"), "www.workbuddy.cn"),
         (_jwt("https://www.codebuddy.ai/x"), "copilot.tencent.com"),
     ]
-    with patch("credits.httpx.Client") as factory:
+    with patch("app.credits.httpx.Client") as factory:
         for token, domain in invalid:
             for operation in (hosts_for_token, credits.daily_checkin, credits.fetch_credits,
                               credits.fetch_request_usage):
@@ -97,7 +97,7 @@ def test_financial_profile_hosts_and_web_headers():
             client.post.return_value.status_code = 200
             client.post.return_value.json.return_value = {"code": 0, "data": {
                 "Accounts": [{"CapacityRemain": 3}], "data": [], "total": 0}}
-            with patch("credits.httpx.Client") as factory:
+            with patch("app.credits.httpx.Client") as factory:
                 factory.return_value.__enter__.return_value = client
                 result = operation("opaque", uid="test-user", domain=domain)
             client.post.assert_called_once()
@@ -132,7 +132,7 @@ def test_financial_failures_stay_on_profile():
                 client.post.return_value.json.return_value = {}
                 if failure == "network":
                     client.post.side_effect = httpx.ConnectError("mock connection failure")
-                with patch("credits.httpx.Client") as factory, patch("credits.time.sleep"):
+                with patch("app.credits.httpx.Client") as factory, patch("app.credits.time.sleep"):
                     factory.return_value.__enter__.return_value = client
                     if operation is credits.daily_checkin:
                         result = operation("opaque", domain=domain)

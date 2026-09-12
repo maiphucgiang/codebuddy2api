@@ -45,36 +45,36 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 try:
-    from desensitize import desensitize_body
+    from app.desensitize import desensitize_body
 except ImportError:  # 模块缺失时降级为不脱敏
     def desensitize_body(body, roles=("system",), desensitize_harness_user=False,
                          desensitize_tools=False, compact_harness=False,
                          strip_tool_metadata=False):
         return body
 
-from responses_adapter import (
+from app.adapters.responses_adapter import (
     responses_request_to_chat,
     ResponsesStreamConverter,
 )
-from responses_projection import project_responses_chat_body
-from anthropic_adapter import (
+from app.adapters.responses_projection import project_responses_chat_body
+from app.adapters.anthropic_adapter import (
     anthropic_request_to_chat,
     AnthropicStreamConverter,
 )
 
-import auth_oauth
-import trial_rewards
-from credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
-                           credential_file_lock)
-from upstream_io import ChatSSEAccumulator, UpstreamResponseError, open_backend_stream
-from request_limits import ImageLimitError, apply_image_policy
-from safe_logging import format_log_body, sanitize_log_text
-from site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
-                          profile_for_auth, profile_for_headers, profile_region, profile_product, profile_site,
-                          chat_url_for_headers, refresh_url_for_auth)
-from client_profiles import CLI_VERSION, CLI_USER_AGENT, credential_headers, catalog_cache_key, account_key
+from app import auth_oauth
+from app import trial_rewards
+from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
+                               credential_file_lock)
+from app.upstream_io import ChatSSEAccumulator, UpstreamResponseError, open_backend_stream
+from app.request_limits import ImageLimitError, apply_image_policy
+from app.safe_logging import format_log_body, sanitize_log_text
+from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
+                              profile_for_auth, profile_for_headers, profile_region, profile_product,
+                              profile_site, chat_url_for_headers, refresh_url_for_auth)
+from app.client_profiles import CLI_VERSION, CLI_USER_AGENT, credential_headers, catalog_cache_key, account_key
 try:
-    import credits as credits_mod
+    from app import credits as credits_mod
 except ImportError:  # 模块缺失时签到/积分/快过期优先调度不可用
     credits_mod = None
 

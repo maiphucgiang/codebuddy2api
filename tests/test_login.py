@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""登录命令的扫码轮询、凭据保存和退出行为；运行 python3 test_login.py。"""
+"""登录命令的扫码轮询、凭据保存和退出行为；运行 python3 tests/test_login.py。"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import contextlib
 import io
@@ -8,12 +12,11 @@ import os
 import stat
 import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 import httpx
 
-import auth_oauth
+from app import auth_oauth
 import converter
 
 

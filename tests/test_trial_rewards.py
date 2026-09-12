@@ -1,8 +1,12 @@
 """Offline trial tests: synthetic headers, MockTransport, disposable ledger directories.
 
-Run: python -B -m unittest -v test_trial_rewards
+Run: python -B -m unittest -v tests/test_trial_rewards.py
 No converter import, credentials, external scripts, or live HTTP requests.
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -10,7 +14,6 @@ import hashlib
 import json
 import multiprocessing
 import os
-from pathlib import Path
 import stat
 import tempfile
 import unittest
@@ -18,8 +21,8 @@ from unittest.mock import patch
 
 import httpx
 
-from client_profiles import credential_headers
-import trial_rewards as trial
+from app.client_profiles import credential_headers
+from app import trial_rewards as trial
 
 KEY = hashlib.sha256(b'["intl-work","synthetic-user","synthetic-tenant"]').hexdigest()
 OTHER_KEY = hashlib.sha256(b"another synthetic account").hexdigest()
@@ -283,7 +286,7 @@ class TrialLedgerTests(unittest.TestCase):
         self.assertTrue(self.ledger.begin(OTHER_KEY, now=100))
         old = self.path.read_bytes()
         for target in ("tempfile.mkstemp", "os.fsync", "os.replace"):
-            with self.subTest(target=target), patch("trial_rewards." + target, side_effect=OSError("mock save error")), \
+            with self.subTest(target=target), patch("app.trial_rewards." + target, side_effect=OSError("mock save error")), \
                     patch.object(trial.httpx, "Client") as client:
                 with self.assertRaises(OSError):
                     trial.attempt_trial(self.ledger, KEY, headers())

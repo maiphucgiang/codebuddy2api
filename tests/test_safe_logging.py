@@ -1,15 +1,17 @@
 """Synthetic, standalone safe-logging regression tests (no application imports)."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import copy
 import json
-from pathlib import Path
 import subprocess
-import sys
 import unittest
 from unittest.mock import patch
 
-import safe_logging
-from safe_logging import format_log_body, sanitize_log_text
+from app import safe_logging
+from app.safe_logging import format_log_body, sanitize_log_text
 
 
 class SafeLoggingTests(unittest.TestCase):
@@ -172,7 +174,7 @@ class SafeLoggingTests(unittest.TestCase):
         # A generous process timeout catches polynomial regressions without
         # asserting machine-dependent millisecond thresholds in the test runner.
         code = r'''
-from safe_logging import format_log_body, sanitize_log_text
+from app.safe_logging import format_log_body, sanitize_log_text
 for count in (5000, 20000):
     for attack in ("data:image/+" + ";data:image/+" * count, "data:image/+;" * count):
         assert sanitize_log_text(attack, len(attack)) == attack
@@ -186,7 +188,7 @@ print("ok")
 '''
         result = subprocess.run(
             [sys.executable, "-B", "-c", code],
-            cwd=Path(__file__).resolve().parent,
+            cwd=Path(__file__).resolve().parents[1],  # 仓库根：子进程需 import 应用模块
             capture_output=True, text=True, timeout=10, check=True,
         )
         self.assertEqual(result.stdout.strip(), "ok")

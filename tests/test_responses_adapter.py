@@ -2,19 +2,20 @@
 """
 test_responses_adapter.py — 验证 Responses API 适配层的转换逻辑。
 
-直接运行：python3 test_responses_adapter.py
+直接运行：python3 tests/test_responses_adapter.py
 """
 
 import json
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
-from responses_adapter import (
+from app.adapters.responses_adapter import (
     responses_request_to_chat,
     ResponsesStreamConverter,
 )
-from desensitize import desensitize_body
-from responses_projection import project_responses_chat_body
+from app.desensitize import desensitize_body
+from app.adapters.responses_projection import project_responses_chat_body
 
 
 def test_simple_text_request():

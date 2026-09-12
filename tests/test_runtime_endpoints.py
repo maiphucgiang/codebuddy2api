@@ -1,4 +1,8 @@
 """网关限额、协议集成、网络失败与配置回归；所有上游调用均由 MockTransport 接管。"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import asyncio
 import contextlib
@@ -8,14 +12,13 @@ import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 import httpx
 from fastapi.testclient import TestClient
 
 import converter
-import upstream_io
+from app import upstream_io
 
 
 ROUTES = ("/v1/chat/completions", "/v1/responses", "/v1/messages")

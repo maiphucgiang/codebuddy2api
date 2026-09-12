@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """拒绝文本与空终止回归；仅内存 SSE、MockTransport，不读凭据或写日志。
 
-仅适配器：python -m unittest test_refusal.AdapterRefusalTests -v
-完整集成：python -m unittest test_refusal -v
+运行：python3 tests/test_refusal.py
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 from copy import deepcopy
 import json
 import unittest
 from unittest.mock import patch
 
-from anthropic_adapter import AnthropicStreamConverter
-from responses_adapter import ResponsesStreamConverter
+from app.adapters.anthropic_adapter import AnthropicStreamConverter
+from app.adapters.responses_adapter import ResponsesStreamConverter
 
 
 REFUSAL_PARTS = ("抱歉，我不能协助这项请求。\n", "I cannot help with that request.")
@@ -127,7 +130,7 @@ class AdapterRefusalTests(unittest.TestCase):
 
 class EmptyTerminationTests(unittest.TestCase):
     def test_empty_stop_done_is_structured_upstream_error(self):
-        from upstream_io import ChatSSEAccumulator, UpstreamResponseError
+        from app.upstream_io import ChatSSEAccumulator, UpstreamResponseError
 
         for collect in (False, True):
             with self.subTest(collect=collect):
@@ -145,7 +148,7 @@ class EndpointRefusalTests(unittest.TestCase):
         import httpx
         from fastapi.testclient import TestClient
         import converter
-        import upstream_io
+        from app import upstream_io
 
         self.httpx = httpx
         self.enterContext(patch.dict(converter.CONFIG, {

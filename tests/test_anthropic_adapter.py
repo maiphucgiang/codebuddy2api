@@ -2,14 +2,15 @@
 """
 test_anthropic_adapter.py — 验证 Anthropic API 适配层的转换逻辑。
 
-直接运行：python3 test_anthropic_adapter.py
+直接运行：python3 tests/test_anthropic_adapter.py
 """
 
 import json
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
-from anthropic_adapter import (
+from app.adapters.anthropic_adapter import (
     anthropic_request_to_chat,
     AnthropicStreamConverter,
 )

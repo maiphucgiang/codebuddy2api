@@ -1,16 +1,19 @@
 """自动 Trial 开关、身份和维护流程回归；所有网络均为 Mock。"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 from copy import deepcopy
 import json
-from pathlib import Path
 import tempfile
 import time
 import unittest
 from unittest.mock import patch
 
 import converter
-import credits
-import trial_rewards
+from app import credits
+from app import trial_rewards
 
 
 class TrialIntegrationTests(unittest.TestCase):

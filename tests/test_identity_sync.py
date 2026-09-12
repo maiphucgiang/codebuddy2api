@@ -1,20 +1,23 @@
 """账号/租户目录、路径复用和启动屏障回归；仅临时合成凭据与 mock，无联网。
 
-运行：.venv/bin/python -B -m unittest -v test_identity_sync
+运行：.venv/bin/python -B -m unittest -v tests/test_identity_sync.py
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import io
 import json
 import os
-from pathlib import Path
 import tempfile
 import time
 import unittest
 from unittest.mock import Mock, patch
 
-import client_profiles
+from app import client_profiles
 import converter as c
-import credits
+from app import credits
 
 
 DOMAINS = {"cn-cli": "www.codebuddy.cn", "cn-work": "www.workbuddy.cn",

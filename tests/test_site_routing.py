@@ -1,11 +1,15 @@
 """Offline routing tests using synthetic unsigned JWTs and no user credentials."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import base64
 import copy
 import json
 import unittest
 
-from site_routing import (
+from app.site_routing import (
     DOMESTIC,
     DOMESTIC_ENDPOINT,
     INTERNATIONAL,

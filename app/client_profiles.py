@@ -3,7 +3,7 @@
 import hashlib
 import json
 
-from site_routing import domain_for_auth, profile_for_auth, profile_product, profile_region
+from .site_routing import domain_for_auth, profile_for_auth, profile_product, profile_region
 
 CLI_VERSION = "2.149.0"
 WORKBUDDY_VERSION = "5.5.2"

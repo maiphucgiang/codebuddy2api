@@ -21,7 +21,7 @@ import uuid
 
 import httpx
 
-from site_routing import profile_for_auth
+from .site_routing import profile_for_auth
 
 PLUGIN_PREFIX = "/v2/plugin"
 OAUTH_TIMEOUT_S = 600          # 授权等待超时秒数

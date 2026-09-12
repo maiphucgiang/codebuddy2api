@@ -17,6 +17,9 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# 本地执行计划（不提交）
+/docs/plans/
+
 # 个人 / 敏感信息（绝不提交）
 *.token
 *.key

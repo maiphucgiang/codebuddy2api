@@ -19,8 +19,8 @@ from pathlib import Path
 
 import httpx
 
-from client_profiles import catalog_headers
-from site_routing import PROFILE_ENDPOINTS, profile_for_auth, profile_product
+from .client_profiles import catalog_headers
+from .site_routing import PROFILE_ENDPOINTS, profile_for_auth, profile_product
 
 BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")

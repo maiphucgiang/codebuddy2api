@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Chat SSE 边界回归；仅使用内存数据和 MockTransport。"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import json
 import unittest
@@ -7,8 +11,8 @@ from unittest.mock import patch
 
 import httpx
 
-import upstream_io
-from upstream_io import ChatSSEAccumulator, UpstreamResponseError
+from app import upstream_io
+from app.upstream_io import ChatSSEAccumulator, UpstreamResponseError
 
 
 def event(delta=None, finish=None, **fields):

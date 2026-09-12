@@ -1,4 +1,8 @@
 """凭据导入、健康接口和会话标识的安全回归测试。"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import asyncio
 import hashlib
@@ -8,12 +12,11 @@ import tempfile
 import time
 import unittest
 import uuid
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 import converter
-import credential_io
-from credential_io import (
+from app import credential_io
+from app.credential_io import (
     CredentialFileError, MAX_CREDENTIAL_BYTES, atomic_write_credential, read_import_file,
 )
 

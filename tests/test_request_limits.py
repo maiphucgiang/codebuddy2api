@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Local synthetic image-policy/adapter/projection regression tests.
 
-Run: .venv/bin/python -B test_request_limits.py
+Run: .venv/bin/python -B tests/test_request_limits.py
 No converter import, account access, image decoding or upstream requests.
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 from copy import deepcopy
 import json
 import unittest
 from unittest.mock import patch
 
-from anthropic_adapter import anthropic_request_to_chat
-from request_limits import ImageLimitError, apply_image_policy
-from responses_adapter import responses_request_to_chat
-from responses_projection import project_responses_chat_body
+from app.adapters.anthropic_adapter import anthropic_request_to_chat
+from app.request_limits import ImageLimitError, apply_image_policy
+from app.adapters.responses_adapter import responses_request_to_chat
+from app.adapters.responses_projection import project_responses_chat_body
 
 
 def chat_image(index=0):

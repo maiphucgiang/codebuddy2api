@@ -1,13 +1,16 @@
 """原 /v1 接口自动地域/产品路由回归：合成凭据，httpx 全部由 MockTransport 接管。
 
-运行：.venv/bin/python -B -m unittest -v test_region_routing
+运行：.venv/bin/python -B -m unittest -v tests/test_region_routing.py
 不启动维护线程，不读取本机 auth/.env，不依赖在线目录或真实账号。
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 from copy import deepcopy
 import json
 import os
-from pathlib import Path
 import tempfile
 import time
 import unittest
@@ -16,9 +19,9 @@ from unittest.mock import patch
 import httpx
 from fastapi.testclient import TestClient
 
-import client_profiles
+from app import client_profiles
 import converter
-import credits
+from app import credits
 
 
 PROFILES = ("cn-cli", "cn-work", "intl-cli", "intl-work")

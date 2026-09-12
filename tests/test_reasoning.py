@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """reasoning_content（思考）透传回归测试：聚合、伪流式重放、Anthropic/Responses 映射。
 
-直接运行：python3 test_reasoning.py
+直接运行：python3 tests/test_reasoning.py
 """
 
 import asyncio
 import json
 import sys
+from pathlib import Path
 import unittest
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import httpx
 
 from converter import _collect_stream, _merge_chat_sse_text, _chat_result_to_sse_lines
-from anthropic_adapter import AnthropicStreamConverter
-from responses_adapter import ResponsesStreamConverter
+from app.adapters.anthropic_adapter import AnthropicStreamConverter
+from app.adapters.responses_adapter import ResponsesStreamConverter
 
 _SSE = (
     'data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":""},"finish_reason":null}]}\n'

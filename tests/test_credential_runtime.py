@@ -1,4 +1,8 @@
 """凭证真实刷新、并发去重、扫描与熔断回归；只使用临时凭据和 mock 上游。"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import json
 import os
@@ -7,7 +11,6 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from unittest.mock import patch
 
 import httpx

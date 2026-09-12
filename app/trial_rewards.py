@@ -14,9 +14,9 @@ import time
 
 import httpx
 
-from client_profiles import identity_headers
-from credential_io import credential_file_lock
-from site_routing import PROFILE_ENDPOINTS, profile_for_headers
+from .client_profiles import identity_headers
+from .credential_io import credential_file_lock
+from .site_routing import PROFILE_ENDPOINTS, profile_for_headers
 
 RETRY_INTERVAL = 24 * 60 * 60
 REQUEST_TIMEOUT = 12.0

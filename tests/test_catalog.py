@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """CLI/WorkBuddy 产品目录解析、请求隔离与 schema2 缓存回归；纯 mock/临时目录。
 
-运行：.venv/bin/python -B test_catalog.py
+运行：.venv/bin/python -B tests/test_catalog.py
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
-from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 import httpx
 
-from client_profiles import catalog_headers, identity_headers
-from credits import (
+from app.client_profiles import catalog_headers, identity_headers
+from app.credits import (
     AuthExpiredError, ModelCatalogCache, fetch_model_catalog, select_cli_models,
     select_product_models,
 )
@@ -183,8 +186,8 @@ class CatalogSelectionTests(unittest.TestCase):
         data = catalog(["fast"])
         client.get.return_value.json.return_value = {"code": 0, "data": data}
         token = jwt("https://www.codebuddy.ai/auth/realms/copilot")
-        with patch("credits.httpx.Client") as factory, patch(
-                "credits.select_product_models", wraps=select_product_models) as select:
+        with patch("app.credits.httpx.Client") as factory, patch(
+                "app.credits.select_product_models", wraps=select_product_models) as select:
             factory.return_value.__enter__.return_value = client
             self.assertEqual(fetch_model_catalog(token, "CLI/test"), [data["models"][1]])
             select.assert_called_once_with(data, "cli")
@@ -208,7 +211,7 @@ class CatalogSelectionTests(unittest.TestCase):
                     client = MagicMock()
                     client.get.return_value.status_code = 200
                     client.get.return_value.json.return_value = {"code": 0, "data": data}
-                    with patch("credits.httpx.Client") as factory:
+                    with patch("app.credits.httpx.Client") as factory:
                         factory.return_value.__enter__.return_value = client
                         result = fetch_model_catalog(token, domain=hint, uid="user", enterprise_id="enterprise")
                     self.assertEqual(result, [data["models"][4 if profile.endswith("work") else 1]])
@@ -238,7 +241,7 @@ class CatalogSelectionTests(unittest.TestCase):
         client = MagicMock()
         client.get.return_value.status_code = 200
         client.get.return_value.json.return_value = {"code": 0, "data": {"models": []}}
-        with patch("credits.httpx.Client") as factory:
+        with patch("app.credits.httpx.Client") as factory:
             factory.return_value.__enter__.return_value = client
             self.assertEqual(fetch_model_catalog("opaque", "CLI/test", domain="www.workbuddy.ai"), [])
         headers = httpx.Headers(client.get.call_args.kwargs["headers"])
@@ -251,7 +254,7 @@ class CatalogSelectionTests(unittest.TestCase):
                  (jwt("https://www.workbuddy.cn/x"), "www.codebuddy.cn"),
                  (jwt("https://www.workbuddy.ai/x"), "www.workbuddy.cn"),
                  (jwt("https://www.workbuddy.ai/x"), "www.codebuddy.ai")]
-        with patch("credits.httpx.Client") as factory:
+        with patch("app.credits.httpx.Client") as factory:
             for token, domain in cases:
                 with self.subTest(domain=domain), self.assertRaises(ValueError):
                     fetch_model_catalog(token, domain=domain)
@@ -269,7 +272,7 @@ class CatalogSelectionTests(unittest.TestCase):
                     client.get.return_value.status_code = status
                     if status == "network":
                         client.get.side_effect = httpx.ConnectError("mock network failure")
-                    with patch("credits.httpx.Client") as factory:
+                    with patch("app.credits.httpx.Client") as factory:
                         factory.return_value.__enter__.return_value = client
                         with self.assertRaises(AuthExpiredError if status == 401 else RuntimeError):
                             fetch_model_catalog("opaque", domain=domain)
@@ -279,7 +282,7 @@ class CatalogSelectionTests(unittest.TestCase):
     def test_fetch_malformed_and_error_responses_are_bounded_and_secret_free(self):
         client = MagicMock()
         token = jwt("https://www.workbuddy.ai/x")
-        with patch("credits.httpx.Client") as factory:
+        with patch("app.credits.httpx.Client") as factory:
             factory.return_value.__enter__.return_value = client
             client.get.return_value.status_code = 200
             for payload in (None, [], "secret" * 1000, {},
@@ -315,7 +318,7 @@ class CatalogCacheTests(unittest.TestCase):
             "domestic": {"models": [{"id": "domestic"}], "fetched_at": 1000},
             "international": {"models": roots, "fetched_at": 1000},
         }}), encoding="utf-8")
-        with patch("credits.time.time", return_value=1001):
+        with patch("app.credits.time.time", return_value=1001):
             cache = ModelCatalogCache(self.path)
             self.assertEqual(cache.models("international"), roots)
             self.assertFalse(cache.fresh("domestic"))
@@ -335,18 +338,18 @@ class CatalogCacheTests(unittest.TestCase):
             self.assertEqual(final.models("domestic"), [{"id": "new-domestic"}])
 
     def test_empty_catalog_ttl_and_epoch_zero_age(self):
-        with patch("credits.time.time", return_value=0):
+        with patch("app.credits.time.time", return_value=0):
             cache = ModelCatalogCache(self.path, ttl=60)
             self.assertIsNone(cache.age("international"))
             cache.put("international", [])
             self.assertTrue(cache.fresh("international"))
             self.assertEqual(cache.age("international"), 0)
-        with patch("credits.time.time", return_value=59):
+        with patch("app.credits.time.time", return_value=59):
             cache = ModelCatalogCache(self.path, ttl=60)
             self.assertTrue(cache.fresh("international"))
             self.assertEqual(cache.models("international"), [])
             self.assertEqual(cache.age("international"), 59)
-        with patch("credits.time.time", return_value=60):
+        with patch("app.credits.time.time", return_value=60):
             self.assertFalse(cache.fresh("international"))
             self.assertEqual(cache.age("international"), 60)
 
@@ -364,19 +367,19 @@ class CatalogCacheTests(unittest.TestCase):
 
     def test_failed_fetch_keeps_old_models_and_age(self):
         cache = ModelCatalogCache(self.path)
-        with patch("credits.time.time", return_value=1000):
+        with patch("app.credits.time.time", return_value=1000):
             cache.put("international", [{"id": "old"}])
         before = self.path.read_bytes()
         client = MagicMock()
         client.get.return_value.status_code = 200
         client.get.return_value.json.return_value = {"code": 0, "data": catalog(["unknown"])}
-        with patch("credits.httpx.Client") as factory:
+        with patch("app.credits.httpx.Client") as factory:
             factory.return_value.__enter__.return_value = client
             with self.assertRaises(ValueError):
                 cache.put("international", fetch_model_catalog(jwt("https://www.codebuddy.ai/x")))
         self.assertEqual(cache.models("international"), [{"id": "old"}])
         self.assertEqual(self.path.read_bytes(), before)
-        with patch("credits.time.time", return_value=1010):
+        with patch("app.credits.time.time", return_value=1010):
             self.assertEqual(cache.age("international"), 10)
 
     def test_site_groups_are_separate(self):
