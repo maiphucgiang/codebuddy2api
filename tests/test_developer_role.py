@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """developer 角色归一化回归测试。
 
-上游（copilot.tencent.com / workbuddy.ai）风控会把 role:"developer" 识别为
-非官方客户端通道指纹，返回 HTTP 400 / code 11128
-"Illegal API invocation from an unapproved channel"；官方 CLI/WorkBuddy 只发
-"system"，而 pi 等 OpenAI 兼容 harness 把系统提示词以 "developer" 发送。
+上游（copilot.tencent.com / workbuddy.ai）会把 role:"developer" 拒绝为
+非官方通道（HTTP 400 / code 11128 "Illegal API invocation from an unapproved
+channel"）；官方 CLI/WorkBuddy 只发 "system"，而 pi 等 OpenAI 兼容 harness 把
+系统提示词以 "developer" 发送。归一化时不得修改调用方的原始 messages。
 
-直接运行：python3 test_developer_role.py
+直接运行：python -B tests/test_developer_role.py
 """
 
+import copy
 import sys
 import unittest
+from pathlib import Path
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import converter
 
 
-def _prepare(messages, **extra):
+def _prepare(messages, *, desensitize=False, **extra):
     body = {"model": "auto", "messages": messages, "stream": False}
     body.update(extra)
     saved = dict(converter.CONFIG)
     converter.CONFIG["model_guard"] = False
-    converter.CONFIG["desensitize"] = False
+    converter.CONFIG["desensitize"] = desensitize
+    converter.CONFIG["no_compact"] = False
     try:
         return converter._prepare_chat_body(body)
     finally:
@@ -73,6 +76,40 @@ class DeveloperRoleNormalization(unittest.TestCase):
         body = _prepare([{"role": "user", "content": "hi"}])
         self.assertEqual(body["messages"][0]["role"], "system")
         self.assertEqual(body["messages"][0]["content"], "You are a helpful assistant.")
+
+
+class CallerPayloadNotMutated(unittest.TestCase):
+    """归一化只改发往上游的副本；调用方原始 payload 必须保持 deep-equal。"""
+
+    def _assert_untouched(self, raw_messages, *, desensitize):
+        raw_body = {"model": "auto", "messages": raw_messages, "stream": False}
+        snapshot = copy.deepcopy(raw_body)
+        _prepare(raw_messages, desensitize=desensitize)
+        self.assertEqual(raw_body, snapshot)
+
+    def test_string_content_untouched(self):
+        self._assert_untouched([
+            {"role": "developer", "content": "You are an expert coding assistant."},
+            {"role": "user", "content": "hi"},
+        ], desensitize=False)
+
+    def test_string_content_untouched_with_desensitize(self):
+        self._assert_untouched([
+            {"role": "developer", "content": "You are an expert coding assistant."},
+            {"role": "user", "content": "hi"},
+        ], desensitize=True)
+
+    def test_text_blocks_untouched(self):
+        self._assert_untouched([
+            {"role": "developer", "content": [{"type": "text", "text": "You are pi."}]},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        ], desensitize=False)
+
+    def test_text_blocks_untouched_with_desensitize(self):
+        self._assert_untouched([
+            {"role": "developer", "content": [{"type": "text", "text": "You are pi."}]},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        ], desensitize=True)
 
 
 if __name__ == "__main__":

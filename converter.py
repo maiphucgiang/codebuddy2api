@@ -878,12 +878,22 @@ class CredentialPool:
             elif refreshed:
                 _log(f"[cred] {'每日保活刷新' if keepalive_due else '已主动刷新'}并回写: {Path(entry['id']).name}")
 
-    def remove_file(self, name: str) -> bool:
+    def remove_file(self, name: str, *, path: str | None = None) -> bool:
         """删除与刷新共用锁，避免删除后被在途刷新重新创建。"""
         with self._lock:
-            entry = next((x for x in self._entries if os.path.basename(x["id"]) == name), None)
-            if entry is None:
+            matches = [
+                x for x in self._entries
+                if os.path.basename(x["id"]).casefold() == str(name).casefold()
+            ]
+            if path:
+                target_path = os.path.normcase(os.path.abspath(str(path)))
+                matches = [
+                    x for x in matches
+                    if os.path.normcase(os.path.abspath(x["id"])) == target_path
+                ]
+            if len(matches) != 1:
                 return False
+            entry = matches[0]
             cm = entry["cm"]
             try:
                 with cm._lock, credential_file_lock(cm.path.parent, cm.path.name):
@@ -945,6 +955,50 @@ def _sync_error(pool, ledger, entry, generation, phase, error):
     _log(f"[{phase}] {Path(entry['id']).name} 同步失败（保留旧数据）: {message}")
 
 
+def _safe_checkin_message(value, fallback: str) -> str:
+    """返回可放进管理接口的签到文案；不透传原始异常、Token 或 API Key。"""
+    text = sanitize_log_text(" ".join(str(value or "").split()), 200)
+    configured_key = str(CONFIG.get("api_key") or "")
+    if configured_key:
+        text = text.replace(configured_key, "[REDACTED]")
+    return text or fallback
+
+
+def _checkin_exception_message(error: Exception) -> str:
+    """把签到异常压缩为固定安全文案，避免响应中出现凭据或请求细节。"""
+    if credits_mod is not None and isinstance(error, credits_mod.AuthExpiredError):
+        return "登录身份已失效"
+    if isinstance(error, httpx.TimeoutException):
+        return "上游请求超时"
+    if isinstance(error, httpx.HTTPError):
+        return "上游网络请求失败"
+    return "签到请求失败"
+
+
+def _record_checkin_result(results: dict | None, cid: str, status: str, message: str) -> None:
+    """按当前凭证路径记录一次手动签到结果；同一凭证只保留本轮最终结果。"""
+    if results is None:
+        return
+    results[str(cid)] = {
+        "auth_file": str(cid),
+        "status": status,
+        "message": _safe_checkin_message(message, "无详细说明"),
+    }
+
+
+def _checkin_result_message(result: dict, status: str) -> str:
+    """把上游结果映射为固定文案；原始 msg 不进入报告或积分缓存。"""
+    if status == "success":
+        return "签到成功"
+    if status == "already":
+        return "今日已签到"
+    if status == "unconfirmed":
+        return "结果未确认，上游请求可能仍在处理"
+    if result.get("inactive"):
+        return "签到活动未开启或已结束"
+    return "签到失败"
+
+
 def _sync_trial(headers):
     """可选福利领取与余额同步分离，持久化故障不阻断普通请求。"""
     ledger = CONFIG.get("trial_ledger")
@@ -963,9 +1017,10 @@ def _sync_trial(headers):
         _log(f"[trial] 领取失败（不影响余额同步）: {_network_error_text(error)}")
 
 
-def _sync_credits(pool, ledger, entry, *, checkin, failed):
+def _sync_credits(pool, ledger, entry, *, checkin, failed, checkin_results=None):
     cm, cid = entry["cm"], entry["id"]
     generation = None
+    checkin_reported = False
     try:
         with cm._lock:
             try:
@@ -978,13 +1033,30 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed):
         if checkin and not ledger.checkin_done(cid, day):
             try:
                 result = credits_mod.daily_checkin(token, uid=uid, domain=domain)
+                checkin_status = (
+                    "unconfirmed" if result.get("uncertain")
+                    else "already" if result.get("already")
+                    else "success" if result.get("ok") else "failed"
+                )
+                checkin_message = _checkin_result_message(result, checkin_status)
                 if not pool.apply_if_current(cm, generation, lambda: ledger.mark_checkin(
-                        cid, day, result["ok"], result.get("code"), result.get("message", ""))):
+                        cid, day, result["ok"], result.get("code"), checkin_message)):
                     failed.add(cid)
+                    _record_checkin_result(checkin_results, cid, "unconfirmed", "凭证状态已变化，结果未确认")
                     return None
+                _record_checkin_result(
+                    checkin_results, cid, checkin_status, checkin_message,
+                )
+                checkin_reported = True
                 _log(f"[checkin] {Path(cid).name}: ok={result['ok']} already={result.get('already')} code={result.get('code')}")
             except Exception as error:
                 _sync_error(pool, ledger, entry, generation, "checkin", error)
+                status = "unconfirmed" if isinstance(error, httpx.HTTPError) else "failed"
+                _record_checkin_result(checkin_results, cid, status, _checkin_exception_message(error))
+                checkin_reported = True
+        elif checkin:
+            _record_checkin_result(checkin_results, cid, "already", "今日已签到")
+            checkin_reported = True
         _sync_trial(headers)
         balance = credits_mod.fetch_credits(token, uid=uid, domain=domain)
         if bool(balance.get("intl")) != (site == INTERNATIONAL):
@@ -997,6 +1069,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed):
         return entry, generation, headers, profile
     except Exception as error:
         failed.add(cid)
+        if checkin and not checkin_reported:
+            _record_checkin_result(checkin_results, cid, "failed", "凭证不可用，未完成签到")
         _sync_error(pool, ledger, entry, generation, "credits", error)
         return None
 
@@ -1094,7 +1168,7 @@ def _sync_usage(pool):
         _log(f"[usage] 明细已同步: {count} 请求 / {used:.2f} credits")
 
 
-def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
+def _housekeep_once(pool, ledger, *, pending_only=False, checkin_results=None):
     """串行维护并提交同代次结果；新凭据只触发额度和目录查询。"""
     if credits_mod is None:
         return
@@ -1107,7 +1181,10 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
             for entry in pool.entries():
                 if entry["id"] not in ids:
                     continue
-                result = _sync_credits(pool, ledger, entry, checkin=not pending_only, failed=failed)
+                result = _sync_credits(
+                    pool, ledger, entry, checkin=not pending_only, failed=failed,
+                    checkin_results=checkin_results,
+                )
                 if result is not None:
                     refs[entry["id"]] = result
             _sync_model_catalogs(pool, ledger, refs, failed)
@@ -1118,6 +1195,7 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
             raise
         finally:
             pool.end_sync(ids, failed)
+    return checkin_results
 
 
 def _housekeeper_loop(pool: CredentialPool, ledger) -> None:
@@ -1395,13 +1473,30 @@ async def admin_add_credential(request: Request,
 @app.delete("/admin/credentials/{name}")
 def admin_del_credential(name: str,
                          authorization: Optional[str] = Header(default=None),
-                         x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """按文件名移除池内凭据（会删除该 *.info 文件）。"""
+                         x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+                         path: Optional[str] = None):
+    """按文件名移除池内凭据；同名时用 path 精确定位。"""
     _check_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
-    if pool is None or not pool.remove_file(os.path.basename(name)):
+    display_name = os.path.basename(name)
+    if pool is None:
         raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
-    return {"removed": os.path.basename(name)}
+    matches = [
+        entry for entry in pool.entries()
+        if os.path.basename(entry["id"]).casefold() == display_name.casefold()
+    ]
+    if not matches:
+        raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {display_name}", "type": "invalid_request_error"}})
+    normalized_path = str(path or "").strip()
+    if not normalized_path and len(matches) > 1:
+        raise HTTPException(status_code=409, detail={"error": {"message": "凭据文件名不唯一，请提供完整路径", "type": "invalid_request_error"}})
+    if normalized_path:
+        target_path = os.path.normcase(os.path.abspath(normalized_path))
+        if not any(os.path.normcase(os.path.abspath(entry["id"])) == target_path for entry in matches):
+            raise HTTPException(status_code=404, detail={"error": {"message": "凭据不在池中", "type": "invalid_request_error"}})
+    if not pool.remove_file(display_name, path=normalized_path or None):
+        raise HTTPException(status_code=404, detail={"error": {"message": "凭据不在池中", "type": "invalid_request_error"}})
+    return {"removed": display_name}
 
 
 
@@ -1489,8 +1584,13 @@ def admin_checkin(authorization: Optional[str] = Header(default=None),
     pool, ledger = CONFIG.get("cred_pool"), CONFIG.get("ledger")
     if pool is None or ledger is None:
         raise HTTPException(status_code=503, detail={"error": {"message": "签到调度未启用", "type": "invalid_request_error"}})
-    _housekeep_once(pool, ledger)
-    return {"credits": ledger.snapshot()}
+    checkin_results = {}
+    day = time.strftime("%Y-%m-%d")
+    _housekeep_once(pool, ledger, checkin_results=checkin_results)
+    return {
+        "checkin": {"day": day, "results": list(checkin_results.values())},
+        "credits": ledger.snapshot(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1877,16 +1977,16 @@ def _prepare_chat_body(body: dict, *, region=None) -> dict:
     if not isinstance(messages, list) or not messages or any(not isinstance(message, dict) for message in messages):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "messages must be a non-empty array of objects", "type": "invalid_request_error"}})
-    # Upstream risk control (copilot.tencent.com / workbuddy.ai) treats the
-    # "developer" role as an unofficial-client fingerprint and rejects the whole
-    # request with HTTP 400 / code 11128 "Illegal API invocation from an
-    # unapproved channel". Official CLI/WorkBuddy clients only ever send
-    # "system", while pi and other OpenAI-compatible harnesses send the system
-    # prompt as "developer". Normalize to "system" before the leading-system
-    # reordering below.
-    for _message in messages:
-        if _message.get("role") == "developer":
-            _message["role"] = "system"
+    # Upstream compatibility: gateways such as copilot.tencent.com and
+    # workbuddy.ai reject the "developer" role with 11128 "Illegal API
+    # invocation from an unapproved channel"; official clients only send
+    # "system". Normalize the role, keep the content, and do not mutate the
+    # caller's message dicts.
+    messages = [
+        dict(message, role="system") if message.get("role") == "developer" else message
+        for message in messages
+    ]
+    body["messages"] = messages
     if messages[0].get("role") != "system":
         system_index = next((index for index, message in enumerate(messages) if message.get("role") == "system"), None)
         if system_index is None:
