@@ -10,6 +10,8 @@ services:
     ports:
       - "${CODEBUDDY2API_BIND:-0.0.0.0}:${CODEBUDDY2API_PORT:-8787}:8787"
     volumes:
+      # .info 凭证、control.sqlite3、logs.sqlite3 及 SQLite WAL/SHM 共用持久目录。
+      # SQLite 需要可写的本地文件系统；不要只挂载单个数据库文件。
       - "${CODEBUDDY2API_AUTH_PATH:-./auth}:/data/auth"
     environment:
       CODEBUDDY2API_KEY: ${CODEBUDDY2API_KEY:-}
