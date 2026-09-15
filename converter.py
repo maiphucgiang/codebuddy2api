@@ -2660,10 +2660,10 @@ def _upstream_failure(error, model_name, t0, rid):
 
 
 def _hungup_response(rid, model_name, t0):
-    """下游已经不听了：不编造结果，也不再占着连接 —— 安静地给一个不成体的响应。
+    """下游已经不听了：安静地给一个不成体的响应，不编造结果。
 
-    真到 uvicorn 那一侧，断连之后的 `send` 是直接丢弃的，所以这个状态码只是「ASGI 调用必须
-    交付一个响应」的形式；审计口径由 `AuditMiddleware` 从 `http.disconnect` 判定为 cancelled。
+    204 只是「ASGI 调用必须交付一个响应」的形式（Starlette 对 204 不写 content-length）；
+    审计由 `AuditMiddleware` 判定为 cancelled。
     """
     elapsed = time.time() - t0 if t0 else 0
     _log(f"[{rid}] ✂ 下游已断连，取消这次聚合 | {model_name} | {elapsed:.1f}s")

@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""下游断连在 `stream=false` 的聚合窗口里没人监听：上游要被取消、名额要归还、审计要如实。
+"""`stream=false` 的聚合窗口监听下游断连：取消上游、归还名额、审计如实，三协议一致。
 
-流式端点有这层保护：Starlette 的 `StreamingResponse.__call__` 在 `spec_version < 2.4`（uvicorn
-的两个 HTTP 协议都是 2.3）把 `stream_response` 和 `listen_for_disconnect` 放进同一个任务组，
-客户端走了，挂着的那次上游读就一起被取消。非流式端点没有对应机制 —— 端点直接 `await` 完整
-聚合，拿到 `JSONResponse` 之后才第一次 `send`，于是整个聚合窗口里没有任何人消费
-`http.disconnect`：客户端已经挂断，这枪上游照旧跑完（最长到 300s 读超时），额度照旧烧，
-`ConcurrencyLimitMiddleware` 的名额照旧占着（名额满了网关就对所有人回 503），审计照旧记成
-`outcome=success`，因为连 `send` 都是往一个已经死掉的连接里写。
+流式端点由 Starlette 的 `listen_for_disconnect` 兜住，非流式端点没有对应机制。这里钉住
+聚合路径的边界，并覆盖换凭证重放途中挂断、以及调用方自己取消外层任务两种情形。
 
-这里钉住：
-  - 挂断之后，聚合中的那次上游读确实被取消；
-  - 取消之后并发名额立刻可用，而不是继续把新请求挡在 503；
-  - 挂断的请求审计为 `cancelled`，不是 `success`；
-  - 两条对照：客户端没走的聚合请求照常完成（不许误伤），流式的同一场景本来就成立。
 运行：.venv/bin/python -B -m unittest -v tests/test_nonstream_disconnect.py
 """
 import sys
@@ -24,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允�
 import asyncio
 import json
 import unittest
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from unittest.mock import patch
 
 import httpx
 from fastapi import FastAPI
@@ -36,16 +27,33 @@ from app.observability import AuditMiddleware
 from tests import test_region_routing as fixtures
 
 HANG_MARKER = "synthetic-hang-up"
-# 客户端已经不在了，回什么都只是往死连接里写；什么都不发或一个不成体的 204 都可以接受，
-# 唯一不可接受的是一个看起来正常的推理响应。
+# 客户端已经不在了：唯一不可接受的是一个看起来正常的推理响应
 QUIET_STATUSES = (None, 204)
 STEP = 2
+ENDPOINTS = fixtures.GENERATIONS
+FAILOVER_LOG = "换凭证重放"
 
 
-class _HangingBody(httpx.AsyncByteStream):
-    """永不结束的上游 SSE：占住整个聚合窗口，并报告自己有没有真的被取消。"""
+def error_body(message="synthetic rejection", code="rate_limit"):
+    return {"error": {"message": message, "type": "upstream_error", "code": code}}
 
-    def __init__(self, closed):
+
+@contextmanager
+def allow_failover(times: int):
+    """打开换凭证重放开关（等价于 --failover-max N）。"""
+    with patch.dict(converter.CONFIG, {"failover_max": times}):
+        yield
+
+
+class _HangingStream(httpx.AsyncByteStream):
+    """永不结束的上游 SSE：占住整个聚合窗口。
+
+    两个独立标记：`read_cancelled` 只在 `__aiter__` 的 `finally` 置位，证明读取被取消；
+    `stream_closed` 由 httpx 的 `Response.aclose()` 调到底，证明连接真的还回去了。
+    """
+
+    def __init__(self, read_cancelled, closed):
+        self.read_cancelled = read_cancelled
         self.closed = closed
 
     async def __aiter__(self):
@@ -53,7 +61,11 @@ class _HangingBody(httpx.AsyncByteStream):
             await asyncio.Event().wait()        # 第一段永远不来，等价于上游卡住
             yield b""
         finally:
-            self.closed.set()
+            self.read_cancelled.set()
+
+    async def aclose(self):
+        self.closed.set()
+        await super().aclose()
 
 
 class NonStreamDisconnectTests(fixtures.RegionRoutingTests):
@@ -62,14 +74,29 @@ class NonStreamDisconnectTests(fixtures.RegionRoutingTests):
     def setUp(self):
         super().setUp()
         self.allowed_profiles = set(fixtures.PROFILES)
-        self.upstream_seen = asyncio.Event()
-        self.upstream_closed = asyncio.Event()
+        self.reset_upstream()
 
-    # --- 上游夹具：带标记的那一枪卡在首段之前 ---
+    def reset_upstream(self):
+        """每个协议子例各自从干净的上游状态起（subTest 共用同一次 setUp）。"""
+        self.upstream_seen = asyncio.Event()
+        self.read_cancelled = asyncio.Event()
+        self.stream_closed = asyncio.Event()
+        self.hang_attempts = 0
+        self.hang_uids = []
+        self.fail_over_first = False
+
+    # --- 上游夹具：带标记的那一枪卡在首段之前；被点名时先让第一枪吃 429 ---
     def handle_upstream(self, request):
         if HANG_MARKER in request.content.decode("utf-8", "replace"):
+            self.hang_attempts += 1
+            self.hang_uids.append(request.headers.get("x-user-id"))
+            if self.hang_attempts == 1 and self.fail_over_first:
+                return httpx.Response(429, json=error_body(),
+                                      headers={"content-type": "application/json"})
             self.upstream_seen.set()
-            return httpx.Response(200, content=_HangingBody(self.upstream_closed),
+            # 用 stream= 而不是 content=：后者会把流再包一层，自定义 aclose 收不到关闭回调
+            return httpx.Response(200, stream=_HangingStream(self.read_cancelled,
+                                                             self.stream_closed),
                                   headers={"content-type": "text/event-stream"})
         return super().handle_upstream(request)
 
@@ -83,7 +110,8 @@ class NonStreamDisconnectTests(fixtures.RegionRoutingTests):
             application.add_middleware(AuditMiddleware, {"audit_store": store})
         return ConcurrencyLimitMiddleware(application, {"max_concurrent": limit})
 
-    def scope(self, path="/v1/chat/completions"):
+    def scope(self, endpoint="chat/completions"):
+        path = "/v1/" + endpoint
         return {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
                 "http_version": "1.1", "method": "POST", "scheme": "http",
                 "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
@@ -92,7 +120,8 @@ class NonStreamDisconnectTests(fixtures.RegionRoutingTests):
 
     def receive(self, payload, hangup):
         """一份正常请求体；之后把 `http.disconnect` 攥在手里，等这个「客户端」真的挂断。"""
-        pending = [{"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}]
+        pending = [{"type": "http.request", "body": json.dumps(payload).encode(),
+                    "more_body": False}]
 
         async def receive():
             if pending:
@@ -110,8 +139,8 @@ class NonStreamDisconnectTests(fixtures.RegionRoutingTests):
     def started_statuses(self, sent):
         return [m.get("status") for m in sent if m.get("type") == "http.response.start"]
 
-    def hang_payload(self, *, stream=False):
-        return self.payload(text=HANG_MARKER, stream=stream)
+    def hang_payload(self, endpoint="chat/completions", *, stream=False):
+        return self.payload(endpoint, text=HANG_MARKER, stream=stream)
 
     async def drain_records(self, store, expected=1):
         for _ in range(int(STEP * 20)):
@@ -121,108 +150,165 @@ class NonStreamDisconnectTests(fixtures.RegionRoutingTests):
             await asyncio.sleep(0.05)
         self.fail(f"审计没有落库：{store.list_records()}")
 
-    # --- 盲区本体 ---
-    def test_hangup_during_aggregation_cancels_the_upstream_call(self):
-        sent, hangup = [], asyncio.Event()
+    async def hang_up(self, gate, endpoint, sent, hangup=None):
+        """发出聚合请求，等它卡在上游之后再让「客户端」挂断。"""
+        hangup = hangup or asyncio.Event()
+        task = asyncio.ensure_future(
+            gate(self.scope(endpoint), self.receive(self.hang_payload(endpoint), hangup),
+                 self.collect(sent)))
+        await asyncio.wait_for(self.upstream_seen.wait(), STEP)
+        self.assertFalse(self.read_cancelled.is_set(), "客户端还没走，这枪不该结束")
+        hangup.set()
+        await asyncio.wait_for(task, STEP)       # 修复前：没人监听断连，这一句必然超时
+        return task
 
-        async def scenario():
-            gate = self.gated(1)
-            task = asyncio.ensure_future(
-                gate(self.scope(), self.receive(self.hang_payload(), hangup), self.collect(sent)))
-            await asyncio.wait_for(self.upstream_seen.wait(), STEP)
-            self.assertFalse(self.upstream_closed.is_set(), "客户端还没走，这枪不该结束")
-            hangup.set()
-            await asyncio.wait_for(task, STEP)      # 修复前：没人监听断连，这一句必然超时
+    async def succeed_after(self, gate, endpoint, sent):
+        """同一个名额闸上再打一发正常请求：名额必须已经还给网关。"""
+        await asyncio.wait_for(
+            gate(self.scope(endpoint), self.receive(self.payload(endpoint), asyncio.Event()),
+                 self.collect(sent)), STEP)
 
-        asyncio.run(scenario())
-        self.assertTrue(self.upstream_closed.is_set(), "挂断之后，挂着的上游读要被取消")
-        statuses = self.started_statuses(sent)
-        self.assertTrue(all(status in QUIET_STATUSES for status in statuses), statuses)
-
-    def test_hangup_frees_the_slot_that_the_dead_client_held(self):
-        """一个已经没有客户端的请求，不许把唯一的并发名额守成 503。"""
-        seen = {}
-
-        async def scenario():
-            gate = self.gated(1)
-            hangup = asyncio.Event()
-            dead = asyncio.ensure_future(
-                gate(self.scope(), self.receive(self.hang_payload(), hangup),
-                     self.collect(seen.setdefault("dead", []))))
-            await asyncio.wait_for(self.upstream_seen.wait(), STEP)
-
-            refused = []
-            await asyncio.wait_for(gate(self.scope(), self.receive(self.payload(), asyncio.Event()),
-                                        self.collect(refused)), STEP)
-            self.assertEqual(self.started_statuses(refused), [503], refused)
-            self.assertIn(b"concurrency_limit",
-                          b"".join(m.get("body", b"") for m in refused))
-
-            hangup.set()
-            await asyncio.wait_for(dead, STEP)      # 修复前：这个任务永不结束，卡在名额上
-
-            recovered = []
-            await asyncio.wait_for(gate(self.scope(), self.receive(self.payload(), asyncio.Event()),
-                                        self.collect(recovered)), STEP)
-            seen["recovered"] = self.started_statuses(recovered)
-
-        asyncio.run(scenario())
-        self.assertEqual(seen["recovered"], [200], "挂断之后名额必须立刻可用")
-
-    def test_hangup_is_audited_as_cancelled_not_success(self):
-        """审计要分得清「模型答完了」和「没人听」：后者不能记成一次成功推理。"""
-        store = AuditStore(self.root / "hangup-audit.sqlite3")
+    def store_for(self, name):
+        store = AuditStore(self.root / (name + ".sqlite3"))
         self.addCleanup(store.close)
-        hangup = asyncio.Event()
+        return store
 
-        async def scenario():
-            gate = self.gated(1, store)
-            task = asyncio.ensure_future(
-                gate(self.scope(), self.receive(self.hang_payload(), hangup), self.collect([])))
-            await asyncio.wait_for(self.upstream_seen.wait(), STEP)
-            hangup.set()
-            await asyncio.wait_for(task, STEP)
-            await self.drain_records(store)
+    # --- 盲区本体：三个协议的聚合端点同一口径 ---
+    def test_hangup_during_aggregation_cancels_and_closes_the_upstream_call(self):
+        for endpoint in ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                self.reset_upstream()
+                sent = []
 
-        asyncio.run(scenario())
-        record = store.list_records()["items"][0]
-        self.assertEqual(record["outcome"], "cancelled", record)
+                async def scenario():
+                    await self.hang_up(self.gated(1), endpoint, sent)
+
+                asyncio.run(scenario())
+                self.assertTrue(self.read_cancelled.is_set(), "挂断之后，挂着的上游读要被取消")
+                self.assertTrue(self.stream_closed.is_set(),
+                                "响应的异步 aclose() 也要跑完，连接才不留半开")
+                statuses = self.started_statuses(sent)
+                self.assertTrue(all(status in QUIET_STATUSES for status in statuses), statuses)
+
+    def test_hangup_is_audited_as_cancelled_and_frees_the_slot(self):
+        for endpoint in ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                self.reset_upstream()
+                store = self.store_for("hangup-" + endpoint)
+
+                hung_up = []
+
+                async def scenario():
+                    gate = self.gated(1, store)
+                    await self.hang_up(gate, endpoint, [])
+                    hung_up.append((await self.drain_records(store))[0])
+                    await self.succeed_after(gate, endpoint, [])
+
+                asyncio.run(scenario())
+                record = hung_up[0]
+                self.assertEqual(record["outcome"], "cancelled", record)
+                self.assertFalse(record["streaming"], record)
+
+    # --- 换凭证重放途中挂断：整段重放是一个可取消单元 ---
+    def test_hangup_after_credential_failover_cancels_the_whole_sequence(self):
+        for endpoint in ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                self.reset_upstream()
+                self.fail_over_first = True
+                store = self.store_for("failover-" + endpoint)
+                sent, follow_up, hung_up = [], [], []
+
+                async def scenario():
+                    gate = self.gated(1, store)
+                    with allow_failover(1):
+                        await self.hang_up(gate, endpoint, sent)
+                        hung_up.append((await self.drain_records(store))[0])
+                    await self.succeed_after(gate, endpoint, follow_up)
+
+                asyncio.run(scenario())
+                record = hung_up[0]
+                self.assertEqual(self.hang_attempts, 2, "第一枪 429 之后应恰好换凭证重放一次")
+                self.assertEqual(len(set(self.hang_uids)), 2,
+                                 "重放必须换凭证：" + str(self.hang_uids))
+                self.assertTrue(self.read_cancelled.is_set())
+                self.assertTrue(self.stream_closed.is_set(), "取消要等重放那一枪的响应也关干净")
+                self.assertTrue(all(status in QUIET_STATUSES
+                                    for status in self.started_statuses(sent)), sent)
+                self.assertEqual(record["outcome"], "cancelled", record)
+                self.assertNotIn("failover_recovered", json.dumps(record["attempts"] or []),
+                                 "没换回结果就不能标成已恢复")
+                self.assertEqual(self.started_statuses(follow_up), [200],
+                                 "挂断之后名额必须立刻可用")
+
+    # --- 调用方自己取消外层任务：同样不许把上游留在半关状态 ---
+    def test_outer_task_cancellation_cancels_and_closes_the_upstream_call(self):
+        for endpoint in ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                self.reset_upstream()
+                store = self.store_for("outer-" + endpoint)
+                sent, follow_up, hung_up = [], [], []
+
+                async def scenario():
+                    gate = self.gated(1, store)
+                    task = asyncio.ensure_future(
+                        gate(self.scope(endpoint),
+                             self.receive(self.hang_payload(endpoint), asyncio.Event()),
+                             self.collect(sent)))
+                    await asyncio.wait_for(self.upstream_seen.wait(), STEP)
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+                    hung_up.append((await self.drain_records(store))[0])
+                    await self.succeed_after(gate, endpoint, follow_up)
+
+                asyncio.run(scenario())
+                self.assertTrue(self.read_cancelled.is_set(), "外层取消要传到挂着的上游读")
+                self.assertTrue(self.stream_closed.is_set())
+                self.assertEqual(hung_up[0]["outcome"], "cancelled", hung_up[0])
+                self.assertEqual(self.started_statuses(follow_up), [200], follow_up)
 
     # --- 对照一：客户端没走，聚合请求必须照常完成（新监听不许误伤） ---
     def test_aggregation_completes_while_the_client_is_still_there(self):
-        sent = []
+        for endpoint in ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                self.reset_upstream()
+                sent = []
 
-        async def scenario():
-            gate = self.gated(4)
-            await asyncio.wait_for(gate(self.scope(), self.receive(self.payload(), asyncio.Event()),
-                                        self.collect(sent)), STEP)
+                async def scenario():
+                    await asyncio.wait_for(
+                        self.gated(4)(self.scope(endpoint),
+                                      self.receive(self.payload(endpoint), asyncio.Event()),
+                                      self.collect(sent)), STEP)
 
-        asyncio.run(scenario())
-        self.assertEqual(self.started_statuses(sent), [200], sent)
-        body = b"".join(m.get("body", b"") for m in sent)
-        self.assertIn(b"ok", body)
-        self.assertFalse(self.upstream_closed.is_set() and not sent, "正常请求不该被断连监听打断")
+                asyncio.run(scenario())
+                self.assertEqual(self.started_statuses(sent), [200], sent)
+                self.assertIn(b"ok", b"".join(m.get("body", b"") for m in sent))
+                self.assertFalse(self.read_cancelled.is_set(), "正常请求不该被断连监听打断")
 
     # --- 对照二：流式的同一场景在修复之前就已经成立 ---
     def test_streaming_hangup_already_closes_the_upstream(self):
-        sent, hangup = [], asyncio.Event()
+        for endpoint in ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                self.reset_upstream()
+                sent = []
 
-        async def scenario():
-            gate = self.gated(1)
-            task = asyncio.ensure_future(
-                gate(self.scope(), self.receive(self.hang_payload(stream=True), hangup),
-                     self.collect(sent)))
-            await asyncio.wait_for(self.upstream_seen.wait(), STEP)
-            hangup.set()
-            with suppress(asyncio.CancelledError):
-                await asyncio.wait_for(task, STEP)
+                async def scenario():
+                    gate = self.gated(1)
+                    hangup = asyncio.Event()
+                    task = asyncio.ensure_future(
+                        gate(self.scope(endpoint),
+                             self.receive(self.hang_payload(endpoint, stream=True), hangup),
+                             self.collect(sent)))
+                    await asyncio.wait_for(self.upstream_seen.wait(), STEP)
+                    hangup.set()
+                    with suppress(asyncio.CancelledError):
+                        await asyncio.wait_for(task, STEP)
 
-        asyncio.run(scenario())
-        self.assertTrue(self.upstream_closed.is_set(), "Starlette 的断连监听管的就是这一段")
-        # 挂断落在第一个字节之前就不该有任何响应头（#18 之后如此，之前是已经开了头的 200）；
-        # 两种都算对，唯一不可接受的是把一个说完了的流交给已经不存在的客户端。
-        self.assertIn(self.started_statuses(sent), ([], [200]), sent)
-        self.assertNotIn(b"[DONE]", b"".join(m.get("body", b"") for m in sent))
+                asyncio.run(scenario())
+                self.assertTrue(self.read_cancelled.is_set(),
+                                "Starlette 的断连监听管的就是这一段")
+                self.assertIn(self.started_statuses(sent), ([], [200]), sent)
+                self.assertNotIn(b"[DONE]", b"".join(m.get("body", b"") for m in sent))
 
 
 if __name__ == "__main__":
