@@ -275,12 +275,14 @@ class PreflightDisconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.closed, 1)
 
 
-class ShieldedCloseTests(unittest.IsolatedAsyncioTestCase):
-    """`_close_stream` 必须扛得住「正在被取消」这件事本身。
+class TeardownCloseTests(unittest.IsolatedAsyncioTestCase):
+    """`_close_stream` 要扛得住「当前任务正在被反复取消」这件事。
 
-    断连时 anyio 的取消作用域会在每个检查点重复取消；不屏蔽的话，生成器 finally 里那个
-     await（httpx 在这里关连接）做到一半就被打断，连接和它的读超时一起留在原地。实测：
-    同样的作用域里不加屏蔽，收尾 await 从来跑不完。
+    直接 `await agen.aclose()` 是不行的：anyio 的取消作用域用 `call_soon` 自循环，每个事件
+    循环周期重投一次取消，生成器 finally 里那个 await（httpx 在这里关连接）做到一半就被打断
+    —— 实测要么永远等不到 `closed`，要么半关。收尾因此放进独立任务（不属于那个作用域，没人再
+    取消它），再尽量当场等它做完。这里钉住「停在 yield 上被取消」这一种：帧没在自己内部被撕开，
+    正是 `_close_stream` 负责的那一段。
     """
 
     async def test_cleanup_await_completes_inside_a_cancelled_scope(self):

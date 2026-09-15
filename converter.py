@@ -40,7 +40,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-import anyio   # 断连收尾要屏蔽外层取消：用的正是发起取消的那套机制
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler as _default_http_exception_handler
@@ -2785,24 +2784,54 @@ class _StreamFailure(Exception):
         super().__init__(f"stream failed before first byte (HTTP {status})")
 
 
+# 断连收尾的等法：轮数而非墙上时间做上界。被反复取消时每次 await 都会立刻抛回来，用时间做
+# 上界就变成忙等；100 轮足够走完一次正常的关闭（实测个位数轮次），走完不成就交给后台。
+TEARDOWN_GRACE_CYCLES = 100
+TEARDOWN_POLL_SECONDS = 0.01
+
+
+def _drain_teardown(future) -> None:
+    """后台收尾任务的异常只取走、不重抛：它跑在没人再取消它的任务里，最终会做完。"""
+    if not future.cancelled():
+        future.exception()
+
+
+async def _teardown_finished(task) -> None:
+    """尽量当场等收尾任务结束；等不到就挂个回调让它后台做完，绝不因此拖住取消本身。
+
+    为什么不能老实 `await task`：下游断连时 anyio 的取消作用域**每个事件循环周期**重投一次
+    取消（`_deliver_cancellation` 用 `call_soon` 自循环），当前任务里的任何 await 都会被反复
+    打断。收尾因此放在独立任务里 —— 它不属于那个作用域，没人再取消它 —— 这里只是尽量把结果
+    等成同步的，等不到也不影响它最终跑完。
+    """
+    for _ in range(TEARDOWN_GRACE_CYCLES):
+        if task.done():
+            _drain_teardown(task)
+            return
+        try:
+            await asyncio.wait([task], timeout=TEARDOWN_POLL_SECONDS)
+        except asyncio.CancelledError:
+            pass
+    if not task.done():
+        task.add_done_callback(_drain_teardown)
+
+
 async def _first_segment(agen):
     """取生成器的第一段输出，但把「我们的等待」和「生成器自己的收尾」分开放。
 
-    直接在当前任务里 `await agen.__anext__()` 也有问题：下游断连时取消打在生成器帧内部的
-    await 上，而 anyio 的取消作用域会在每个检查点重复取消 —— 帧自己的 `finally` 做到一半就
-    被打断（`httpx` 正是在这里关连接），实测那段清理根本跑不完，连接留到读超时。放进子任务
-    之后，外层取消打断的是我们的 `await`，我们只取消子任务一次，再屏蔽着等它把 `finally`
-    走完。结果不取：取消语义下这一轮已经作废，交给调用方关流。
+    直接在当前任务里 `await agen.__anext__()` 有个实测问题：断连的取消打在生成器帧内部的
+    await 上，帧自己的 `finally` 做到一半就被反复投进来的取消打断 —— `httpx` 正是在那里关
+    连接，于是清理根本跑不完，连接留到读超时。放进子任务之后，外层取消打断的是我们的
+    `await`，子任务只被取消一次，它的 `finally` 能自己走完。
+
+    取消语义下这一轮已经作废，所以子任务的结果不取；异常交给 `_teardown_finished` 收尾时取走。
     """
     task = asyncio.ensure_future(agen.__anext__())
     try:
         return await asyncio.shield(task)
     except BaseException:
         task.cancel()
-        with anyio.CancelScope(shield=True):
-            await asyncio.wait([task])
-        if not task.cancelled():
-            task.exception()     # 取回异常，别留给 asyncio 报「never retrieved」
+        await _teardown_finished(task)
         raise
 
 
@@ -2842,19 +2871,21 @@ async def _preflight_stream(agen, model_name, t0, rid):
 
 
 async def _close_stream(agen) -> None:
-    """显式收尾上游生成器，并屏蔽外层取消。
+    """显式收尾上游生成器，收尾跑在不受当前取消作用域影响的任务里。
 
-    下游断连时取消正在反复投递（anyio 的取消作用域会在每个检查点再取消一次），不屏蔽的话
-    `httpx` 的关闭做到一半就被打断，上游连接和它的读超时一起留在原地。清理失败不改变已经
-    定型的响应，所以这里只吞掉异常，不吞掉取消。
+    覆盖「取消落在两段之间、帧还停在 yield 上」这种情况：直接 `await agen.aclose()` 会被
+    反复投递的取消打断在 `httpx` 关连接的半途。清理失败不改变已经定型的响应，所以只吞异常。
     """
     if agen is None:
         return
-    with anyio.CancelScope(shield=True):
+
+    async def close() -> None:
         try:
             await agen.aclose()
         except Exception:
             pass
+
+    await _teardown_finished(asyncio.ensure_future(close()))
 
 
 def _chunk_bytes(chunk, charset: str = "utf-8"):
