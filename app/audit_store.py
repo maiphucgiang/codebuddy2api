@@ -475,12 +475,16 @@ class AuditStore:
             return json.loads(row[0]) if row else None
         return self._run(fetch, write=True)
 
-    def dashboard(self, days=30):
+    def dashboard(self, days=30, granularity="auto"):
         days = int(days)
-        if not 1 <= days <= 36500:
-            raise ValueError("invalid days")
+        if not 1 <= days <= 36500 or granularity not in ("auto", "hour", "day"):
+            raise ValueError("invalid dashboard range or granularity")
+        grain = ("hour" if days == 1 else "day") if granularity == "auto" else granularity
+        if grain == "hour" and days > 90:
+            raise ValueError("hourly range exceeds 90 days")
         now = time.time()
         start = int(now // 86400) * 86400 - (days - 1) * 86400
+        period = {"days": days, "start": start, "end": now, "timezone": "UTC", "granularity": grain}
         def fetch():
             summary = self._empty_stats()
             series, models, profiles = [], {}, {}
@@ -489,17 +493,28 @@ class AuditStore:
                 stats = json.loads(row["payload"])
                 if row["dimension"] == "global":
                     self._merge(summary, stats)
-                    series.append({"bucket": row["bucket"], "date": time.strftime("%Y-%m-%d", time.gmtime(row["bucket"])), **stats})
+                    if grain == "day":
+                        series.append({"bucket": row["bucket"], **stats})
                 elif row["dimension"] in ("model", "profile"):
                     target = models if row["dimension"] == "model" else profiles
                     self._merge(target.setdefault(row["dimension_key"], self._empty_stats()), stats)
+            if grain == "hour":
+                rows = self._db.execute("SELECT bucket,payload FROM stats_hourly WHERE dimension='global' AND bucket>=? AND bucket<=? ORDER BY bucket", (start, now)).fetchall()
+                series = [{"bucket": row["bucket"], **json.loads(row["payload"])} for row in rows]
+            partial = grain == "hour" and sum(row["requests"] for row in series) != summary["requests"]
+            step = 3600 if grain == "hour" else 86400
+            if days <= 90 and not partial:
+                recorded = {row["bucket"]: row for row in series}
+                series = [recorded.get(bucket, {"bucket": bucket, **self._empty_stats()})
+                          for bucket in range(start, int(now // step) * step + 1, step)]
+            for row in series:
+                row["date"] = time.strftime("%Y-%m-%d %H:00" if grain == "hour" else "%Y-%m-%d", time.gmtime(row["bucket"]))
             summary["success_rate"] = summary["success"] / summary["requests"] if summary["requests"] else None
             return {"summary": summary, "series": series,
                     "models": [{"model": key, **value} for key, value in models.items()],
                     "profiles": [{"profile": key, **value} for key, value in profiles.items()],
-                    "generated_at": now, "range": {"days": days, "start": start, "end": now, "timezone": "UTC"}}
-        return self._run(fetch, {"summary": self._empty_stats(), "series": [], "models": [], "profiles": [], "generated_at": now, "range": {"days": days, "start": start, "end": now}, "degraded": True})
-
+                    "generated_at": now, "range": {**period, "partial": partial}}
+        return self._run(fetch, {"summary": self._empty_stats(), "series": [], "models": [], "profiles": [], "generated_at": now, "range": period, "degraded": True})
     def storage(self):
         def fetch():
             self._prune()

@@ -1,5 +1,8 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { api, errorMessage, object, text, type RecordValue } from "./api";
+import { api, errorMessage, object } from "./api";
+import { lockPage } from "./modal";
+import { useExiting } from "./presence";
+export { DrawerPresence } from "./presence";
 import s from "./ui.module.scss";
 
 export function Icon({ name = "grid" }: { name?: string }) {
@@ -10,11 +13,19 @@ export function Icon({ name = "grid" }: { name?: string }) {
     logs: "M6 3h12v18H6z M9 7h6M9 11h6M9 15h4",
     settings: "M4 7h16M4 17h16M8 4v6M16 14v6",
     arrow: "M5 12h14m-5-5 5 5-5 5",
+    plus: "M12 5v14M5 12h14",
+    collapse: "M4 4h16v16H4zM9 4v16m7-12-3 4 3 4",
+    expand: "M4 4h16v16H4zM9 4v16m4-12 3 4-3 4",
     refresh: "M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1",
     close: "m6 6 12 12M6 18 18 6",
     shield: "m12 2 8 3v6c0 5-8 11-8 11S4 16 4 11V5l8-3Zm-4 9 3 3 5-6",
     leaf: "M20 3C7 2 1 8 5 16s17 4 15-13ZM5 20 16 8",
     alert: "m12 3 10 18H2L12 3Zm0 5v6m0 3v1",
+    appearance:
+      "M12 3a9 9 0 1 0 0 18h1a2 2 0 0 0 1-3.7 1.5 1.5 0 0 1 1-2.8h2a4 4 0 0 0 4-4C21 6.4 17 3 12 3ZM7 10h.01M10 7h.01M15 7h.01M17 10h.01",
+    sun: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5",
+    moon: "M20 15A9 9 0 0 1 9 4a9 9 0 1 0 11 11Z",
+    system: "M3 4h18v13H3zM8 21h8m-4-4v4",
   };
   return (
     <svg
@@ -120,57 +131,65 @@ export function Panel({
     </section>
   );
 }
-export function Fields({ data }: { data: RecordValue }) {
-  return (
-    <dl className={s.details}>
-      {Object.entries(data).map(([key, value]) => (
-        <div key={key}>
-          <dt>{key}</dt>
-          <dd>{text(value)}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
+export { Fields, DataValue, profileLabel } from "./values";
 export function Drawer({
   title,
   children,
   onClose,
+  dismissDisabled = false,
+  className = "",
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
+  dismissDisabled?: boolean;
+  className?: string;
 }) {
+  const exiting = useExiting();
   const ref = useRef<HTMLDialogElement>(null);
+  const outside = useRef(false);
   const id = useId();
   useEffect(() => {
     const dialog = ref.current;
+    if (!dialog) return;
     const active = document.activeElement;
-    dialog?.showModal();
+    dialog.showModal();
+    const unlock = lockPage();
     return () => {
-      dialog?.close();
-      if (active instanceof HTMLElement) active.focus();
+      dialog.close();
+      unlock();
+      if (active instanceof HTMLElement && active.isConnected)
+        active.focus({ preventScroll: true });
     };
   }, []);
   return (
     <dialog
-      className={s.drawer}
+      className={`${s.modalOverlay} ${exiting ? s.exiting : ""}`}
+      data-phase={exiting ? "exiting" : "open"}
       ref={ref}
       aria-labelledby={id}
+      onPointerDown={(e) => {
+        outside.current = e.button === 0 && e.target === e.currentTarget;
+      }}
+      onClick={(e) => {
+        const dismiss = outside.current && e.target === e.currentTarget;
+        outside.current = false;
+        if (dismiss && !dismissDisabled && !exiting) onClose();
+      }}
       onCancel={(e) => {
         e.preventDefault();
-        onClose();
+        if (!dismissDisabled && !exiting) onClose();
       }}
     >
-      <div className={s.drawerHead}>
-        <div>
+      <section className={`${s.drawer} ${className}`} inert={exiting}>
+        <div className={s.drawerHead}>
           <h2 id={id}>{title}</h2>
+          <button type="button" aria-label="关闭抽屉" disabled={dismissDisabled} onClick={onClose}>
+            <Icon name="close" />
+          </button>
         </div>
-        <button aria-label="关闭抽屉" onClick={onClose}>
-          <Icon name="close" />
-        </button>
-      </div>
-      <div className={s.drawerBody}>{children}</div>
+        <div className={s.drawerBody}>{children}</div>
+      </section>
     </dialog>
   );
 }
@@ -182,7 +201,7 @@ export function ClearLogs({ onClose, onDone }: { onClose: () => void; onDone: ()
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   return (
-    <Drawer title="清理日志" onClose={onClose}>
+    <Drawer title="清理日志" onClose={onClose} dismissDisabled={busy}>
       <form
         onSubmit={(e) => {
           e.preventDefault();

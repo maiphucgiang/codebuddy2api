@@ -8,6 +8,7 @@ from pathlib import Path
 import threading
 import time
 from urllib.parse import quote, urlsplit
+import uuid
 import zipfile
 
 from fastapi import HTTPException, Request
@@ -46,6 +47,7 @@ def _public_credential(item):
               "credits_by_profile", "catalog", "catalog_sync", "sync", "generation", "auth_broken",
               "models", "remaining", "enterprise_id", "product", "status", "sync_pending", "sync_error",
               "fail_until", "cooldown_until", "cooldown_remaining", "last_failure_at", "catalog_ready", "bindings",
+              "auto_checkin", "auto_travel", "travel_supported", "checkin", "travel",
               "token_expired", "token_expires_at", "last_refresh_time", "sessions", "sticky_sessions", "last_error_code"}
     result = {key: value for key, value in item.items() if key in fields}
     identity = item.get("account_key") or item.get("id")
@@ -250,18 +252,29 @@ def install_admin(app, config, gateway):
 
     @route("GET", "/admin/models")
     async def models_get(request):
-        snapshot = control.snapshot()
-        models = []
-        for item in await run_in_threadpool(gateway.admin_model_inventory):
-            item = {"id": item} if isinstance(item, str) else dict(item)
-            source = item["id"]
-            rule = snapshot["models"].get(source, {"public_id": source, "enabled": True, "keep_original": False,
-                                                   "region": None, "profile": None, "credential_ids": []})
-            models.append({**item, **rule})
-        return JSONResponse({"revision": snapshot["revision"], "models": models})
+        def build_models():
+            with mutation_lock:
+                inventory = gateway.admin_model_inventory()
+                snapshot = control.snapshot()  # 扫描可能同步账号身份，随后读取对应的规则版本。
+                models = []
+                for item in inventory:
+                    item = {"id": item} if isinstance(item, str) else dict(item)
+                    source = item["id"]
+                    rule = snapshot["models"].get(source, {"public_id": source, "enabled": True, "keep_original": False,
+                                                           "region": None, "profile": None, "credential_ids": []})
+                    models.append({**item, **rule})
+                return JSONResponse({"revision": snapshot["revision"], "models": models})
+        return await run_in_threadpool(build_models)
 
-    def checked_rule(source, data):
-        rule = validate_model(source, data, control.snapshot()["models"], known_models())
+    def checked_rule(source, data, *, creating=False):
+        if "custom" in data:
+            raise ValueError("custom 是只读字段")
+        existing = control.snapshot()["models"].get(source, {})
+        if creating and (not data.get("public_id") or not data.get("upstream_id")):
+            raise ValueError("对外 ID 和上游模型 ID 均不能为空")
+        values = {"upstream_id": existing.get("upstream_id", source), **data,
+                  "custom": True if creating else existing.get("custom", False)}
+        rule = validate_model(source, values, control.snapshot()["models"], known_models())
         for identity in rule["credential_ids"]:
             item = selected(identity)
             if item is None:
@@ -271,6 +284,42 @@ def install_admin(app, config, gateway):
                             or (rule["region"] and not profile.startswith(rule["region"] + "-"))):
                 raise ValueError("绑定凭证与区域或产品规则冲突")
         return rule
+
+    @route("POST", "/admin/models")
+    async def models_create(request):
+        data = await _body(request)
+        revision = data.pop("revision", None)
+        source = "custom:" + uuid.uuid4().hex
+        def apply():
+            with mutation_lock:
+                rule = checked_rule(source, data, creating=True)
+                snapshot = control.update_model(source, rule, revision, known_models())
+            event("model.created", {"model": rule["public_id"]})
+            return JSONResponse({"revision": snapshot["revision"], "model": {"id": source, **rule}}, status_code=201)
+        return await run_in_threadpool(apply)
+
+    @route("POST", "/admin/models/preview")
+    async def models_create_preview(request):
+        data = await _body(request)
+        data.pop("revision", None)
+        source = "custom:" + uuid.uuid4().hex
+        def preview():
+            return JSONResponse(gateway.admin_model_preview(source, checked_rule(source, data, creating=True)))
+        return await run_in_threadpool(preview)
+
+    @route("DELETE", "/admin/models/{id:path}")
+    async def models_delete(request):
+        data = await _body(request)
+        if set(data) != {"revision"}:
+            raise ValueError("删除模型只接受 revision")
+        source = request.path_params["id"]
+        def remove():
+            with mutation_lock:
+                snapshot = control.delete_model(source, data["revision"])
+            event("model.deleted", {"model": source})
+            return JSONResponse({"revision": snapshot["revision"], "ok": True})
+        return await run_in_threadpool(remove)
+
 
     @route("PUT", "/admin/models/{id:path}")
     async def models_put(request):
@@ -297,17 +346,23 @@ def install_admin(app, config, gateway):
     @route("PATCH", "/admin/credentials/{id}")
     async def credentials_patch(request):
         data = await _body(request)
-        if set(data) != {"enabled"} or type(data["enabled"]) is not bool:
-            raise ValueError("enabled 必须为布尔值")
+        if set(data) not in ({"enabled"}, {"auto_checkin"}, {"auto_travel"}) or any(type(value) is not bool for value in data.values()):
+            raise ValueError("仅接受一个布尔字段：enabled、auto_checkin 或 auto_travel")
+        field, value = next(iter(data.items()))
         identity = request.path_params["id"]
         def apply():
             if selected(identity) is None:
                 return error_response(404, "凭证不存在")
             with mutation_lock:
                 # The gateway persists under the pool lock before publishing routing state.
-                gateway.admin_set_credential_enabled(identity, data["enabled"])
-            event("credential.enabled", {"credential": identity, "enabled": data["enabled"]})
-            return JSONResponse({"id": identity, "enabled": data["enabled"], "revision": control.snapshot()["revision"]})
+                if field == "enabled":
+                    gateway.admin_set_credential_enabled(identity, value)
+                elif field == "auto_checkin":
+                    gateway.admin_set_auto_checkin(identity, value)
+                else:
+                    gateway.admin_set_auto_travel(identity, value)
+            event("credential." + field, {"credential": identity, field: value})
+            return JSONResponse({"id": identity, field: value, "revision": control.snapshot()["revision"]})
         return await run_in_threadpool(apply)
 
     def upload(body):
@@ -442,8 +497,11 @@ def install_admin(app, config, gateway):
             raise ValueError("days 必须为 1、7、30 或 90") from None
         if days not in (1, 7, 30, 90):
             raise ValueError("days 必须为 1、7、30 或 90")
+        granularity = request.query_params.get("granularity", "auto")
+        if granularity not in ("auto", "hour", "day"):
+            raise ValueError("granularity 必须为 auto、hour 或 day")
         def build_dashboard():
-            result = audit.dashboard(days)
+            result = audit.dashboard(days, granularity=granularity)
             if result.get("degraded"):
                 return error_response(503, "统计暂时无法读取，不能确认当前数值；请检查审计存储状态")
             rows = [_public_credential(item) for item in inventory()]

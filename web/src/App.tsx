@@ -7,6 +7,7 @@ import { Models } from "./pages/Models";
 import { Credentials } from "./pages/Credentials";
 import { Logs } from "./pages/Logs";
 import { Settings } from "./pages/Settings";
+import { Appearance } from "./appearance";
 import s from "./ui.module.scss";
 
 const navigation = [
@@ -42,32 +43,65 @@ function Shell() {
   const location = useLocation();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("codebuddy.sidebar.collapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const toggleSidebar = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    try {
+      localStorage.setItem("codebuddy.sidebar.collapsed", String(next));
+    } catch {
+      /* Session-only preference when storage is unavailable. */
+    }
+  };
   return (
-    <div className={s.app}>
+    <div className={`${s.app} ${collapsed ? s.collapsed : ""}`}>
       <a href="#main" className={s.skip}>
         跳转到内容
       </a>
       <aside className={s.sidebar}>
-        <NavLink className={s.brand} to="/dashboard">
-          <span className={s.brandIcon}>
-            <Icon name="leaf" />
-          </span>
-          <span>
-            CodeBuddy<small>个人管理工作台</small>
-          </span>
-        </NavLink>
+        <div className={s.sidebarHead}>
+          <NavLink className={s.brand} to="/dashboard" aria-label="CodeBuddy 概览">
+            <span className={s.brandIcon}>
+              <Icon name="leaf" />
+            </span>
+            <span className={s.brandText}>
+              CodeBuddy<small>个人管理工作台</small>
+            </span>
+          </NavLink>
+          <button
+            className={s.sidebarToggle}
+            onClick={toggleSidebar}
+            aria-label={collapsed ? "展开侧栏" : "收起侧栏"}
+            aria-expanded={!collapsed}
+            aria-controls="workspace-navigation"
+            title={collapsed ? "展开侧栏" : "收起侧栏"}
+          >
+            <Icon name={collapsed ? "expand" : "collapse"} />
+          </button>
+        </div>
         <p className={s.navLabel}>工作空间</p>
-        <nav aria-label="主导航">
+        <nav id="workspace-navigation" aria-label="主导航">
           {navigation.map(([path, label, icon]) => (
             <NavLink
               key={path}
               to={`/dashboard${path}`}
               end={path === ""}
+              aria-label={label}
+              title={collapsed ? label : undefined}
+              data-label={label}
               className={({ isActive }) => `${s.navItem} ${isActive ? s.active : ""}`}
             >
               <Icon name={icon} />
-              {label}
-              <span className={s.navArrow}>↗</span>
+              <span className={s.navText}>{label}</span>
+              <span className={s.navArrow}>
+                <Icon name="arrow" />
+              </span>
             </NavLink>
           ))}
         </nav>
@@ -79,6 +113,7 @@ function Shell() {
             {navigation.find(([path]) => `/dashboard${path}` === location.pathname)?.[1] ?? "概览"}
           </span>
           <div className={s.actions}>
+            <Appearance />
             <span className={s.session}>
               <span />
               会话已认证
@@ -115,6 +150,9 @@ function Login() {
   if (status === "authenticated") return <Navigate to="/dashboard" replace />;
   return (
     <div className={s.login}>
+      <div className={s.loginAppearance}>
+        <Appearance />
+      </div>
       <section className={s.loginIntro}>
         <div className={s.brand}>
           <span className={s.brandIcon}>

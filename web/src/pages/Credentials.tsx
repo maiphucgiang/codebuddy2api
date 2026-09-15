@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { OAuth } from "../OAuth";
 import {
   api,
   credentialResponse,
@@ -13,7 +14,9 @@ import {
 } from "../api";
 import {
   Badge,
+  DataValue,
   Drawer,
+  DrawerPresence,
   Empty,
   ErrorNotice,
   Fields,
@@ -21,6 +24,7 @@ import {
   PageTitle,
   Panel,
   ResourceState,
+  profileLabel,
 } from "../components";
 import { prepareImports, type ImportResult } from "../imports";
 import { downloadFilename } from "../downloads";
@@ -30,154 +34,13 @@ function expiry(value: unknown, milliseconds = false) {
     ? new Date(milliseconds ? value : value * 1000).toLocaleString("zh-CN")
     : text(value);
 }
-export function safeOAuthUrl(value: unknown): string {
-  if (typeof value !== "string") throw new Error("OAuth 响应缺少验证链接");
-  const url = new URL(value);
-  if (
-    url.protocol !== "https:" ||
-    (url.port !== "" && url.port !== "443") ||
-    url.username ||
-    url.password ||
-    ![
-      "www.codebuddy.cn",
-      "www.codebuddy.ai",
-      "www.workbuddy.cn",
-      "www.workbuddy.ai",
-      "copilot.tencent.com",
-    ].includes(url.hostname)
-  )
-    throw new Error("服务返回了不在官方白名单中的 OAuth 链接");
-  return url.href;
-}
-function OAuth({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [site, setSite] = useState("cn");
-  const [login, setLogin] = useState<{ id: string; url: string; until: number } | null>(null);
-  const [message, setMessage] = useState("选择站点后发起授权。");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const controller = useRef<AbortController | null>(null);
-  useEffect(() => () => controller.current?.abort(), []);
-  useEffect(() => {
-    if (!login) return;
-    const abort = new AbortController();
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      if (Date.now() > login.until) {
-        setLogin(null);
-        setMessage("授权已过期，请重新发起。");
-        return;
-      }
-      if (document.visibilityState === "hidden") {
-        timer = setTimeout(() => {
-          void poll();
-        }, 4000);
-        return;
-      }
-      try {
-        const response = await api.get<unknown>("/oauth/poll", {
-          params: { login_id: login.id },
-          signal: abort.signal,
-        });
-        const data = object(response.data);
-        if (typeof data.done !== "boolean") throw new Error("OAuth 轮询响应缺少 done 状态");
-        if (abort.signal.aborted) return;
-        if (data.done) {
-          setLogin(null);
-          if (data.error) setError(text(data.error));
-          else {
-            setMessage("授权完成，凭证已添加。");
-            onDone();
-          }
-          return;
-        }
-        timer = setTimeout(() => {
-          void poll();
-        }, 4000);
-      } catch (err) {
-        if (!abort.signal.aborted) {
-          setError(errorMessage(err));
-          setLogin(null);
-          setMessage("请重新发起授权。");
-        }
-      }
-    };
-    timer = setTimeout(() => {
-      void poll();
-    }, 4000);
-    return () => {
-      abort.abort();
-      clearTimeout(timer);
-    };
-  }, [login, onDone]);
-  return (
-    <Drawer title="OAuth 添加凭证" onClose={onClose}>
-      <p className={s.note}>请仅在官方站点完成授权。</p>
-      <label className={s.field}>
-        登录站点
-        <select value={site} disabled={!!login || busy} onChange={(e) => setSite(e.target.value)}>
-          <option value="cn">中国大陆 · CN</option>
-          <option value="intl">国际 · WorkBuddy</option>
-          <option value="intl-codebuddy">国际 · CodeBuddy</option>
-        </select>
-      </label>
-      <ErrorNotice message={error} />
-      <p role="status">{message}</p>
-      {login ? (
-        <>
-          <a className={s.linkButton} href={login.url} target="_blank" rel="noopener noreferrer">
-            打开官方授权页面 <Icon name="arrow" />
-          </a>
-          <button
-            onClick={() => {
-              setLogin(null);
-              setMessage("已停止查询。");
-            }}
-          >
-            停止轮询
-          </button>
-        </>
-      ) : (
-        <button
-          className={s.primary}
-          disabled={busy}
-          onClick={() => {
-            setError(null);
-            setBusy(true);
-            controller.current = new AbortController();
-            void api
-              .post<unknown>("/oauth/start", null, {
-                params: { site },
-                signal: controller.current.signal,
-              })
-              .then((res) => {
-                const d = object(res.data);
-                if (typeof d.login_id !== "string") throw new Error("OAuth 响应缺少 login_id");
-                const seconds = number(d.expires_in);
-                setLogin({
-                  id: d.login_id,
-                  url: safeOAuthUrl(d.verification_uri),
-                  until: Date.now() + Math.min(seconds ?? 300, 600) * 1000,
-                });
-                setMessage("等待官方授权完成…");
-              })
-              .catch((err: unknown) => {
-                if (!controller.current?.signal.aborted) setError(errorMessage(err));
-              })
-              .finally(() => setBusy(false));
-          }}
-        >
-          {busy ? "正在发起…" : "发起 OAuth 授权"}
-        </button>
-      )}
-    </Drawer>
-  );
-}
+export { safeOAuthUrl } from "../OAuth";
 function ImportDrawer({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
   const [results, setResults] = useState<ImportResult[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   return (
-    <Drawer title="导入凭证" onClose={onClose}>
+    <Drawer title="导入凭证" onClose={onClose} dismissDisabled={busy}>
       <p className={s.note}>
         支持 UTF-8 .info 或 ZIP，ZIP 仅接受根目录 .info。单项 ≤ 1 MiB，每批 ≤ 100 项 / 32
         MiB，不覆盖现有文件。
@@ -241,6 +104,44 @@ export function Credentials() {
   const [deleting, setDeleting] = useState<Credential | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [maintenance, setMaintenance] = useState<Record<string, unknown>[]>([]);
+  const maintain = (
+    action: "refresh" | "checkin" | "sync" | "travel" | "travel-status",
+    credential?: Credential,
+  ) => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setMaintenance([]);
+    const path = credential
+      ? `/credentials/${encodeURIComponent(credential.id)}/${action}`
+      : `/${action}`;
+    void api
+      .post(path, undefined, { timeout: 300000 })
+      .then(({ data }) => {
+        const results = list(object(data).results, "凭证操作结果");
+        if (
+          !results.length ||
+          results.some((r) => typeof r.ok !== "boolean" || typeof r.message !== "string")
+        )
+          throw new Error("未收到完整操作结果，请刷新列表核验，勿直接重复执行");
+        for (const r of results) if (r.travel !== undefined) object(r.travel, "旅行操作结果");
+        setMaintenance(results);
+      })
+      .catch((err: unknown) =>
+        setError(`${errorMessage(err)}；请求失败不代表后台已停止，请刷新列表核验。`),
+      )
+      .finally(() => {
+        setBusy(false);
+        resource.reload();
+      });
+  };
+  const oauthDone = useCallback(() => {
+    setDrawer(null);
+    setNotice("授权完成，凭证已添加。");
+    resource.reload();
+  }, [resource.reload]);
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -257,6 +158,27 @@ export function Credentials() {
       .catch((err: unknown) => setError(errorMessage(err)))
       .finally(() => setBusy(false));
   };
+  const preference = (
+    credential: Credential,
+    field: "auto_checkin" | "auto_travel",
+    enabled: boolean,
+  ) => {
+    run(async () => {
+      const response = await api.patch(`/credentials/${encodeURIComponent(credential.id)}`, {
+        [field]: enabled,
+      });
+      const saved = object(response.data);
+      if (
+        saved.id !== credential.id ||
+        saved[field] !== enabled ||
+        !Number.isInteger(saved.revision)
+      )
+        throw new Error("设置保存结果未确认，请刷新列表核验");
+      setNotice(
+        `${field === "auto_checkin" ? "自动签到" : "自动旅行"}已${enabled ? "开启" : "关闭"}；保存不会立即领取，后续维护按新设置执行。`,
+      );
+    });
+  };
   const liveSelected = selected.filter((id) => resource.data?.some((c) => c.id === id));
   return (
     <>
@@ -272,8 +194,39 @@ export function Credentials() {
           </>
         }
       />
+      {notice && (
+        <p className={s.successNotice} role="status">
+          {notice}
+        </p>
+      )}
       <ResourceState {...resource} />
       <ErrorNotice message={error} />
+      {maintenance.length > 0 && (
+        <Panel title="凭证操作结果">
+          <ul className={s.operationResults} aria-live="polite">
+            {maintenance.map((r, i) => (
+              <li key={i}>
+                <strong>{text(r.name)}</strong>
+                <Badge tone={r.ok ? "good" : "warn"}>
+                  {r.ok
+                    ? "已完成"
+                    : r.checkin_ok === true ||
+                        r.claimed === true ||
+                        r.departed === true ||
+                        (r.travel &&
+                          typeof r.travel === "object" &&
+                          (object(r.travel).claimed === true || object(r.travel).departed === true))
+                      ? "部分完成"
+                      : r.skipped
+                        ? "已跳过"
+                        : "未完成"}
+                </Badge>
+                <span>{text(r.message)}</span>
+              </li>
+            ))}
+          </ul>
+        </Panel>
+      )}
       <Panel
         title="账号凭证"
         hint={resource.data ? `${resource.data.length} 个账号` : "等待凭证列表"}
@@ -282,16 +235,23 @@ export function Credentials() {
           <div className={s.actions}>
             <button onClick={resource.reload}>
               <Icon name="refresh" />
-              刷新
+              刷新列表
             </button>
-            <button disabled={busy} onClick={() => run(() => api.post("/checkin"))}>
-              签到 / 同步余额
+            <button disabled={busy} onClick={() => maintain("checkin")}>
+              批量签到
             </button>
+            <button disabled={busy} onClick={() => maintain("sync")}>
+              同步全部余额
+            </button>
+            {busy && <span role="status">操作执行中，请勿重复提交…</span>}
           </div>
           <button disabled={!liveSelected.length} onClick={() => setDrawer("export")}>
             导出已选 ({liveSelected.length})
           </button>
         </div>
+        <p className={s.note}>
+          自动任务按账号保存：国内默认签到后旅行，国际默认关闭。开关分别生效；余额同步不触发领取，关闭开关不撤回已发送的请求。
+        </p>
         {resource.data &&
           (resource.data.length ? (
             <div className={s.tableWrap}>
@@ -312,6 +272,7 @@ export function Credentials() {
                     </th>
                     <th>凭证 / 产品</th>
                     <th>人工状态</th>
+                    <th>自动任务 / 上次结果</th>
                     <th>认证健康</th>
                     <th>模型 429 冷却</th>
                     <th>官方余额 / 到期</th>
@@ -326,6 +287,9 @@ export function Credentials() {
                     const cooldowns = Array.isArray(c.cooldowns) ? list(c.cooldowns) : null;
                     const balance =
                       c.credits && typeof c.credits === "object" ? object(c.credits) : null;
+                    const checkin =
+                      c.checkin && typeof c.checkin === "object" ? object(c.checkin) : null;
+                    const trip = c.travel && typeof c.travel === "object" ? object(c.travel) : null;
                     return (
                       <tr key={c.id}>
                         <td>
@@ -345,7 +309,7 @@ export function Credentials() {
                         <td>
                           <strong>{c.name ?? "安全文件名不可用"}</strong>
                           <small>
-                            {text(c.profile)} · {text(c.nickname ?? c.uid)}
+                            {profileLabel(text(c.profile))} · {text(c.nickname ?? c.uid)}
                           </small>
                           <small>
                             {c.sync_pending === true
@@ -363,6 +327,45 @@ export function Credentials() {
                                 ? "人工停用"
                                 : "未知"}
                           </Badge>
+                        </td>
+                        <td className={s.automation}>
+                          <label className={s.check}>
+                            <input
+                              type="checkbox"
+                              role="switch"
+                              aria-label={`自动签到 ${c.name ?? c.id}`}
+                              checked={c.auto_checkin === true}
+                              disabled={busy || typeof c.auto_checkin !== "boolean"}
+                              onChange={(e) => preference(c, "auto_checkin", e.target.checked)}
+                            />
+                            自动签到
+                          </label>
+                          <small>
+                            上次签到{checkin?.date ? `（${text(checkin.date)}）` : ""}：
+                            {checkin ? text(checkin.message) : "尚未查询"}
+                          </small>
+                          <label className={s.check}>
+                            <input
+                              type="checkbox"
+                              role="switch"
+                              aria-label={`自动旅行 ${c.name ?? c.id}`}
+                              checked={c.auto_travel === true}
+                              disabled={
+                                busy ||
+                                c.travel_supported !== true ||
+                                typeof c.auto_travel !== "boolean"
+                              }
+                              onChange={(e) => preference(c, "auto_travel", e.target.checked)}
+                            />
+                            自动旅行
+                          </label>
+                          <small>
+                            {c.travel_supported === true
+                              ? `上次旅行：${trip ? text(trip.message) : "尚未查询"}`
+                              : "旅行仅适用于国内账号"}
+                          </small>
+                          {trip?.stale === true && <small>状态可能已变化，请先查询核验</small>}
+                          {c.enabled === false && <small>账号停用期间不执行自动任务</small>}
                         </td>
                         <td>
                           <Badge
@@ -397,7 +400,7 @@ export function Credentials() {
                               <Badge>无模型冷却</Badge>
                             )
                           ) : c.model_cooldowns ? (
-                            text(c.model_cooldowns)
+                            <DataValue value={c.model_cooldowns} />
                           ) : (
                             "未知"
                           )}
@@ -415,6 +418,45 @@ export function Credentials() {
                         <td>
                           <div className={s.rowActions}>
                             <button onClick={() => setDetail(c)}>详情</button>
+                            <button
+                              disabled={busy || c.enabled !== true}
+                              aria-label={`刷新凭证 ${c.name ?? c.id}`}
+                              onClick={() => maintain("refresh", c)}
+                            >
+                              刷新 Token
+                            </button>
+                            <button
+                              disabled={busy || c.enabled !== true}
+                              aria-label={`签到 ${c.name ?? c.id}`}
+                              onClick={() => maintain("checkin", c)}
+                            >
+                              {c.auto_travel === true ? "签到并旅行" : "签到"}
+                            </button>
+                            <button
+                              disabled={busy || c.enabled !== true}
+                              aria-label={`同步余额 ${c.name ?? c.id}`}
+                              onClick={() => maintain("sync", c)}
+                            >
+                              同步余额
+                            </button>
+                            {c.travel_supported === true && (
+                              <>
+                                <button
+                                  disabled={busy || c.enabled !== true}
+                                  aria-label={`旅行状态 ${c.name ?? c.id}`}
+                                  onClick={() => maintain("travel-status", c)}
+                                >
+                                  旅行状态
+                                </button>
+                                <button
+                                  disabled={busy || c.enabled !== true}
+                                  aria-label={`旅行领派 ${c.name ?? c.id}`}
+                                  onClick={() => maintain("travel", c)}
+                                >
+                                  旅行领派
+                                </button>
+                              </>
+                            )}
                             <button
                               disabled={busy || typeof c.enabled !== "boolean"}
                               onClick={() =>
@@ -446,82 +488,92 @@ export function Credentials() {
             <Empty title="还没有凭证">添加账号或导入 .info 文件。</Empty>
           ))}
       </Panel>
-      {drawer === "oauth" && <OAuth onClose={() => setDrawer(null)} onDone={resource.reload} />}{" "}
-      {drawer === "import" && (
-        <ImportDrawer onClose={() => setDrawer(null)} onDone={resource.reload} />
-      )}{" "}
-      {detail && (
-        <Drawer title="凭证详情" onClose={() => setDetail(null)}>
-          <Fields data={detail} />
-        </Drawer>
-      )}
-      {deleting && (
-        <Drawer title="删除凭证" onClose={() => setDeleting(null)}>
-          <div className={s.warning}>
-            将永久删除 {deleting.name}，不可撤销。如已绑定模型规则，请先解除绑定。
-          </div>
-          <ErrorNotice message={error} />
-          <button
-            className={s.danger}
-            disabled={busy}
-            onClick={() =>
-              run(() => api.delete(`/credentials/${encodeURIComponent(deleting.name!)}`))
-            }
-          >
-            确认删除凭证
-          </button>
-        </Drawer>
-      )}
-      {drawer === "export" && (
-        <Drawer title="导出明文凭证" onClose={() => setDrawer(null)}>
-          <div className={s.warning}>
-            <Icon name="alert" />
-            <div>
-              <strong>文件包含明文认证信息</strong>
-              <p>
-                将导出 {liveSelected.length}{" "}
-                个凭证，他人可能借此使用账号。请仅保存在可信设备，勿分享或公开上传。
-              </p>
+      <DrawerPresence>
+        {drawer === "oauth" && <OAuth onClose={() => setDrawer(null)} onDone={oauthDone} />}
+      </DrawerPresence>
+      <DrawerPresence>
+        {drawer === "import" && (
+          <ImportDrawer onClose={() => setDrawer(null)} onDone={resource.reload} />
+        )}
+      </DrawerPresence>
+      <DrawerPresence>
+        {detail && (
+          <Drawer title="凭证详情" onClose={() => setDetail(null)}>
+            <Fields data={detail} />
+          </Drawer>
+        )}
+      </DrawerPresence>
+      <DrawerPresence>
+        {deleting && (
+          <Drawer title="删除凭证" onClose={() => setDeleting(null)} dismissDisabled={busy}>
+            <div className={s.warning}>
+              将永久删除 {deleting.name}，不可撤销。如已绑定模型规则，请先解除绑定。
             </div>
-          </div>
-          <ErrorNotice message={error} />
-          <button
-            className={s.danger}
-            disabled={busy || !liveSelected.length}
-            onClick={() => {
-              setBusy(true);
-              setError(null);
-              void api
-                .post<Blob>(
-                  "/credentials/export",
-                  { ids: liveSelected, confirm: true },
-                  { responseType: "blob" },
-                )
-                .then((response) => {
-                  if (!response.data.size) throw new Error("导出响应为空");
-                  const type = String(response.headers["content-type"] ?? "");
-                  if (type.includes("json") || type.includes("html"))
-                    throw new Error("导出响应不是凭证附件");
-                  const url = URL.createObjectURL(response.data);
-                  const link = document.createElement("a");
-                  link.href = url;
-                  const header = String(response.headers["content-disposition"] ?? "");
-                  link.download = downloadFilename(
-                    header,
-                    liveSelected.length === 1 ? "credential.info" : "credentials.zip",
-                  );
-                  link.click();
-                  setTimeout(() => URL.revokeObjectURL(url), 1000);
-                  setDrawer(null);
-                })
-                .catch((err: unknown) => setError(errorMessage(err)))
-                .finally(() => setBusy(false));
-            }}
-          >
-            我理解明文风险，下载已选凭证
-          </button>
-        </Drawer>
-      )}
+            <ErrorNotice message={error} />
+            <button
+              className={s.danger}
+              disabled={busy}
+              onClick={() =>
+                run(() => api.delete(`/credentials/${encodeURIComponent(deleting.name!)}`))
+              }
+            >
+              确认删除凭证
+            </button>
+          </Drawer>
+        )}
+      </DrawerPresence>
+      <DrawerPresence>
+        {drawer === "export" && (
+          <Drawer title="导出明文凭证" onClose={() => setDrawer(null)} dismissDisabled={busy}>
+            <div className={s.warning}>
+              <Icon name="alert" />
+              <div>
+                <strong>文件包含明文认证信息</strong>
+                <p>
+                  将导出 {liveSelected.length}{" "}
+                  个凭证，他人可能借此使用账号。请仅保存在可信设备，勿分享或公开上传。
+                </p>
+              </div>
+            </div>
+            <ErrorNotice message={error} />
+            <button
+              className={s.danger}
+              disabled={busy || !liveSelected.length}
+              onClick={() => {
+                setBusy(true);
+                setError(null);
+                void api
+                  .post<Blob>(
+                    "/credentials/export",
+                    { ids: liveSelected, confirm: true },
+                    { responseType: "blob" },
+                  )
+                  .then((response) => {
+                    if (!response.data.size) throw new Error("导出响应为空");
+                    const type = String(response.headers["content-type"] ?? "");
+                    if (type.includes("json") || type.includes("html"))
+                      throw new Error("导出响应不是凭证附件");
+                    const url = URL.createObjectURL(response.data);
+                    const link = document.createElement("a");
+                    link.href = url;
+                    const header = String(response.headers["content-disposition"] ?? "");
+                    link.download = downloadFilename(
+                      header,
+                      liveSelected.length === 1 ? "credential.info" : "credentials.zip",
+                    );
+                    link.click();
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                    setDrawer(null);
+                  })
+                  .catch((err: unknown) => setError(errorMessage(err)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              我理解明文风险，下载已选凭证
+            </button>
+          </Drawer>
+        )}
+      </DrawerPresence>
     </>
   );
 }

@@ -13,6 +13,7 @@ import {
   Badge,
   ClearLogs,
   Drawer,
+  DrawerPresence,
   Empty,
   ErrorNotice,
   Fields,
@@ -289,45 +290,49 @@ export function Logs() {
           </div>
         </div>
       </Panel>
-      {detail && (
-        <Drawer title="日志详情与实际尝试" onClose={closeDetail}>
-          <ErrorNotice message={detailError} />
-          {detailLoading ? (
-            <p role="status">正在加载详情…</p>
-          ) : (
-            <>
-              <Fields
-                data={Object.fromEntries(
-                  Object.entries(detail).filter(([key]) => key !== "attempts"),
-                )}
-              />
-              {Array.isArray(detail.attempts) && (
-                <Panel title="实际尝试">
-                  {detail.attempts.length ? (
-                    list(detail.attempts).map((attempt, i) => (
-                      <div key={i}>
-                        <h3>尝试 {i + 1}</h3>
-                        <Fields data={attempt} />
-                      </div>
-                    ))
-                  ) : (
-                    <p>暂无尝试记录。</p>
+      <DrawerPresence>
+        {detail && (
+          <Drawer title="日志详情与实际尝试" onClose={closeDetail}>
+            <ErrorNotice message={detailError} />
+            {detailLoading ? (
+              <p role="status">正在加载详情…</p>
+            ) : (
+              <>
+                <Fields
+                  data={Object.fromEntries(
+                    Object.entries(detail).filter(([key]) => key !== "attempts"),
                   )}
-                </Panel>
-              )}
-            </>
-          )}
-        </Drawer>
-      )}
-      {clear && (
-        <ClearLogs
-          onClose={() => setClear(false)}
-          onDone={() => {
-            setCursors([]);
-            resource.reload();
-          }}
-        />
-      )}
+                />
+                {Array.isArray(detail.attempts) && (
+                  <Panel title="实际尝试">
+                    {detail.attempts.length ? (
+                      list(detail.attempts).map((attempt, i) => (
+                        <div key={i}>
+                          <h3>尝试 {i + 1}</h3>
+                          <Fields data={attempt} />
+                        </div>
+                      ))
+                    ) : (
+                      <p>暂无尝试记录。</p>
+                    )}
+                  </Panel>
+                )}
+              </>
+            )}
+          </Drawer>
+        )}
+      </DrawerPresence>
+      <DrawerPresence>
+        {clear && (
+          <ClearLogs
+            onClose={() => setClear(false)}
+            onDone={() => {
+              setCursors([]);
+              resource.reload();
+            }}
+          />
+        )}
+      </DrawerPresence>
     </>
   );
 }

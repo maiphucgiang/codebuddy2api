@@ -47,6 +47,7 @@ describe("model rules and route preview", () => {
       />,
     );
     fireEvent.change(screen.getByLabelText("对外 ID"), { target: { value: "new-id" } });
+    fireEvent.click(screen.getByRole("radio", { name: /指定账号/ }));
     fireEvent.click(screen.getByRole("checkbox", { name: /one.info/ }));
     fireEvent.click(screen.getByText("预览候选路由"));
     await waitFor(() =>
@@ -59,6 +60,7 @@ describe("model rules and route preview", () => {
           region: null,
           profile: null,
         }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
     );
     expect(await screen.findByText(/人工停用/)).toBeTruthy();
@@ -67,6 +69,7 @@ describe("model rules and route preview", () => {
       expect(put).toHaveBeenCalledWith(
         "/models/upstream",
         expect.objectContaining({ revision: 7, public_id: "new-id" }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
     );
     expect(saved).toHaveBeenCalledOnce();

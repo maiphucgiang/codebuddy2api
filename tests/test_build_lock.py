@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import re
+import tomllib
 import shlex
 import unittest
 
@@ -39,6 +40,25 @@ class BuildLockTests(unittest.TestCase):
                   for line in requirement_lines(ROOT / "requirements.in")}
         self.assertTrue(direct)
         self.assertTrue(direct <= locked)
+
+    def test_uv_metadata_and_exported_locks_stay_consistent(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+        self.assertEqual(project["version"], (ROOT / "VERSION").read_text().strip())
+        self.assertEqual(set(project["dependencies"]), set(requirement_lines(ROOT / "requirements.in")))
+        lock = tomllib.loads((ROOT / "uv.lock").read_text())
+        packages = {p["name"]: p for p in lock["package"] if p["name"] != project["name"]}
+        exported = set()
+        for line in requirement_lines(ROOT / "requirements.txt"):
+            requirement, *hashes = re.split(r"\s+--hash=", line)
+            parsed = Requirement(requirement)
+            package = packages[canonicalize_name(parsed.name)]
+            self.assertIn(package["version"], parsed.specifier)
+            locked_hashes = {wheel["hash"] for wheel in package.get("wheels", [])}
+            if package.get("sdist"):
+                locked_hashes.add(package["sdist"]["hash"])
+            self.assertTrue({value.strip() for value in hashes} <= locked_hashes)
+            exported.add(canonicalize_name(parsed.name))
+        self.assertEqual(exported, set(packages))
 
     def test_external_images_and_build_frontend_are_pinned(self):
         dockerfile = (ROOT / "Dockerfile").read_text()

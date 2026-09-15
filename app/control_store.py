@@ -21,13 +21,19 @@ def _identifier(value, label):
     return value
 
 
-def validate_model(source, rule, models=None, known_models=()):
-    _identifier(source, "上游模型 ID")
-    if not isinstance(rule, dict) or set(rule) - {"public_id", "enabled", "keep_original", "region", "profile", "credential_ids"}:
+def validate_model(source, rule, models=None, known_models=(), *, legacy_scopes=False):
+    _identifier(source, "模型规则 ID")
+    if not isinstance(rule, dict) or set(rule) - {"public_id", "upstream_id", "custom", "enabled", "keep_original", "region", "profile", "credential_ids"}:
         raise ValueError("模型规则字段无效")
-    clean = {"public_id": source, "enabled": True, "keep_original": False,
+    clean = {"public_id": source, "upstream_id": source, "custom": False,
+             "enabled": True, "keep_original": False,
              "region": None, "profile": None, "credential_ids": [], **rule}
+    _identifier(clean["upstream_id"], "上游模型 ID")
+    if type(clean["custom"]) is not bool or (clean["custom"] and clean["keep_original"]):
+        raise ValueError("自建模型不能公开内部规则标识")
     _identifier(clean["public_id"], "公开模型 ID")
+    if clean["custom"] and clean["public_id"] == source:
+        raise ValueError("自建模型必须使用独立的对外 ID")
     if type(clean["enabled"]) is not bool or type(clean["keep_original"]) is not bool:
         raise ValueError("enabled/keep_original 必须为布尔值")
     if clean["region"] not in (None, "cn", "intl") or clean["profile"] not in (None, "cn-cli", "cn-work", "intl-cli", "intl-work"):
@@ -41,6 +47,8 @@ def validate_model(source, rule, models=None, known_models=()):
         _identifier(identity, "账号指纹")
     if len(set(ids)) != len(ids):
         raise ValueError("账号指纹重复")
+    if ids and (clean["region"] or clean["profile"]) and not legacy_scopes:
+        raise ValueError("指定账号与区域/产品范围只能选择一种")
     all_rules = {**(models or {}), source: clean}
     real_ids = set(known_models) | set(all_rules) | {"auto"}
     aliases = {}
@@ -94,10 +102,12 @@ class ControlStore:
         if not isinstance(data["models"], dict) or not isinstance(data["credentials"], dict):
             raise ValueError("管理数据库策略无效")
         for source, rule in data["models"].items():
-            validate_model(source, rule, data["models"])
+            validate_model(source, rule, data["models"], legacy_scopes=True)  # 旧联合范围保持原有交集，编辑时再显式转换。
         for identity, metadata in data["credentials"].items():
             _identifier(identity, "账号指纹")
-            if not isinstance(metadata, dict) or set(metadata) - {"enabled", "label"} or type(metadata.get("enabled")) is not bool:
+            if (not isinstance(metadata, dict) or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel"}
+                    or type(metadata.get("enabled")) is not bool
+                    or any(key in metadata and type(metadata[key]) is not bool for key in ("auto_checkin", "auto_travel"))):
                 raise ValueError("管理数据库凭证元数据无效")
         return {"revision": row[0], **data}
 
@@ -138,11 +148,35 @@ class ControlStore:
             state["models"][source] = validate_model(source, rule, state["models"], known_models)
         return self._update(revision, change)
 
+    def delete_model(self, source, revision):
+        if type(revision) is not int:
+            raise ValueError("revision 必须为整数")
+        def change(state):
+            if not state["models"].get(source, {}).get("custom"):
+                raise ValueError("只能删除自建模型，目录模型请停用")
+            del state["models"][source]
+        return self._update(revision, change)
+
+
     def set_credential(self, account_key, enabled):
         _identifier(account_key, "账号指纹")
         if type(enabled) is not bool:
             raise ValueError("enabled 必须为布尔值")
         return self._update(None, lambda state: state["credentials"].setdefault(account_key, {}).update(enabled=enabled))
+
+    def set_auto_checkin(self, account_key, enabled):
+        _identifier(account_key, "账号指纹")
+        if type(enabled) is not bool:
+            raise ValueError("auto_checkin 必须为布尔值")
+        return self._update(None, lambda state: state["credentials"].setdefault(
+            account_key, {"enabled": True}).update(auto_checkin=enabled))
+
+    def set_auto_travel(self, account_key, enabled):
+        _identifier(account_key, "账号指纹")
+        if type(enabled) is not bool:
+            raise ValueError("auto_travel 必须为布尔值")
+        return self._update(None, lambda state: state["credentials"].setdefault(
+            account_key, {"enabled": True}).update(auto_travel=enabled))
 
     def close(self):
         with self._lock:

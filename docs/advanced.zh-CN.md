@@ -72,9 +72,11 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `GET /admin/credentials` | 凭证列表与运行状态 |
 | `POST /admin/credentials` | 从服务端受控目录导入 `.info` |
 | `DELETE /admin/credentials/{name}` | 按文件名删除凭证文件；仍被模型绑定引用时返回 409 |
-| `PATCH /admin/credentials/{id}` | 按账号身份 ID 启停凭证，不删除文件 |
+| `PATCH /admin/credentials/{id}` | 按账号设置单个布尔字段：`enabled`、`auto_checkin` 或 `auto_travel`；保存自动任务开关不立即领取 |
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | 发起与轮询登录；`site=cn`（默认）、`intl`（国际 WorkBuddy）或 `intl-codebuddy`（国际 CodeBuddy） |
-| `GET /admin/credits` · `POST /admin/checkin` | 查询额度、手动触发签到与额度同步 |
+| `GET /admin/credits` · `POST /admin/checkin` | 查询额度；按日幂等签到，国内按开关继续旅行 |
+| `POST /admin/sync` | 同步全部启用账号的余额、目录和用量，不签到、不领取试用 |
+| `POST /admin/credentials/{id}/{action}` | 单账号 `refresh`、`checkin`、`sync`、`travel-status`（仅查询）或 `travel`（领取后派出） |
 
 页面使用 `/dashboard/*`，管理 API 使用 `/admin/*`，客户端保留原 `/v1/*`；不注册 `/cn`、`/intl` API 前缀。模型自动选路不要求客户端改变地址。
 

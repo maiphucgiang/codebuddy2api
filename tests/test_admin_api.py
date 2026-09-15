@@ -375,9 +375,28 @@ class AdminApiTests(unittest.TestCase):
         stale = self.client.patch("/admin/settings", headers=self.headers, json={"revision": 0, "values": {"max_images": 6}})
         self.assertEqual(stale.status_code, 409)
 
+    def test_model_inventory_uses_revision_after_identity_sync(self):
+        def inventory():
+            self.store.update_model("custom:synced", {"public_id": "synced-model", "upstream_id": "upstream", "custom": True}, 0)
+            return [{"id": "custom:synced", "public_id": "synced-model", "upstream_id": "upstream", "custom": True}]
+        self.gateway.admin_model_inventory.side_effect = inventory
+        response = self.client.get("/admin/models", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["revision"], 1)
+        self.assertEqual(response.json()["models"][0]["public_id"], "synced-model")
+
+
+    def test_dashboard_granularity_is_validated_and_forwarded(self):
+        response = self.client.get("/admin/dashboard?days=1&granularity=hour", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.audit.dashboard.assert_called_with(1, granularity="hour")
+        for value in ("week", "minute", "unknown"):
+            self.assertEqual(self.client.get("/admin/dashboard?days=1&granularity=" + value, headers=self.headers).status_code, 400)
+
+
     def test_model_rules_preview_and_credential_constraints(self):
         response = self.client.put("/admin/models/upstream", headers=self.headers,
-                                    json={"revision": 0, "public_id": "public", "credential_ids": ["fingerprint"], "region": "cn"})
+                                    json={"revision": 0, "public_id": "public", "credential_ids": ["fingerprint"]})
         self.assertEqual(response.status_code, 200, response.text)
         models = self.client.get("/admin/models", headers=self.headers).json()
         self.assertEqual(models["models"][0]["public_id"], "public")

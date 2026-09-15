@@ -67,7 +67,7 @@ from app.adapters.anthropic_adapter import (
 
 from app import auth_oauth
 from app import trial_rewards
-from app import model_policy
+from app import checkin as checkin_service, model_policy, travel
 from app.model_blocks import ModelBlocks
 from app.observability import (AuditMiddleware, observe_recovery, observe_route,
                                observe_usage, observe_attempt, observe_failure)
@@ -718,8 +718,8 @@ class CredentialPool:
         except (TypeError, ValueError):
             return False
 
-    def _eligible(self, entry, model, *, region=None, profile=None):
-        if not model_policy.route_allowed(CONFIG, entry, model):
+    def _eligible(self, entry, model, *, region=None, profile=None, rule=None):
+        if not model_policy.route_allowed(CONFIG, entry, model, rule=rule):
             return False
         actual = self._entry_profile(entry)
         profile = profile or actual
@@ -1123,7 +1123,7 @@ def _sync_trial(headers):
         _log(f"[trial] 领取失败（不影响余额同步）: {_network_error_text(error)}")
 
 
-def _sync_credits(pool, ledger, entry, *, checkin, failed):
+def _sync_credits(pool, ledger, entry, *, checkin, failed, claim_trial=True, expected_identity=None):
     if not model_policy.credential_enabled(CONFIG, entry):
         return None
     cm, cid = entry["cm"], entry["id"]
@@ -1131,17 +1131,33 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed):
     try:
         with cm._lock:
             try:
+                if expected_identity is not None and cm.summary().get("account_key") != expected_identity:
+                    failed.add(cid)
+                    return None
                 headers = cm.get_headers()
             finally:
                 generation = cm._generation
+        profile = profile_for_headers(headers)
+        identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
+        if entry.get("account_key") and entry["account_key"] != identity:
+            failed.add(cid)
+            return None  # A path now owned by another account must be rescheduled with its own preferences.
         site = site_for_headers(headers)
         token, uid, domain = _bearer_token(headers), headers.get("X-User-Id", ""), headers.get("X-Domain", "")
         day = time.strftime("%Y-%m-%d")
-        if checkin and not ledger.checkin_done(cid, day):
+        if checkin and model_policy.credential_auto_checkin(CONFIG, entry) and not ledger.checkin_done(cid, day):
             try:
-                result = credits_mod.daily_checkin(token, uid=uid, domain=domain)
-                if not pool.apply_if_current(cm, generation, lambda: ledger.mark_checkin(
-                        cid, day, result["ok"], result.get("code"), result.get("message", ""))):
+                def can_claim():
+                    return (model_policy.credential_auto_checkin(CONFIG, entry)
+                            and pool.apply_if_current(cm, generation, lambda: None))
+                result = checkin_service.perform(token, uid=uid, domain=domain, can_claim=can_claim)
+                if result["state"] == "cancelled":
+                    if not pool.apply_if_current(cm, generation, lambda: None):
+                        failed.add(cid)
+                        return None
+                    # A preference-only cancellation must not interrupt balance refresh.
+                elif not pool.apply_if_current(cm, generation, lambda: ledger.mark_checkin(
+                        cid, day, result["ok"], result.get("code"), result["message"], state=result["state"])):
                     failed.add(cid)
                     return None
                 _log(f"[checkin] {Path(cid).name}: ok={result['ok']} already={result.get('already')} code={result.get('code')}")
@@ -1149,7 +1165,19 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed):
                 _sync_error(pool, ledger, entry, generation, "checkin", error)
         if not model_policy.credential_enabled(CONFIG, entry):
             return None
-        _sync_trial(headers)
+        if checkin and model_policy.credential_auto_travel(CONFIG, entry):
+            try:
+                def can_travel():
+                    return (model_policy.credential_auto_travel(CONFIG, entry)
+                            and pool.apply_if_current(cm, generation, lambda: None))
+                trip = travel.perform(token, profile_for_headers(headers), can_write=can_travel)
+                if not pool.apply_if_current(cm, generation, lambda: travel.remember(ledger, cid, trip)):
+                    failed.add(cid)
+                    return None
+            except Exception as error:
+                _sync_error(pool, ledger, entry, generation, "travel", error)
+        if claim_trial:
+            _sync_trial(headers)
         if not model_policy.credential_enabled(CONFIG, entry):
             return None
         balance = credits_mod.fetch_credits(token, uid=uid, domain=domain)
@@ -1228,18 +1256,25 @@ def _sync_model_catalogs(pool, ledger, refs, failed):
     _publish_model_cache()
 
 
-def _sync_usage(pool):
+def _sync_usage(pool, entries=None, expected_identity=None):
     """历史用量仅在定时/手动维护时同步；每账号独立快照，单账号失败只替换自身数据。"""
     accounts = CONFIG.get("usage_daily_accounts")
     if not isinstance(accounts, dict):
         accounts = CONFIG["usage_daily_accounts"] = {}
-    stale = set()
-    for entry in pool.entries():
+    targets = pool.entries() if entries is None else entries
+    target_ids = {entry["id"] for entry in targets}
+    previous_stale = set((CONFIG.get("usage_daily") or {}).get("stale_accounts", []))
+    stale = {entry["id"] for entry in pool.entries()
+             if entry["id"] not in target_ids and Path(entry["id"]).name in previous_stale}
+    for entry in targets:
         if not model_policy.credential_enabled(CONFIG, entry):
             continue
         try:
             cm = entry["cm"]
             with cm._lock:
+                if expected_identity is not None and cm.summary().get("account_key") != expected_identity:
+                    stale.add(entry["id"])
+                    continue
                 headers = cm.get_headers()
                 generation = cm._generation
             site = site_for_headers(headers)
@@ -1251,11 +1286,13 @@ def _sync_usage(pool):
                                          "requests": usage["requests"],
                                          "partial": bool(usage.get("partial")),
                                          "fetched_at": time.time()}
-            pool.apply_if_current(cm, generation, store)
+            if not pool.apply_if_current(cm, generation, store):
+                stale.add(entry["id"])
         except Exception as error:
             stale.add(entry["id"])
             _log(f"[usage] {Path(entry['id']).name} 明细拉取失败（保留其上次成功快照）: {_network_error_text(error)}")
     _publish_usage_daily(pool, stale)
+    return stale & target_ids
 
 
 def _publish_usage_daily(pool, stale=()):
@@ -1786,13 +1823,29 @@ def admin_model_blocks(authorization: Optional[str] = Header(default=None),
 @app.post("/admin/checkin")
 def admin_checkin(authorization: Optional[str] = Header(default=None),
                   x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """手动触发一轮签到 + 积分刷新（签到按日幂等，已签则只刷积分）。"""
+    """手动签到（按日幂等），余额和用量由独立同步操作更新。"""
     _check_admin_auth(authorization, x_api_key)
-    pool, ledger = CONFIG.get("cred_pool"), CONFIG.get("ledger")
-    if pool is None or ledger is None:
-        raise HTTPException(status_code=503, detail={"error": {"message": "签到调度未启用", "type": "invalid_request_error"}})
-    _housekeep_once(pool, ledger)
-    return {"credits": ledger.snapshot()}
+    return _admin_credential_action("checkin")
+
+
+def _admin_credential_action(action, identity=None):
+    from app.credential_actions import run
+    return run(sys.modules[__name__], action, identity)
+
+
+@app.post("/admin/sync")
+def admin_sync(authorization: Optional[str] = Header(default=None),
+               x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    _check_admin_auth(authorization, x_api_key)
+    return _admin_credential_action("sync")
+
+
+@app.post("/admin/credentials/{identity}/{action}")
+def admin_credential_action(identity: str, action: str,
+                            authorization: Optional[str] = Header(default=None),
+                            x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    _check_admin_auth(authorization, x_api_key)
+    return _admin_credential_action(action, identity)
 
 
 # ---------------------------------------------------------------------------
@@ -3501,7 +3554,8 @@ def main():
     sys.stderr.write("   添加账号：python3 converter.py login（自动等待扫码并保存）\n")
     if credits_mod is not None:
         sys.stderr.write("   GET  /admin/credits           (积分/签到状态)\n")
-        sys.stderr.write("   POST /admin/checkin           (手动触发签到+积分刷新)\n")
+        sys.stderr.write("   POST /admin/checkin           (仅签到，按日幂等)\n")
+        sys.stderr.write("   POST /admin/sync              (同步余额、目录与用量，不签到)\n")
         sys.stderr.write("   每日签到 + 快过期积分优先调度已启用\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")

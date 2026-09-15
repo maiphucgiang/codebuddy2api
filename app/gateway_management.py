@@ -8,7 +8,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.staticfiles import StaticFiles
 
-from . import model_policy
+from . import checkin, model_policy, travel
 
 
 class Management:
@@ -43,6 +43,11 @@ class Management:
                 state = ("disabled" if not enabled else "error" if row.get("error") else
                          "circuit_open" if until > now else "expired" if row.get("token_expired") else "ready")
                 row.update(id=identity, name=Path(path).name, enabled=enabled, health=state,
+                           auto_checkin=model_policy.credential_auto_checkin(self.CONFIG, entry),
+                           checkin=checkin.view(balance.get("checkin") or {}),
+                           auto_travel=model_policy.credential_auto_travel(self.CONFIG, entry),
+                           travel_supported=travel.supported(entry.get("profile")),
+                           travel=balance.get("travel") or {"state": "unknown", "message": "尚未查询旅行状态"},
                            fail_until=until, cooldown_until=until,
                            cooldown_remaining=max(0, round(until - now)),
                            last_error_code=("http_401" if entry.get("last_error") == "backend HTTP 401" else
@@ -52,7 +57,7 @@ class Management:
                            cooldowns=cooldowns, credits=balance.get("credits") or None,
                            sync_pending=path in pool._sync_pending or path in pool._syncing or path in pool._sync_retry,
                            catalog_ready=(self.CONFIG.get("account_catalogs") or {}).get(identity, {}).get("models") is not None,
-                           bindings=[source for source, rule in model_policy.snapshot(self.CONFIG)["models"].items()
+                           bindings=[rule.get("public_id", source) for source, rule in model_policy.snapshot(self.CONFIG)["models"].items()
                                      if identity in rule.get("credential_ids", [])])
                 result.append(row)
             return result
@@ -76,6 +81,28 @@ class Management:
                     pool._sync_event.clear()
             self.gateway.invalidate_model_table()
         return next(row for row in self.admin_credential_inventory() if row["id"] == identity)
+
+    def admin_set_auto_checkin(self, identity, enabled):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            if not any(entry.get("account_key") == identity for entry in pool.entries()):
+                raise HTTPException(404, "凭证不存在")
+            self.CONFIG["control_store"].set_auto_checkin(identity, enabled)
+        # Persist only: enabling does not launch a claim or enqueue unrelated synchronization.
+
+    def admin_set_auto_travel(self, identity, enabled):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            if enabled and not travel.supported(entry.get("profile")):
+                raise HTTPException(400, "旅行仅适用于国内账号")
+            self.CONFIG["control_store"].set_auto_travel(identity, enabled)
 
     def admin_delete_guard(self, name):
         rows = self.admin_credential_inventory()
@@ -106,11 +133,13 @@ class Management:
         for source, row in facts.items():
             rule = model_policy.rule_for(self.CONFIG, source)
             preview = self.admin_model_preview(source, rule)
-            result.append({**row, **rule, "available_credentials": len(preview["candidates"]),
+            target = facts.get(rule["upstream_id"], row)
+            result.append({**target, **rule, "id": source, "available_credentials": len(preview["candidates"]),
                            "available": bool(preview["candidates"])})
         return sorted(result, key=lambda row: row["id"])
 
     def admin_model_preview(self, source, rule):
+        upstream = rule.get("upstream_id", source)
         pool = self.CONFIG.get("cred_pool")
         accepted, rejected = [], []
         if pool is None:
@@ -128,20 +157,20 @@ class Management:
                     reason = "不在绑定范围"
                 elif not pool._healthy(entry):
                     reason = "认证熔断"
-                elif not pool._model_healthy(entry, source):
+                elif not pool._model_healthy(entry, upstream):
                     reason = "模型额度冷却"
-                else:
+                elif not pool._model_servable(entry, upstream):
+                    reason = "后端模型暂时不可用"
+                elif not pool._eligible(entry, upstream, rule=rule):
                     account = (self.CONFIG.get("account_catalogs") or {}).get(identity, {})
                     models = self.gateway._account_scope(account, "serves")
-                    if self.CONFIG.get("account_catalogs") is not None:
-                        if models is None:
-                            reason = "目录尚未就绪"
-                        elif not any(item["id"] == self.gateway._upstream_model(source, profile)
-                                     for item in self.gateway._usable_models(models)) and not (
-                                         source == "auto" and profile == "cn-cli" and self.gateway._usable_models(models)):
-                            reason = "账号自身目录不支持模型"
-                    if reason is None and not (pool._has_credit(entry, profile) or pool._model_free(entry, source)):
+                    if (self.CONFIG.get("account_catalogs") is not None or self.CONFIG.get("model_cache") is not None) and (
+                            models is None or account.get("profile") != profile):
+                        reason = "目录尚未就绪"
+                    elif not (pool._has_credit(entry, profile) or pool._model_free(entry, upstream)):
                         reason = "额度不足或未知"
+                    else:
+                        reason = "账号自身目录不支持模型"
                 item = {"id": identity, "name": Path(entry["id"]).name, "profile": profile}
                 if reason:
                     rejected.append({**item, "reason": reason})

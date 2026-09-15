@@ -38,7 +38,7 @@ class UnavailableAudit:
         return {"available": False, "degraded": True, "last_error": self.code, "dropped": self.dropped,
                 "warning": "日志存储不可用；保留原文件，未自动重建。统计可能不完整。"}
 
-    def dashboard(self, days=30):
+    def dashboard(self, days=30, granularity="auto"):
         return {"summary": None, "series": [], "models": [], "profiles": [], "degraded": True, "storage": self.storage()}
 
     def list_records(self, *args, **kwargs):

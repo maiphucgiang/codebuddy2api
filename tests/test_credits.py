@@ -86,7 +86,7 @@ def test_financial_hints_rejected_before_network():
 
 
 def test_financial_profile_hosts_and_web_headers():
-    """三类财务请求传递 domain，使用各自品牌 Web 协议而非目录 CLI 身份头。"""
+    """各品牌不混用，签到走桌面 Bearer 协议，余额和用量保留 Web 协议。"""
     for domain in ("www.codebuddy.cn", "copilot.tencent.com", "www.workbuddy.cn",
                    "www.codebuddy.ai", "www.workbuddy.ai"):
         host = "https://" + ("www.codebuddy.cn" if domain == "copilot.tencent.com" else domain)
@@ -104,12 +104,15 @@ def test_financial_profile_hosts_and_web_headers():
             args, kwargs = client.post.call_args
             assert args == (host + path,)
             headers = httpx.Headers(kwargs["headers"])
-            assert headers["x-client-platform"] == "web"
-            assert headers["origin"] == host
-            assert headers["referer"] == host + "/profile/plans-usage"
+            if operation is credits.daily_checkin:
+                assert "x-client-platform" not in headers and "origin" not in headers and "referer" not in headers
+            else:
+                assert headers["x-client-platform"] == "web"
+                assert headers["origin"] == host
+                assert headers["referer"] == host + "/profile/plans-usage"
+                assert headers["user-agent"] == credits.BROWSER_UA
             assert headers["authorization"] == "Bearer opaque"
             assert headers["x-user-id"] == "test-user" and headers["x-domain"] == domain
-            assert headers["user-agent"] == credits.BROWSER_UA
             assert headers["content-type"] == "application/json"
             assert "x-ide-type" not in headers
             assert kwargs["timeout"] == credits.REQUEST_TIMEOUT

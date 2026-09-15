@@ -7,10 +7,11 @@
 - 支持 Chat Completions、Responses 和 Anthropic Messages，包含工具调用与流式输出。
 - 内置 **WebUI**：扫码添加账号，管理模型、凭证、日志与设置，无需桌面端。
 - 多账号自动选路，兼容国内／国际站，自动刷新凭证。
+- 按账号配置自动任务：国内默认签到后派 Buddy 旅行，可分别关闭；国际自动签到默认关闭。
 
 ## 快速开始
 
-需要 Git 和 Docker Compose；以下方式从源码构建，已包含 WebUI。
+需要 Git 和 Docker Compose；直接拉取 GHCR 已构建镜像，无需在本机编译。
 
 ```bash
 git clone https://github.com/maiphucgiang/codebuddy2api.git
@@ -18,12 +19,18 @@ cd codebuddy2api
 cp .env.example .env
 ```
 
-编辑 `.env`，将 `CODEBUDDY2API_KEY` 设置为你自己的随机密钥；已有 `.env` 请勿覆盖。然后启动：
+首次部署时编辑 `.env`，将 `CODEBUDDY2API_KEY` 设置为自己的随机密钥，并指定镜像；已有 `.env` 请保留：
+
+```dotenv
+CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebuddy2api:latest
+```
 
 ```bash
-docker compose build
-docker compose up -d
+docker compose pull
+docker compose up -d --no-build
 ```
+
+`latest` 跟随稳定发行版；需固定部署时改用已发布的版本标签。镜像功能以对应版本为准，不包含尚未合并的源码分支改动。
 
 1. 打开 **http://127.0.0.1:8787/dashboard**，使用刚设置的 API key 登录。
 2. 在「凭证管理」扫码添加国内或国际账号，也可导入 `.info` 文件。
@@ -31,7 +38,17 @@ docker compose up -d
 
 按模板配置时仅允许本机访问。远程访问前请配置 HTTPS 并限制网络访问；保留并妥善备份 `auth/` 数据目录。
 
-[使用发布镜像或本地 Python 运行 →](docs/deployment.zh-CN.md)
+### 本地运行当前源码
+
+安装 Python 3.12+、uv、Node.js 与 vp CLI，并按上面配置 `.env`：
+
+```bash
+uv sync --locked --no-build --python 3.12
+(cd web && vp install --frozen-lockfile && vp build)
+uv run --locked --no-build --env-file .env converter.py --desensitize
+```
+
+[开发用镜像构建、命令行登录与部署详情 →](docs/deployment.zh-CN.md)
 
 ## 客户端接入
 

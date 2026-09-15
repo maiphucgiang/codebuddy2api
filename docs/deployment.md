@@ -48,10 +48,9 @@ After editing `.env`, repeat the appropriate `docker compose up -d` command to r
 Requires Python, uv, and Node.js with the vp CLI to build the interface:
 
 ```bash
-uv venv
-uv pip install --require-hashes --only-binary=:all: -r requirements.txt
+uv sync --locked --no-build --python 3.12
 (cd web && vp install --frozen-lockfile && vp build)
-uv run --env-file .env converter.py --desensitize
+uv run --locked --no-build --env-file .env converter.py --desensitize
 ```
 
 Configure `.env` as above before starting, then open `/dashboard` to add accounts. Rebuild the WebUI after changing frontend source.
@@ -62,13 +61,14 @@ Local Python binding uses `--host` and `--port`. Compose-only `CODEBUDDY2API_BIN
 
 ## Dependency locks
 
-`requirements.in` lists direct dependencies; install the committed, hash-locked `requirements.txt`. To regenerate it with uv:
+`pyproject.toml` owns direct dependencies; `uv.lock` pins all resolved versions. `requirements.in` and the hash-locked `requirements.txt` are generated compatibility files for pip, Docker and CI:
 
 ```bash
-uv pip compile --universal --python-version 3.12 --no-python-downloads --generate-hashes requirements.in -o requirements.txt
+uv lock
+python3 scripts/export_requirements.py
 ```
 
-Existing pins are reused; use `--upgrade-package NAME` only for deliberate updates and review the lockfile diff. Installation requires matching binary wheels and hashes; fix the lock or roll back rather than disabling those checks.
+Use `uv add`/`uv remove` for intentional dependency changes, then export and review both locks. Normal startup uses `--locked` and never upgrades packages. Metadata stays at the current `VERSION`; releases must update both version fields. Pip/Docker still require matching hashes and binary wheels; do not disable these checks.
 
 Docker's build frontend, Node and Python images are pinned by multi-platform digest. When refreshing them, retain `linux/amd64` and `linux/arm64` support and verify the build. Locks prevent drift, not future vulnerabilities; security updates still require reviewed refreshes.
 
@@ -78,9 +78,9 @@ Docker's build frontend, Node and Python images are pinned by multi-platform dig
 When the WebUI is unavailable, browser login also works without starting the server:
 
 ```bash
-uv run --env-file .env converter.py login
-uv run --env-file .env converter.py login --site intl --no-browser
-uv run --env-file .env converter.py login --site intl-codebuddy --no-browser
+uv run --locked --no-build --env-file .env converter.py login
+uv run --locked --no-build --env-file .env converter.py login --site intl --no-browser
+uv run --locked --no-build --env-file .env converter.py login --site intl-codebuddy --no-browser
 ```
 
 The first command uses the domestic site. `--site intl` selects international WorkBuddy (`www.workbuddy.ai`); `--site intl-codebuddy` selects international CodeBuddy (`www.codebuddy.ai`). `--no-browser` prints a link you can open on another device. Even after the browser reports success, wait for the terminal to confirm that credentials were saved. Links expire after 10 minutes; press `Ctrl+C` to cancel.

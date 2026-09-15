@@ -7,10 +7,11 @@ Use your **WorkBuddy / CodeBuddy (Tencent)** subscription as local **OpenAI- and
 - Chat Completions, Responses and Anthropic Messages, with tool calling and streaming.
 - Built-in **WebUI** for browser login, models, credentials, logs and settings — no desktop client required.
 - Automatic multi-account routing across domestic and international sites, with credential refresh.
+- Per-account automation: domestic check-in then Buddy travel by default, with independent switches; international check-in is opt-in.
 
 ## Quick start
 
-Requires Git and Docker Compose. This builds from source and includes the WebUI.
+Requires Git and Docker Compose. Use the prebuilt GHCR image; no local build is needed.
 
 ```bash
 git clone https://github.com/maiphucgiang/codebuddy2api.git
@@ -18,12 +19,18 @@ cd codebuddy2api
 cp .env.example .env
 ```
 
-Edit `.env` and set `CODEBUDDY2API_KEY` to your own random key; do not overwrite an existing `.env`. Then start:
+For first setup, edit `.env`, set `CODEBUDDY2API_KEY` to your own random key, and choose the image below. Preserve an existing `.env`:
+
+```dotenv
+CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebuddy2api:latest
+```
 
 ```bash
-docker compose build
-docker compose up -d
+docker compose pull
+docker compose up -d --no-build
 ```
+
+`latest` tracks stable releases; pin a published version tag for reproducible deployments. Image features belong to that version, not to unmerged source branches.
 
 1. Open **http://127.0.0.1:8787/dashboard** and sign in with that API key.
 2. In **Credentials**, add a domestic or international account through browser login, or import an `.info` file.
@@ -31,7 +38,17 @@ docker compose up -d
 
 The template binds to localhost only. Configure HTTPS and restrict network access before allowing remote connections; keep and securely back up the `auth/` data directory.
 
-[Published images and local Python setup →](docs/deployment.md)
+### Run current source locally
+
+With Python 3.12+, uv, Node.js and the vp CLI installed, prepare `.env` as above:
+
+```bash
+uv sync --locked --no-build --python 3.12
+(cd web && vp install --frozen-lockfile && vp build)
+uv run --locked --no-build --env-file .env converter.py --desensitize
+```
+
+[Source image builds, CLI login and deployment details →](docs/deployment.md)
 
 ## Client setup
 

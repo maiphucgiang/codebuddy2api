@@ -48,10 +48,9 @@ docker compose up -d --no-build
 需要 Python、uv，以及构建界面的 Node.js 和 vp CLI：
 
 ```bash
-uv venv
-uv pip install --require-hashes --only-binary=:all: -r requirements.txt
+uv sync --locked --no-build --python 3.12
 (cd web && vp install --frozen-lockfile && vp build)
-uv run --env-file .env converter.py --desensitize
+uv run --locked --no-build --env-file .env converter.py --desensitize
 ```
 
 先按上文配置 `.env`，再启动服务并进入 `/dashboard` 添加账号。更改前端源码后需重新构建 WebUI。
@@ -62,13 +61,14 @@ uv run --env-file .env converter.py --desensitize
 
 ## 依赖锁定
 
-`requirements.in` 维护直接依赖；安装使用已提交、带哈希的 `requirements.txt`。用 uv 重新生成：
+`pyproject.toml` 是直接依赖入口，`uv.lock` 锁定完整依赖；`requirements.in` 和带哈希的 `requirements.txt` 是供 pip、Docker、CI 使用的生成文件：
 
 ```bash
-uv pip compile --universal --python-version 3.12 --no-python-downloads --generate-hashes requirements.in -o requirements.txt
+uv lock
+python3 scripts/export_requirements.py
 ```
 
-默认沿用已有固定版本；有意升级时再用 `--upgrade-package NAME`，并审阅锁文件差异。安装要求匹配的二进制 wheel 和哈希；失败时修正锁文件或回退，不关闭检查。
+有意改动依赖时使用 `uv add`/`uv remove`，然后导出并审阅锁文件差异。日常启动使用 `--locked`，不升级依赖；项目元数据版本保持与 `VERSION` 一致，发版时同步两处。pip/Docker 安装仍要求二进制 wheel 与哈希匹配，不关闭检查。
 
 Docker 构建前端、Node 和 Python 镜像按多架构 digest 固定。更新时保留 `linux/amd64`、`linux/arm64` 并验证构建。锁定防止漂移，不代替后续安全更新。
 
@@ -78,9 +78,9 @@ Docker 构建前端、Node 和 Python 镜像按多架构 digest 固定。更新�
 无法使用 WebUI 时也可扫码登录，无需先启动服务：
 
 ```bash
-uv run --env-file .env converter.py login
-uv run --env-file .env converter.py login --site intl --no-browser
-uv run --env-file .env converter.py login --site intl-codebuddy --no-browser
+uv run --locked --no-build --env-file .env converter.py login
+uv run --locked --no-build --env-file .env converter.py login --site intl --no-browser
+uv run --locked --no-build --env-file .env converter.py login --site intl-codebuddy --no-browser
 ```
 
 第一条默认国内站；`--site intl` 登录国际 WorkBuddy（`www.workbuddy.ai`），`--site intl-codebuddy` 登录国际 CodeBuddy（`www.codebuddy.ai`）。`--no-browser` 只显示链接，可在其他设备打开扫码。网页显示登录成功后，仍需等待终端确认「账号已保存」。链接 10 分钟内有效，`Ctrl+C` 可取消。

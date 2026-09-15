@@ -1,6 +1,5 @@
-# Direct dependencies; requirements.txt is the generated, hash-locked install file.
-fastapi
-anyio            # 取消屏蔽：下游断连时仍要把上游连接的收尾做完
-uvicorn[standard]
-httpx
-pytest
+# Generated from pyproject.toml by scripts/export_requirements.py; do not edit.
+fastapi>=0.141.1
+httpx>=0.28.1
+pytest>=9.1.1
+uvicorn[standard]>=0.52.4

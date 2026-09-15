@@ -1,0 +1,15 @@
+[project]
+name = "codebuddy2api"
+version = "1.2.1"
+description = "Personal CodeBuddy API gateway and management interface"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[tool.uv]
+# Run from source, without building/installing the gateway as a Python package.
+package = false

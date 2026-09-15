@@ -66,6 +66,22 @@ class ControlStoreTests(unittest.TestCase):
                 self.store.update_model(source, rule, 1)
         self.assertEqual(self.store.snapshot()["revision"], 1)
 
+    def test_legacy_combined_scopes_load_without_widening_and_require_explicit_edit(self):
+        from app import model_policy
+        legacy = {"public_id": "legacy", "enabled": True, "keep_original": False,
+                  "region": "cn", "profile": None, "credential_ids": ["cn-account", "intl-account"]}
+        self.store._update(0, lambda state: state["models"].update({"real": legacy}))
+        reopened = ControlStore(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.snapshot()["models"]["real"], legacy)
+        config = {"control_store": reopened}
+        self.assertTrue(model_policy.route_allowed(config, {"profile": "cn-cli", "account_key": "cn-account"}, "real"))
+        self.assertFalse(model_policy.route_allowed(config, {"profile": "intl-cli", "account_key": "intl-account"}, "real"))
+        with self.assertRaises(ValueError):
+            reopened.update_model("real", legacy, 1)
+        self.assertEqual(reopened.snapshot()["revision"], 1)
+
+
     def test_credential_metadata_and_no_secret_settings(self):
         self.store.set_credential("account-fingerprint", False)
         self.assertEqual(self.store.snapshot()["credentials"], {"account-fingerprint": {"enabled": False}})

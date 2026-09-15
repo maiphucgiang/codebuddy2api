@@ -172,7 +172,10 @@ class DeploymentTests(unittest.TestCase):
         for filename in ("README.md", "README.zh-CN.md"):
             doc = (ROOT / filename).read_text()
             self.assertIn("cp .env.example .env", doc)
-            self.assertIn("docker compose build", doc)
+            self.assertIn("docker compose pull", doc)
+            self.assertIn("docker compose up -d --no-build", doc)
+            self.assertIn("ghcr.io/maiphucgiang/codebuddy2api:latest", doc)
+            self.assertNotIn("docker compose build", doc)
             self.assertNotRegex(doc, r"\bdocker-compose\s")
 
     def test_readmes_link_guides_and_webui_setup(self):

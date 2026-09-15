@@ -33,7 +33,8 @@ BILLING_PROFILE_HOSTS = {
     "intl-cli": "https://www.codebuddy.ai",
     "intl-work": "https://www.workbuddy.ai",
 }
-CHECKIN_PATHS = ("/billing/meter/daily-checkin", "/v2/billing/meter/daily-checkin")
+CHECKIN_PATHS = ("/v2/billing/meter/daily-checkin",)
+CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
 RESOURCE_PATH = "/v2/billing/meter/get-user-resource"
 CONFIG_PATH = "/v3/config"  # cbc CLI CloudProductProvider 同源：云端模型表
 RESOURCE_PRODUCT_CODE = "p_tcaca"
@@ -103,48 +104,66 @@ def _post_json(client: httpx.Client, url: str, headers: dict, body: dict) -> tup
 # ---------------------------------------------------------------------------
 
 def classify_checkin_result(http_ok: bool, code, message: str) -> dict:
-    """只接受明确成功：code=0；或 code=10001 且文案表明今日已签（幂等）。"""
+    """兼容旧签到文案与桌面业务码，不把活动未开放误判为已领取。"""
     try:
-        ncode = int(code) if code is not None and str(code).strip() != "" else None
-    except (TypeError, ValueError):
+        ncode = int(code) if type(code) in (int, str) else None
+    except ValueError:
         ncode = None
     text = str(message or "")
-    inactive = bool(_INACTIVE_RE.search(text))
-    already = ncode == 10001 and not inactive and bool(_ALREADY_RE.search(text))
+    inactive = ncode == 1003 or bool(_INACTIVE_RE.search(text))
+    already = not inactive and (ncode == 1001 or (ncode == 10001 and bool(_ALREADY_RE.search(text))))
     ok = not inactive and ((ncode == 0 and http_ok) or already)
-    return {"ok": ok, "already": already, "inactive": inactive, "code": ncode, "message": text}
+    state = ("already" if already else "success" if ok else "inactive" if inactive else
+             "not_eligible" if ncode == 1002 else "error")
+    return {"ok": ok, "already": already, "inactive": inactive, "state": state, "code": ncode, "message": text}
+
+
+def _checkin_request(access_token, uid, domain, path):
+    host = hosts_for_token(access_token, domain)[0]
+    headers = {"accept": "application/json", "content-type": "application/json",
+               "authorization": f"Bearer {access_token}", "x-user-id": str(uid or ""),
+               "x-domain": str(domain or "")}
+    url = host + path
+    with httpx.Client() as client:
+        try:
+            status, payload = _post_json(client, url, headers, {})
+        except AuthExpiredError:
+            return 401, {"code": 401}, url
+        except httpx.HTTPError:
+            return 0, {"code": -1}, url
+    return status, payload if isinstance(payload, dict) else {}, url
 
 
 def daily_checkin(access_token: str, uid: str = "", domain: str = "") -> dict:
-    """仅在同 profile host 内切换签到 path；返回 classify 结果 + status/url。"""
-    endpoints = [h + p for h in hosts_for_token(access_token, domain) for p in CHECKIN_PATHS]
-    last_err = "未知错误"
-    first_401: dict | None = None
-    with httpx.Client() as client:
-        for url in endpoints:
-            host = url.split("/v2/billing")[0].split("/billing")[0]  # 先剥 /v2 再剥 /billing 取 origin
-            try:
-                status, payload = _post_json(client, url, _web_headers(host, access_token, uid, domain), {})
-            except AuthExpiredError:
-                first_401 = first_401 or {"ok": False, "already": False, "code": 401,
-                                          "message": "登录身份过期", "status": 401, "url": url}
-                last_err = "登录身份过期"
-                continue
-            except httpx.HTTPError as e:
-                last_err = str(e)
-                continue
-            message = payload.get("msg") or payload.get("message") or ("ok" if 200 <= status < 300 else f"HTTP {status}")
-            result = classify_checkin_result(200 <= status < 300, payload.get("code"), message)
-            result.update(status=status, url=url)
-            if result["ok"]:
-                return result
-            if 400 <= status < 500 and status != 404:
-                return result  # 客户端错误（除 404 换 path）：不再兜底
-            last_err = str(message)
-    if first_401 is not None:
-        return first_401
-    return {"ok": False, "already": False, "inactive": False, "code": -1,
-            "message": last_err, "url": endpoints[0] if endpoints else None}
+    """仅调用同 profile 的桌面 Bearer 接口；发送后失败不重放领取。"""
+    status, payload, url = _checkin_request(access_token, uid, domain, CHECKIN_PATHS[0])
+    message = payload.get("msg") or payload.get("message") or ""
+    result = classify_checkin_result(200 <= status < 300, payload.get("code"), message)
+    if not (200 <= status < 300 or status in (400, 409)):
+        result.update(ok=False, already=False, inactive=False, state="error")
+    result.update(status=status, url=url)
+    return result
+
+
+def fetch_checkin_status(access_token: str, uid: str = "", domain: str = "") -> dict:
+    """查询活动状态；不完整响应不能授权领取。"""
+    status, payload, _ = _checkin_request(access_token, uid, domain, CHECKIN_STATUS_PATH)
+    result = classify_checkin_result(200 <= status < 300, payload.get("code"),
+                                     payload.get("msg") or payload.get("message") or "")
+    if not (200 <= status < 300 or status in (400, 409)):
+        return {"ok": False, "state": "unknown", "code": result["code"]}
+    if result["state"] in {"already", "inactive", "not_eligible"}:
+        return result
+    data = payload.get("data")
+    if not (200 <= status < 300 and result["code"] == 0 and isinstance(data, dict)
+            and type(data.get("active")) is bool):
+        return {"ok": False, "state": "unknown", "code": result["code"]}
+    if not data["active"]:
+        return {"ok": False, "state": "inactive", "code": 0}
+    if type(data.get("today_checked_in")) is not bool:
+        return {"ok": False, "state": "unknown", "code": 0}
+    return {"ok": data["today_checked_in"], "already": data["today_checked_in"],
+            "state": "already" if data["today_checked_in"] else "available", "code": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +706,19 @@ class CreditLedger:
             c = self._entry(cred_id).get("checkin") or {}
             return c.get("date") == day and c.get("ok") is True
 
-    def mark_checkin(self, cred_id: str, day: str, ok: bool, code, message: str):
+    def mark_checkin(self, cred_id: str, day: str, ok: bool, code, message: str, *, state=None):
         with self._lock:
             self._entry(cred_id)["checkin"] = {
                 "date": day, "ok": bool(ok), "code": code,
                 "message": str(message or "")[:200], "at": time.time(),
             }
+            if state is not None:
+                self._entry(cred_id)["checkin"]["state"] = state
+            self._save()
+
+    def update_travel(self, cred_id: str, result: dict):
+        with self._lock:
+            self._entry(cred_id)["travel"] = deepcopy(result)
             self._save()
 
     # ---- 积分 ----

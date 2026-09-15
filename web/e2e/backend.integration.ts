@@ -30,6 +30,25 @@ test("real management API: session, model alias, audit, clear, and file credenti
   });
   expect(generated.status()).toBe(200);
   expect((await generated.json()).model).toBe("garden-fixture");
+  await page.getByRole("button", { name: "新增模型" }).click();
+  await page.getByLabel("对外 ID").fill("mapped-fixture");
+  await page.getByLabel("上游 ID").fill("fixture-model");
+  await page.getByRole("radio", { name: /指定账号/ }).check();
+  await page.getByRole("checkbox", { name: /fixture.info/ }).check();
+  await page.getByRole("button", { name: "创建模型" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const mapped = await page.request.post("/v1/chat/completions", {
+    headers: { Authorization: "Bearer synthetic-e2e-key" },
+    data: {
+      model: "mapped-fixture",
+      stream: false,
+      messages: [{ role: "user", content: "synthetic mapping" }],
+    },
+  });
+  expect(mapped.status()).toBe(200);
+  expect((await mapped.json()).model).toBe("mapped-fixture");
+  const credentials = (await (await page.request.get("/admin/credentials")).json()).credentials;
+  expect(credentials[0].bindings).toContain("mapped-fixture");
   await page.getByRole("link", { name: "日志审计" }).click();
   await expect(page.getByText("garden-fixture", { exact: true }).first()).toBeVisible();
   await page.screenshot({ path: "test-results/backend-real-audit.png", fullPage: true });

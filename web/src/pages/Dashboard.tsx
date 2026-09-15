@@ -1,6 +1,15 @@
 import { useState } from "react";
 import { list, metric, number, object, text, useResource, type RecordValue } from "../api";
-import { Badge, Empty, Fields, Icon, PageTitle, Panel, ResourceState } from "../components";
+import {
+  Badge,
+  Empty,
+  Fields,
+  Icon,
+  PageTitle,
+  Panel,
+  ResourceState,
+  profileLabel,
+} from "../components";
 import s from "../ui.module.scss";
 function normalize(value: unknown): RecordValue & {
   summary: RecordValue;
@@ -9,6 +18,7 @@ function normalize(value: unknown): RecordValue & {
   profiles: RecordValue[];
   health: RecordValue;
   storage: RecordValue;
+  range: RecordValue;
 } {
   const d = object(value);
   for (const field of ["series", "models", "profiles"]) {
@@ -23,6 +33,7 @@ function normalize(value: unknown): RecordValue & {
     profiles: list(d.profiles, "产品分布"),
     health: object(d.health, "健康状态"),
     storage: object(d.storage, "存储状态"),
+    range: d.range === undefined ? {} : object(d.range, "统计窗口"),
   };
 }
 function Health({ data }: { data: RecordValue }) {
@@ -35,7 +46,7 @@ function Health({ data }: { data: RecordValue }) {
         <div key={i}>
           <div>
             <strong>{text(c.name ?? c.filename)}</strong>
-            <small>{text(c.profile)}</small>
+            <small>{profileLabel(text(c.profile))}</small>
           </div>
           <div>
             <Badge tone={c.enabled === false ? "neutral" : c.health === "ready" ? "good" : "warn"}>
@@ -97,83 +108,15 @@ function bytes(value: unknown) {
   if (n < 1048576) return `${(n / 1024).toFixed(1)} KiB`;
   return `${(n / 1048576).toFixed(1)} MiB`;
 }
-export function Trend({ rows }: { rows: RecordValue[] }) {
-  if (!rows.length) return <Empty title="当前时间范围内暂无请求" />;
-  const max = Math.max(1, ...rows.map((r) => number(r.requests) ?? 0));
-  const xAt = (index: number) => (rows.length === 1 ? 390 : 30 + (index * 720) / (rows.length - 1));
-  const points = rows
-    .map((r, i) => `${xAt(i)},${180 - ((number(r.requests) ?? 0) / max) * 145}`)
-    .join(" ");
-  return (
-    <>
-      <svg viewBox="0 0 780 220" className={s.chart} role="img" aria-label="按日请求量趋势">
-        <defs>
-          <linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1">
-            <stop stopColor="#78AD48" stopOpacity=".22" />
-            <stop offset="1" stopColor="#78AD48" stopOpacity="0" />
-          </linearGradient>
-        </defs>
-        {[35, 83, 131, 180].map((y) => (
-          <line key={y} x1="30" y1={y} x2="750" y2={y} stroke="#e4eadd" strokeDasharray="4 5" />
-        ))}
-        {rows.length > 1 && (
-          <>
-            <polygon points={`30,180 ${points} 750,180`} fill="url(#chartFill)" />
-            <polyline points={points} stroke="#78AD48" strokeWidth="3" fill="none" />
-          </>
-        )}
-        {rows.map((r, i) => (
-          <circle
-            key={i}
-            cx={xAt(i)}
-            cy={180 - ((number(r.requests) ?? 0) / max) * 145}
-            r="3.5"
-            fill="#3F7028"
-          >
-            <title>
-              {text(r.date)} · {metric(r.requests)} 请求
-            </title>
-          </circle>
-        ))}
-        <text x={xAt(0)} y="209" textAnchor={rows.length === 1 ? "middle" : "start"}>
-          {text(rows[0].date)}
-        </text>
-        {rows.length > 1 && (
-          <text x="750" y="209" textAnchor="end">
-            {text(rows.at(-1)?.date)}
-          </text>
-        )}
-      </svg>
-      <details className={s.chartData}>
-        <summary>查看趋势数据表</summary>
-        <table>
-          <thead>
-            <tr>
-              <th>日期</th>
-              <th>请求</th>
-              <th>成功</th>
-              <th>失败</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r, i) => (
-              <tr key={i}>
-                <td>{text(r.date)}</td>
-                <td>{metric(r.requests)}</td>
-                <td>{metric(r.success)}</td>
-                <td>{metric(r.error)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </details>
-    </>
-  );
-}
+import { Trend } from "../Trend";
+export { Trend } from "../Trend";
 export function Dashboard() {
   const [days, setDays] = useState("7");
-  const resource = useResource(`/dashboard?days=${days}`, normalize);
+  const [granularity, setGranularity] = useState("auto");
+  const resource = useResource(`/dashboard?days=${days}&granularity=${granularity}`, normalize);
   const d = resource.data;
+  const period = d?.range ?? {};
+  const actualGrain = period.granularity === "hour" ? "hour" : "day";
   const rate = number(d?.summary.success_rate);
   return (
     <>
@@ -191,6 +134,15 @@ export function Dashboard() {
                   最近 {n} 天
                 </option>
               ))}
+            </select>
+            <select
+              aria-label="统计粒度"
+              value={granularity}
+              onChange={(e) => setGranularity(e.target.value)}
+            >
+              <option value="auto">自动粒度</option>
+              <option value="hour">按小时</option>
+              <option value="day">按天</option>
             </select>
             <button onClick={resource.reload}>
               <Icon name="refresh" />
@@ -226,8 +178,17 @@ export function Dashboard() {
             ))}
           </div>
           <div className={s.dashboardGrid}>
-            <Panel title="请求趋势" hint={`最近 ${days} 天 · UTC`} className={s.trend}>
-              <Trend rows={d.series} />
+            <Panel
+              title="请求趋势"
+              hint={`最近 ${days} 天 · UTC 自然日 · ${actualGrain === "hour" ? "按小时" : "按天"}`}
+              className={s.trend}
+            >
+              {period.partial === true && (
+                <p className={s.note} role="status">
+                  小时记录不完整，仅展示已记录时段；可切换按天查看完整统计。
+                </p>
+              )}
+              <Trend rows={d.series} granularity={actualGrain} partial={period.partial === true} />
             </Panel>
             <Panel title="产品分布" hint="按请求量">
               {d.profiles.length ? (
@@ -238,13 +199,13 @@ export function Dashboard() {
                     return (
                       <div key={i}>
                         <div>
-                          <strong>{text(p.profile) || "未选路"}</strong>
+                          <strong>{profileLabel(text(p.profile))}</strong>
                           <span>{metric(p.requests)}</span>
                         </div>
                         <progress
                           max={total || 1}
                           value={count ?? 0}
-                          aria-label={`${text(p.profile) || "未选路"} 请求占比`}
+                          aria-label={`${profileLabel(text(p.profile))} 请求占比`}
                         />
                       </div>
                     );

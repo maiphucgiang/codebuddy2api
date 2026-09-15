@@ -72,9 +72,11 @@ Use a source/image build and Compose configuration containing this feature; recr
 | `GET /admin/credentials` | Credential inventory and runtime state |
 | `POST /admin/credentials` | Import an `.info` file from the server's controlled directory |
 | `DELETE /admin/credentials/{name}` | Delete the credential file by filename; returns 409 while referenced by model bindings |
-| `PATCH /admin/credentials/{id}` | Enable/disable by account identity ID, without deleting files |
+| `PATCH /admin/credentials/{id}` | One Boolean field per account: `enabled`, `auto_checkin`, or `auto_travel`; automation preference saves do not claim immediately |
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | Start/poll login; `site=cn` (default), `intl` (international WorkBuddy) or `intl-codebuddy` (international CodeBuddy) |
-| `GET /admin/credits` · `POST /admin/checkin` | Inspect credits; trigger check-in and credit synchronization |
+| `GET /admin/credits` · `POST /admin/checkin` | Inspect credits; daily-idempotent check-in followed by domestic travel when enabled |
+| `POST /admin/sync` | Synchronize all enabled accounts' balances, catalogs and usage; no check-in or trial claims |
+| `POST /admin/credentials/{id}/{action}` | Single-account `refresh`, `checkin`, `sync`, `travel-status` (query only), or `travel` (claim then dispatch) |
 
 Pages use `/dashboard/*`, management APIs use `/admin/*`, and clients retain `/v1/*`. `/cn` and `/intl` API prefixes are not registered. Automatic model routing requires no client URL changes.
 
