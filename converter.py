@@ -2716,7 +2716,18 @@ def _cred_manager(cred):
 # 也一样，不在其中。
 FAILOVER_CODES = frozenset({401, 403, 429, 502, 503, 504})
 # 请求体确定没被上游收下的传输失败（建连失败 / 写请求体超时），重放不会重复计费。
+# 写超时按定义就是「Content-Length 声明的正文没写完」：上游手里没有完整请求，跑不出结果。
 REPLAYABLE_TRANSPORT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout)
+# 上游网关在拿到后端答复之前就把错误抛回来的状态：后端那侧可能已经处理完并计费。仍然重放
+# （理由见 _failover_safe），但要如实标出来，便于事后拿官方账本核对。
+POSSIBLY_CHARGED_CODES = frozenset({502, 504})
+
+
+def _replay_cost_note(error) -> str:
+    """重放日志里的代价标记：只给「可能已经付费」的那一类加，别把 429 也说成有风险。"""
+    if isinstance(error, UpstreamHTTPError) and error.status in POSSIBLY_CHARGED_CODES:
+        return " | 上游可能已处理该请求"
+    return ""
 
 
 def _failover_safe(error, raw=b"") -> bool:
@@ -2724,8 +2735,15 @@ def _failover_safe(error, raw=b"") -> bool:
 
     三条硬边界：内容审核拒绝不切号重放（那是模型的真实答复，换账号只会再撞一次同一堵墙，
     还白烧一次额度）；聚合器从 200 响应体里合成的 502（空流、坏 SSE、已开流后断连）不重放，
-    因为上游可能已经处理并计费；真正的重放窗口由 `open_backend_stream` 的 `opened` 标记与
-    `_preflight_stream` 守住。
+    因为上游已经回了 200、可能已经计费，而且那时状态码还收得回来；真正的重放窗口由
+    `open_backend_stream` 的 `opened` 标记与 `_preflight_stream` 守住。
+
+    为什么 502/504 这类「上游可能已经处理并计费」的失败仍然重放：这类失败对下游是**彻底
+    失败**——连响应头都没有，更没有可用的结果。不重放并不能把已经花掉的额度退回来，只是把
+    一次已经付出的请求换成一段静默断掉的会话。所以取舍不是「省钱 vs 花钱」，而是「花一次已
+    付的学费 vs 花两次并给出结果」。代价因此被严格夹住：默认 `--failover-max=0` 完全关闭，
+    开启后每请求最多多打 N 次，且这类重放在日志里由 `_replay_cost_note()` 单独标注，可事后
+    按官方用量明细核对。
     """
     if is_filter_error(raw):
         return False
@@ -2812,7 +2830,8 @@ async def _routed_stream(payload, body, model_name, rid, t0, make, routed, cred,
                 raise surface from None
             routed, cred, headers, url = attempt
             _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | {model_name} | 上游 HTTP "
-                 f"{failure.status} → {profile_for_headers(headers)}")
+                 f"{failure.status} → {profile_for_headers(headers)}"
+                 f"{_replay_cost_note(failure.error)}")
 
 
 async def _routed_fetch(payload, body, model_name, rid, t0, fetch, routed, cred, headers, url):
@@ -2840,7 +2859,8 @@ async def _routed_fetch(payload, body, model_name, rid, t0, fetch, routed, cred,
                 raise surface from None
             routed, cred, headers, url = attempt
             _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | {model_name} | 上游 HTTP "
-                 f"{status} → {profile_for_headers(headers)}")
+                 f"{status} → {profile_for_headers(headers)}"
+                 f"{_replay_cost_note(error)}")
 
 
 def _note_content_filter(rid, model_name, *, final):

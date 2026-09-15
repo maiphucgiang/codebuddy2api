@@ -121,6 +121,27 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         self.assertEqual(len(set(self.uids(sent))), 2, "重放必须换凭证")
         self.assertEqual(len(self.failover_lines()), 1, self.failover_lines())
 
+    def test_replay_log_separates_the_maybe_billed_class(self):
+        """受理期拒绝不标风险；502/504 可能已被后端处理并计费，必须在日志里单独标出来。
+
+        重放的取舍不是「省钱 vs 花钱」：这类失败连响应头都没有，那次结果对下游永远拿不到，
+        不重放也退不回额度，只是把一次已付费的请求换成一段断掉的会话。所以保留重放，但要
+        如实标注，便于事后按官方用量明细核对。
+        """
+        for status, marked in ((429, False), (401, False), (403, False), (503, False),
+                               (502, True), (504, True)):
+            with self.subTest(status=status):
+                self.fresh_pool()
+                self.logs.clear()
+                with allow_failover(1):
+                    self.poison_with_status(status)
+                    response, sent = self.stream_post()
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(len(sent), 2)
+                lines = self.failover_lines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertEqual(("上游可能已处理该请求" in lines[0]), marked, lines[0])
+
     def test_every_stream_endpoint_can_fail_over(self):
         for endpoint in fixtures.GENERATIONS:
             with self.subTest(endpoint=endpoint):
