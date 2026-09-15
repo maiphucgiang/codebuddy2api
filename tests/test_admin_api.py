@@ -336,6 +336,28 @@ class AdminApiTests(unittest.TestCase):
         self.assertIs(self.config[key], True)
         self.assertIs(self.store.snapshot()["settings"][key], True)
 
+    def test_failover_settings_are_hot_and_persisted(self):
+        """换凭证重放与写超时开关都要能在系统设置里改完立即生效，不需要重启进程。"""
+        current = self.client.get("/admin/settings", headers=self.headers).json()
+        items = {item["key"]: item for item in current["items"]}
+        for key, kind, default in (("failover_max", "integer", 0), ("retry_write_timeout", "boolean", False)):
+            with self.subTest(key=key):
+                spec = items[key]
+                self.assertEqual((spec["mode"], spec["locked"], spec["type"]), ("hot", False, kind))
+                self.assertEqual(spec["value"], default, "默认必须与上游行为一致：关闭")
+        response = self.client.patch("/admin/settings", headers=self.headers, json={
+            "revision": current["revision"], "values": {"failover_max": 2, "retry_write_timeout": True}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual((self.config["failover_max"], self.config["retry_write_timeout"]), (2, True))
+        self.assertEqual(self.store.snapshot()["settings"]["failover_max"], 2)
+        self.assertIs(self.store.snapshot()["settings"]["retry_write_timeout"], True)
+        self.gateway.admin_apply_settings.assert_called_once_with(
+            {"failover_max": 2, "retry_write_timeout": True})
+        applied = {item["key"]: item for item in response.json()["items"]}
+        for key, value in (("failover_max", 2), ("retry_write_timeout", True)):
+            self.assertEqual((applied[key]["value"], applied[key]["source"], applied[key]["locked"]),
+                             (value, "management", False), applied[key])
+
     def test_settings_revision_locked_sources_and_secret_redaction(self):
         self.config["auth_dir"] = "/private-directory"
         self.config["settings_sources"] = {"max_images": "environment"}
