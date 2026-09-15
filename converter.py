@@ -43,7 +43,7 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler as _default_http_exception_handler
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 import uvicorn
 
@@ -69,6 +69,7 @@ from app import auth_oauth
 from app import trial_rewards
 from app import checkin as checkin_service, model_policy, travel
 from app.model_blocks import ModelBlocks
+from app.client_hangup import ClientHungUp, await_or_hangup
 from app.observability import (AuditMiddleware, observe_recovery, observe_route,
                                observe_usage, observe_attempt, observe_failure,
                                observe_failure_seq)
@@ -2415,8 +2416,13 @@ async def chat_completions(request: Request,
     async def fetch(routed, cred, headers, url):
         return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
                                          filter_retry=True)
-    collected = await _routed_fetch(payload, prepared, model_name, rid, t0, fetch,
-                                    body, cred, headers, url)
+    # 断连监听包在重放外层：换凭证的那几枪同样属于「还没给下游一个字节」的窗口
+    try:
+        collected = await await_or_hangup(
+            _routed_fetch(payload, prepared, model_name, rid, t0, fetch,
+                          body, cred, headers, url), request)
+    except ClientHungUp:
+        return _hungup_response(rid, model_name, t0)
     _log_finish(model_name, t0, collected, rid)
     if CONFIG.get("control_store") is not None:
         collected = {**collected, "model": model_name}
@@ -2651,6 +2657,17 @@ def _upstream_failure(error, model_name, t0, rid):
     _log(f"[{rid}] ✗ {category} | {model_name} | {elapsed:.1f}s | {sanitize_log_text(raw.decode('utf-8', 'replace'), 512)}")
     _log_text_body(f"[{rid}] ERROR BODY", raw.decode("utf-8", "replace"))
     return status, raw
+
+
+def _hungup_response(rid, model_name, t0):
+    """下游已经不听了：不编造结果，也不再占着连接 —— 安静地给一个不成体的响应。
+
+    真到 uvicorn 那一侧，断连之后的 `send` 是直接丢弃的，所以这个状态码只是「ASGI 调用必须
+    交付一个响应」的形式；审计口径由 `AuditMiddleware` 从 `http.disconnect` 判定为 cancelled。
+    """
+    elapsed = time.time() - t0 if t0 else 0
+    _log(f"[{rid}] ✂ 下游已断连，取消这次聚合 | {model_name} | {elapsed:.1f}s")
+    return Response(status_code=204)
 
 
 async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *, filter_retry=False):
@@ -3170,25 +3187,28 @@ async def create_response(request: Request,
                               chat_body, cred, headers, url)
 
     return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred,
-                                    payload=payload, canonical=prepared)
+                                    payload=payload, canonical=prepared, request=request)
 
 
 async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False,
-                             payload=None, canonical=None):
+                             payload=None, canonical=None, request=None):
     converter = (AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name, parallel_tool_calls=body.get("parallel_tool_calls", True)))
 
     async def fetch(routed, cred, headers, url):
         return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
                                          filter_retry=True)
     try:
-        collected = await _routed_fetch(payload, body if canonical is None else canonical,
-                                        model_name, rid, t0, fetch, body, cred, headers, url)
+        collected = await await_or_hangup(
+            _routed_fetch(payload, body if canonical is None else canonical,
+                          model_name, rid, t0, fetch, body, cred, headers, url), request)
         for line in _chat_result_to_sse_lines(_completion_to_merged(collected)):
             converter.feed_line(_public_sse_line(line, model_name))
         converter.finish()
     except (httpx.HTTPError, UpstreamResponseError) as error:
         status, raw = _upstream_failure(error, model_name, t0, rid)
         raise HTTPException(status_code=status, detail=_safe_err_raw(raw, status)) from None
+    except ClientHungUp:
+        return _hungup_response(rid, model_name, t0)
     result = converter.get_nonstream_response()
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=result)
@@ -3272,7 +3292,8 @@ async def create_message(request: Request,
 
     if not _client_wants_stream(payload):
         return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred,
-                                        anthropic=True, payload=payload, canonical=prepared)
+                                        anthropic=True, payload=payload, canonical=prepared,
+                                        request=request)
 
     def attempt(routed, cred, headers, url):
         return _stream_anthropic(url, headers, routed, model_name, t0, rid, cred=cred)
