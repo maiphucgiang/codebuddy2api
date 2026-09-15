@@ -1427,6 +1427,7 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "max_inbound_bytes": 64 * 1024 * 1024,
                 "max_collect_bytes": 8 * 1024 * 1024, "max_concurrent": 64,
                 "failover_max": 0,     # 流式失败在第一个字节之前发生时可换凭证重放的最大次数
+                "retry_write_timeout": False,  # 写请求体超时是否也算「上游没收下请求体」（默认否，见 --retry-write-timeout）
                 "usage_daily": None,     # 官方用量聚合视图（日期×模型 credit），供 billing/usage 出 daily_costs
                 "usage_daily_accounts": None,  # 按账号的用量快照；单账号失败不丢历史
                 "credit_price_cny": None, "credit_price_usd": None, "usd_rate": None,
@@ -2541,7 +2542,8 @@ async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name
                         duration_ms=(time.monotonic() - started) * 1000)
         _log(f"[{rid}] 建连失败，重试 1/1 | {model_name} | {_network_error_text(error)}")
     try:
-        async with open_backend_stream(url, headers, body, read_timeout=timeout, on_retry=retry) as response:
+        async with open_backend_stream(url, headers, body, read_timeout=timeout, on_retry=retry,
+                                       retry_write_timeout=bool(CONFIG.get("retry_write_timeout"))) as response:
             opened = True
             observe_attempt("upstream_http", status_code=response.status_code,
                             duration_ms=(time.monotonic() - started) * 1000)
@@ -2715,9 +2717,11 @@ def _cred_manager(cred):
 # 可换凭证重放的上游 HTTP 状态：限流、认证、网关抖动。400/404/413 是确定性拒绝，换账号
 # 也一样，不在其中。
 FAILOVER_CODES = frozenset({401, 403, 429, 502, 503, 504})
-# 请求体确定没被上游收下的传输失败（建连失败 / 写请求体超时），重放不会重复计费。
-# 写超时按定义就是「Content-Length 声明的正文没写完」：上游手里没有完整请求，跑不出结果。
-REPLAYABLE_TRANSPORT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout)
+# 上游手里没有任何正文的传输失败（建连阶段就失败），重放零风险。
+REPLAYABLE_TRANSPORT = (httpx.ConnectError, httpx.ConnectTimeout)
+# 写超时：正文没写完是确定的，上游有没有按已收到的半截正文动过账则观察不到，
+# 因此只有 `--retry-write-timeout` 打开后才参与重放（两层重放都受这个开关约束）。
+WRITE_TIMEOUT_TRANSPORT = (httpx.WriteTimeout,)
 # 上游网关在拿到后端答复之前就把错误抛回来的状态：后端那侧可能已经处理完并计费。仍然重放
 # （理由见 _failover_safe），但要如实标出来，便于事后拿官方账本核对。
 POSSIBLY_CHARGED_CODES = frozenset({502, 504})
@@ -2727,6 +2731,8 @@ def _replay_cost_note(error) -> str:
     """重放日志里的代价标记：只给「可能已经付费」的那一类加，别把 429 也说成有风险。"""
     if isinstance(error, UpstreamHTTPError) and error.status in POSSIBLY_CHARGED_CODES:
         return " | 上游可能已处理该请求"
+    if isinstance(error, WRITE_TIMEOUT_TRANSPORT):
+        return " | 上游可能已处理该请求（正文未写完）"
     return ""
 
 
@@ -2735,8 +2741,9 @@ def _failover_safe(error, raw=b"") -> bool:
 
     三条硬边界：内容审核拒绝不切号重放（那是模型的真实答复，换账号只会再撞一次同一堵墙，
     还白烧一次额度）；聚合器从 200 响应体里合成的 502（空流、坏 SSE、已开流后断连）不重放，
-    因为上游已经回了 200、可能已经计费，而且那时状态码还收得回来；真正的重放窗口由
-    `open_backend_stream` 的 `opened` 标记与 `_preflight_stream` 守住。
+    因为上游已经回了 200、可能已经计费，而且那时状态码还收得回来；写超时默认也不重放，
+    要显式 `--retry-write-timeout`。真正的重放窗口由 `open_backend_stream` 的 `opened` 标记
+    与 `_preflight_stream` 守住。
 
     为什么 502/504 这类「上游可能已经处理并计费」的失败仍然重放：这类失败对下游是**彻底
     失败**——连响应头都没有，更没有可用的结果。不重放并不能把已经花掉的额度退回来，只是把
@@ -2751,6 +2758,8 @@ def _failover_safe(error, raw=b"") -> bool:
         return error.status in FAILOVER_CODES
     if isinstance(error, UpstreamResponseError):
         return False
+    if isinstance(error, WRITE_TIMEOUT_TRANSPORT):
+        return bool(CONFIG.get("retry_write_timeout"))
     return isinstance(error, REPLAYABLE_TRANSPORT)
 
 
@@ -3269,7 +3278,13 @@ def main():
     ap.add_argument("--failover-max", type=_nonnegative_int, metavar="N",
                     default=os.environ.get("CODEBUDDY2API_FAILOVER_MAX", "0"),
                     help="失败发生在向下游落第一个字节之前时，最多换几个凭证就地重放，默认 0（关闭）；"
-                         "只重放上游没收下请求体或用 401/403/429/502/503/504 拒绝的失败")
+                         "只重放上游没收下请求体或用 401/403/429/502/503/504 拒绝的失败；"
+                         "写请求体超时需另开 --retry-write-timeout 才参与")
+    ap.add_argument("--retry-write-timeout", type=_boolean_arg, nargs="?", const=True,
+                    default=os.environ.get("CODEBUDDY2API_RETRY_WRITE_TIMEOUT", "false"),
+                    help="把「写请求体超时」也算作上游没收下请求体从而参与重放，默认 false。写超时只能"
+                         "证明正文没写完，上游是否已按半截正文计费看不到，因此要显式开启（同时作用于连接"
+                         "重试与 --failover-max 换凭证重放）")
     ap.add_argument("--auto-trial", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_AUTO_TRIAL", "false"),
                     help="自动领取国际 WorkBuddy 一次性体验积分，默认关闭")
@@ -3281,7 +3296,7 @@ def main():
 
     for key in ("max_images", "image_policy", "max_request_bytes", "log_body_limit", "auto_trial",
                 "tool_call_max_retry", "max_inbound_bytes", "max_collect_bytes", "max_concurrent",
-                "failover_max"):
+                "failover_max", "retry_write_timeout"):
         CONFIG[key] = getattr(args, key)
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize

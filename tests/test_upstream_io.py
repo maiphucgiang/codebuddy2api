@@ -317,9 +317,9 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(requests[0].method, "POST")
 
     async def test_body_not_accepted_is_replayed_on_a_fresh_connection(self):
-        """建连失败 / 写请求体超时：上游没收下请求体，换新连接重放一次不会重复计费。"""
+        """建连失败 / 建连超时：上游手里没有正文，换新连接重放一次不会重复计费。"""
         real_client = httpx.AsyncClient
-        for error_type in (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout):
+        for error_type in (httpx.ConnectError, httpx.ConnectTimeout):
             with self.subTest(error=error_type.__name__):
                 attempts = []
 
@@ -333,6 +333,48 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(upstream_io.httpx, "AsyncClient",
                                   side_effect=lambda **kw: real_client(transport=transport, **kw)):
                     async with upstream_io.open_backend_stream("https://synthetic.invalid", {}, {}) as response:
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(await response.aread(), b"data: [DONE]\n\n")
+                self.assertEqual(len(attempts), 2, "只允许重放一次")
+                self.assertEqual([request.method for request in attempts], ["POST", "POST"])
+
+    async def test_write_timeout_is_not_replayed_without_the_opt_in(self):
+        """写超时只证明正文没写完，证不了上游没处理已收到的部分：默认不重放。"""
+        real_client = httpx.AsyncClient
+        for error_type in upstream_io.WRITE_TIMEOUT:
+            with self.subTest(error=error_type.__name__):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    raise error_type("synthetic write timeout")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    with self.assertRaises(error_type):
+                        async with upstream_io.open_backend_stream("https://synthetic.invalid", {}, {}) as response:
+                            await response.aread()
+                self.assertEqual(len(attempts), 1, "默认必须一次都不重放")
+
+    async def test_write_timeout_is_replayed_only_when_opted_in(self):
+        """`retry_write_timeout=True` 是运维显式承担计费歧义，重放行为与建连失败一致。"""
+        real_client = httpx.AsyncClient
+        for error_type in upstream_io.WRITE_TIMEOUT:
+            with self.subTest(error=error_type.__name__):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    if len(attempts) == 1:
+                        raise error_type("synthetic write timeout")
+                    return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    async with upstream_io.open_backend_stream(
+                            "https://synthetic.invalid", {}, {}, retry_write_timeout=True) as response:
                         self.assertEqual(response.status_code, 200)
                         self.assertEqual(await response.aread(), b"data: [DONE]\n\n")
                 self.assertEqual(len(attempts), 2, "只允许重放一次")

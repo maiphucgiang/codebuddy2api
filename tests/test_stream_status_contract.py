@@ -26,10 +26,11 @@ from app import upstream_io
 
 ROUTES = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
 TOOLS = [{"type": "function", "function": {"name": "synthetic_tool", "parameters": {"type": "object"}}}]
-# 写超时/建连失败时上游还没收下请求体，open_backend_stream 会换新连接重放一次；
-# 中途 reset 与协议错误属于「歧义请求」，绝不重放 POST。
-REPLAYABLE = (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout)
-AMBIGUOUS = (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.WriteError)
+# 建连失败/建连超时：上游手里没有正文，open_backend_stream 会换新连接重放一次；
+# 中途 reset、协议错误、以及写超时（正文没写完 ≠ 上游没处理）都属于歧义请求，默认不重放。
+REPLAYABLE = (httpx.ConnectError, httpx.ConnectTimeout)
+AMBIGUOUS = (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.WriteError,
+             httpx.WriteTimeout)
 HTTP_STATUSES = (400, 403, 429, 503)
 TERMINALS = ("data: [DONE]", '"response.completed"', '"message_stop"')
 

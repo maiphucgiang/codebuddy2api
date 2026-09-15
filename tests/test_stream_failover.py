@@ -33,8 +33,10 @@ from tests import test_region_routing as fixtures
 
 REPLAYABLE_STATUS = (401, 403, 429, 502, 503, 504)
 DETERMINISTIC_STATUS = (400, 404, 405, 413, 422)
-# 上游没收下请求体：换连接/换账号重放安全
-REPLAYABLE_TRANSPORT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout)
+# 上游手里没有任何正文：换连接/换账号重放安全
+REPLAYABLE_TRANSPORT = (httpx.ConnectError, httpx.ConnectTimeout)
+# 写超时：正文没写完是确定的，是否已按半截正文计费看不到，只有显式 opt-in 才参与重放
+WRITE_TIMEOUT_TRANSPORT = (httpx.WriteTimeout,)
 # 请求体已经发出去了（甚至响应已经开始）：上游可能已处理并计费，禁止重放
 AMBIGUOUS_TRANSPORT = (httpx.ReadError, httpx.ReadTimeout, httpx.WriteError,
                        httpx.RemoteProtocolError)
@@ -307,6 +309,73 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
                 self.assertGreaterEqual(len(sent), 2)
                 self.assertNotEqual(len(set(self.uids(sent))), 1, "必须换过凭证")
                 self.assertEqual(len(self.failover_lines()), 1, self.failover_lines())
+
+    def test_write_timeout_needs_an_explicit_opt_in(self):
+        """默认：写超时按歧义处理——如实回 502，一次都不多重放。"""
+        self.assertEqual(converter.CONFIG["retry_write_timeout"], False, "默认必须关闭")
+        for error_type in WRITE_TIMEOUT_TRANSPORT:
+            with self.subTest(error=error_type.__name__):
+                self.fresh_pool()
+                self.requests.clear()
+                self.logs.clear()
+                with allow_failover(2):
+                    self.poison_with_transport(error_type)
+                    response, sent = self.stream_post()
+                self.assertEqual(response.status_code, 502, response.text)
+                self.assertEqual(len(sent), 1, "未开启 opt-in 时禁止重放")
+                self.assertEqual(self.failover_lines(), [])
+
+    def test_write_timeout_opt_in_replays_and_flags_the_billing_risk(self):
+        """开启 `--retry-write-timeout`：重放救回会话，但必须在日志里标出计费歧义。"""
+        for error_type in WRITE_TIMEOUT_TRANSPORT:
+            with self.subTest(error=error_type.__name__):
+                self.fresh_pool()
+                self.requests.clear()
+                self.logs.clear()
+                with allow_failover(1), patch.dict(converter.CONFIG, {"retry_write_timeout": True}):
+                    self.poison_with_transport(error_type)
+                    response, sent = self.stream_post()
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertIn("data: [DONE]", response.text)
+                self.assertGreaterEqual(len(sent), 2, "应当重放过")
+                lines = self.failover_lines()
+                self.assertTrue(lines, "重放必须留日志")
+                self.assertIn("上游可能已处理该请求", lines[0], lines[0])
+
+    def test_write_timeout_opt_in_does_not_replay_ambiguous_transport(self):
+        """开关只管写超时：读超时/中途 reset 这些歧义失败照旧禁止重放。"""
+        with patch.dict(converter.CONFIG, {"retry_write_timeout": True}):
+            for error_type in AMBIGUOUS_TRANSPORT:
+                with self.subTest(error=error_type.__name__):
+                    self.fresh_pool()
+                    self.requests.clear()
+                    with allow_failover(2):
+                        self.poison_with_transport(error_type)
+                        response, sent = self.stream_post()
+                    self.assertEqual(response.status_code, 502, response.text)
+                    self.assertEqual(len(sent), 1)
+                    self.assertEqual(self.failover_lines(), [])
+
+    def test_failover_switches_are_hot_public_settings(self):
+        """两个开关都必须能在大控制台「系统设置」里改，且不需要重启进程。"""
+        from app import settings
+
+        self.assertEqual(converter.CONFIG["failover_max"], 0)
+        self.assertEqual(converter.CONFIG["retry_write_timeout"], False)
+        for key, value in (("failover_max", 2), ("retry_write_timeout", True)):
+            with self.subTest(key=key):
+                spec = settings.SCHEMA[key]
+                self.assertEqual(spec["mode"], "hot", f"{key} 改了要能立即生效，不能要求重启")
+                self.assertFalse(spec["sensitive"], "运维开关必须对管理台可见")
+                self.assertEqual(settings.validate_settings({key: value}), {key: value})
+                listed = {item["key"]: item for item in
+                          settings.resolve_settings({"failover_max": 2, "retry_write_timeout": True})}
+                self.assertIn(key, listed)
+                self.assertFalse(listed[key]["locked"], listed[key])
+        with self.assertRaises(ValueError):
+            settings.validate_settings({"failover_max": 99})       # 上界 10
+        with self.assertRaises(ValueError):
+            settings.validate_settings({"retry_write_timeout": "yes"})
 
     def test_ambiguous_transport_never_fails_over(self):
         for error_type in AMBIGUOUS_TRANSPORT:

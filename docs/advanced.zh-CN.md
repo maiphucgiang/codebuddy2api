@@ -34,10 +34,11 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `--max-collect-bytes` | `8388608` | 聚合路径输出收集总字节上限（正文+思考+工具参数），超限返回 `response_too_large`；`0` 不限制 |
 | `--max-concurrent` | `64` | 仅限制三个生成端点；占满立即 503（含 Retry-After），不限制 token 估算；`0` 不限制 |
 | `--failover-max` | `0` | 请求在「一个字节都还没发给下游」之前失败时，最多再换几个凭证就地重放；`0` 表示如实把失败回给下游 |
+| `--retry-write-timeout` | `false` | 让「写请求体超时」也参与重放（换新连接与 `--failover-max` 换凭证），代价是已发出的那半截正文可能已被上游处理 |
 | `--max-request-bytes` | `33554432` | 处理后的上游 JSON 字节上限，须为正整数 |
 | `--log-body-limit` | `65536` | 兼容文本日志正文预览字节；`0` 只记摘要，不控制 SQLite 诊断预算 |
 
-环境变量包括 `CODEBUDDY_AUTH_DIR`、`CODEBUDDY_IMPORT_DIR`、`CODEBUDDY2API_KEY`、`CODEBUDDY2API_ADMIN_CSRF`、`CODEBUDDY2API_KEEP_TOOL_METADATA`、`CODEBUDDY2API_LOG`，以及 `CODEBUDDY2API_MAX_IMAGES`、`CODEBUDDY2API_IMAGE_POLICY`、`CODEBUDDY2API_MAX_REQUEST_BYTES`、`CODEBUDDY2API_LOG_BODY_LIMIT`、`CODEBUDDY2API_AUTO_TRIAL`、`CODEBUDDY2API_FAILOVER_MAX`。启动示例见 [部署指南](deployment.zh-CN.md)。
+环境变量包括 `CODEBUDDY_AUTH_DIR`、`CODEBUDDY_IMPORT_DIR`、`CODEBUDDY2API_KEY`、`CODEBUDDY2API_ADMIN_CSRF`、`CODEBUDDY2API_KEEP_TOOL_METADATA`、`CODEBUDDY2API_LOG`，以及 `CODEBUDDY2API_MAX_IMAGES`、`CODEBUDDY2API_IMAGE_POLICY`、`CODEBUDDY2API_MAX_REQUEST_BYTES`、`CODEBUDDY2API_LOG_BODY_LIMIT`、`CODEBUDDY2API_AUTO_TRIAL`、`CODEBUDDY2API_FAILOVER_MAX`、`CODEBUDDY2API_RETRY_WRITE_TIMEOUT`。启动示例见 [部署指南](deployment.zh-CN.md)。
 
 体验积分领取默认关闭，仅适用于符合上游资格的 `intl-work` 账号。成功或已领取的结果按账号保存到 `auth/trial-ledger.json`，失败至少退避 24 小时，不立即重放 POST；资格与额度以上游为准，升级时保留该文件。
 
@@ -167,10 +168,11 @@ WebUI 可以直接上传文件；以下限制针对 `POST /admin/credentials` �
 | 上游 401 / 403 | 凭证级认证熔断；在 WebUI 检查并重新登录 |
 | 429 | 对该凭证的上游模型冷却，后续请求自动换绑；全部候选都在冷却时仍返回 429。设了 `--failover-max` 时，当前请求就地换凭证重放 |
 | 上游 `service info not found`（11102） | 该后端根本不服务这个模型：按 (后端, 模型) 避让，把该模型派给其他后端，全部后端都没有时返回 404。6 小时后半开放行重试，反复命中最长退避 24 小时，一次成功调用即刻解除；可用 `GET /admin/model-blocks` 查看 |
-| 建连失败、写请求体超时 | `ConnectError` / `ConnectTimeout` / `WriteTimeout` 换新连接重放一次：三者都意味着上游没收下请求体，重放不会重复计费 |
+| 建连失败 | `ConnectError` / `ConnectTimeout` 换新连接重放一次：两者都发生在写下第一个正文字节之前，上游手里什么都没有，重放不会重复计费 |
 | 发送后断连、读超时、协议错误 | 不做网络重放，避免重复计费；日志记录异常类型与耗时 |
 | 流式在第一个字节之前失败 | 按**真实状态码**返回，与 `stream=false` 同口径。只带一个流内 `error` 事件的 200 会被客户端读成「模型答了个空」，会话静默结束，审计里还记成一次成功 |
-| 换凭证重放（`--failover-max`） | 默认关闭。开启后，失败落在「一个字节都没发给下游」之前时换一个凭证重打，最多 N 次，审计记为 `success` 并留下 `failover_recovered` 尝试标记。只重放上游用 HTTP 状态码给出的拒绝（401/403/429/502/503/504）与没收下请求体的传输失败：内容审核拒绝、上游已回 200 之后合成的 502、读超时与协议错误一律不重放；换不出其他凭证时如实回第一次的状态码。**计费口径**：401/403/429/503 与上述三类传输失败都发生在受理阶段，不会扣费；502/504 有可能已被后端处理并计费，但那次结果对下游根本拿不到，不重放也退不回额度——只是把一次已经付费的请求换成一段断掉的会话。这类重放在日志里单独标注「上游可能已处理该请求」，便于按官方用量明细核对 |
+| 换凭证重放（`--failover-max`） | 默认关闭。开启后，失败落在「一个字节都没发给下游」之前时换一个凭证重打，最多 N 次，审计记为 `success` 并留下 `failover_recovered` 尝试标记。只重放上游用 HTTP 状态码给出的拒绝（401/403/429/502/503/504）与确定没开始收正文的传输失败（建连失败/建连超时）：内容审核拒绝、上游已回 200 之后合成的 502、读超时与协议错误一律不重放；换不出其他凭证时如实回第一次的状态码。**计费口径**：401/403/429/503 与建连类失败都发生在受理阶段，不会扣费；502/504 有可能已被后端处理并计费，但那次结果对下游根本拿不到，不重放也退不回额度——只是把一次已经付费的请求换成一段断掉的会话。这类重放在日志里单独标注「上游可能已处理该请求」，便于按官方用量明细核对 |
+| 写超时重放（`--retry-write-timeout`） | 默认关闭。写超时只能证明声明的正文没发完，不能证明上游忽略了已经收到的那部分，因此它默认既不参与连接重试也不参与换凭证重放；显式打开后两层都生效。跨境长会话最容易撞的恰恰是 60s 写超时（实测某部署传输失败 100% 是它），确认自己的上游不会按半截正文计费再开；这类重放同样带「上游可能已处理该请求」日志标记 |
 | 工具参数损坏 | 聚合校验失败按 `--tool-call-max-retry`（默认 3）额外生成，可能消耗更多额度；被丢弃的生成带用量记入尝试明细；耗尽后返回错误 |
 | 上游空流或残流 | 没有有效输出、缺少结束标记或包含错误的流不伪装为成功 |
 | 内容审核拒绝 | 脱敏 + `--no-compact` 下，仅完整非流式纯拒绝且模板确实缩短时，最多同账号兜底一次；流式不做审核重试，也不因此熔断或切号 |
