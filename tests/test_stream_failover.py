@@ -47,6 +47,23 @@ def error_body(message="synthetic rejection", code="rate_limit"):
     return {"error": {"message": message, "type": "upstream_error", "code": code}}
 
 
+def filtered_sse():
+    """上游正常回 200、结果却是审核拒绝：聚合路径会在 `fetch` 返回**之前**就记上这次失败。
+
+    只用 `finish_reason` 触发检测（`ContentFilterDetector.feed` 认 `content_filter`），
+    不依赖任何拒绝文案，免得上游改措辞就把测试带崩。
+    """
+    chunks = [
+        {"id": "synthetic-completion", "choices": [{"index": 0,
+         "delta": {"role": "assistant", "content": "blocked"}, "finish_reason": None}]},
+        {"id": "synthetic-completion", "choices": [{"index": 0,
+         "delta": {}, "finish_reason": "content_filter"}],
+         "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}},
+    ]
+    return ("".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+            + "data: [DONE]\n\n").encode()
+
+
 @contextmanager
 def allow_failover(times: int):
     """打开换凭证重放开关（等价于 --failover-max N）。"""
@@ -337,8 +354,8 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         self.stream = True
 
     # --- 审计口径：重放救回来的请求不得留在 error ---
-    def audited_client(self):
-        store = AuditStore(self.root / "failover-audit.sqlite3")
+    def audited_client(self, name="failover-audit"):
+        store = AuditStore(self.root / f"{name}.sqlite3")   # 一条用例要对比两行审计时分开落盘
         self.addCleanup(store.close)
         application = FastAPI()
         application.router.routes = list(converter.app.router.routes)
@@ -363,6 +380,64 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         statuses = [attempt.get("status_code") for attempt in record["attempts"]]
         self.assertEqual(statuses[:2], [429, 200], record["attempts"])
         self.assertIn("failover_recovered", json.dumps(record["attempts"], ensure_ascii=False))
+        markers = [attempt for attempt in record["attempts"]
+                   if attempt.get("stage") == "failover_recovered"]
+        self.assertEqual([attempt.get("code") for attempt in markers], ["upstream_429"],
+                         "恢复标记必须点名「被撤销的那一次失败」本身")
+
+    def test_content_filter_after_replay_is_still_audited_as_filtered(self):
+        """换到的账号回了审核拒绝：那是这一枪的真实结果，不能被上一枪 429 的重放抹掉。
+
+        没有修复前的样子：`outcome=success` + `error_code` 为空 + 恢复标记写着
+        `content_filter` —— 等于把一次被拦截的请求记成了一次干净的成功。
+        """
+        store, client = self.audited_client()
+        with allow_failover(1), patch.object(fixtures, "success_sse", filtered_sse):
+            self.poison_once = True
+            self.poison_with_status(429)
+            response = client.post("/v1/chat/completions", json=self.payload(stream=False))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.failover_lines()), 1, self.logs)
+        record = self.only_record(store)
+        self.assertEqual(record["outcome"], "error", record)
+        self.assertEqual(record["error_code"], "content_filter", record)
+        self.assertNotIn("failover_recovered",
+                         json.dumps(record["attempts"], ensure_ascii=False), record["attempts"])
+
+    def test_content_filter_audit_matches_the_unreplayed_request(self):
+        """同一次审核拒绝，走没走过重放必须是同一行审计：重放不该改变账单口径。"""
+        with patch.object(fixtures, "success_sse", filtered_sse):
+            store, client = self.audited_client("filter-without-replay")
+            plain = client.post("/v1/chat/completions", json=self.payload(stream=False))
+            self.assertEqual(plain.status_code, 200, plain.text)
+            baseline = self.only_record(store)
+        self.assertEqual(baseline["outcome"], "error", baseline)
+        self.assertEqual(baseline["error_code"], "content_filter", baseline)
+        store, client = self.audited_client("filter-with-replay")
+        with allow_failover(1), patch.object(fixtures, "success_sse", filtered_sse):
+            self.poison_once = True
+            self.poison_with_status(429)
+            replayed = client.post("/v1/chat/completions", json=self.payload(stream=False))
+        self.assertEqual(replayed.status_code, 200, replayed.text)
+        record = self.only_record(store)
+        for key in ("outcome", "error_code", "status_code"):
+            self.assertEqual(record[key], baseline[key], (key, record, baseline))
+
+    def test_content_filter_after_replay_survives_the_aggregated_stream(self):
+        """带 tools 的流式在预取里就跑完整聚合，`_stream_plan` 那条顺序陷阱一模一样。"""
+        store, client = self.audited_client()
+        payload = self.payload(stream=True)
+        payload["tools"] = [{"type": "function", "function": {"name": "synthetic_tool",
+                                                             "parameters": {"type": "object"}}}]
+        with allow_failover(1), patch.object(fixtures, "success_sse", filtered_sse):
+            self.poison_once = True
+            self.poison_with_status(429)
+            response = client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.failover_lines()), 1, self.logs)
+        record = self.only_record(store)
+        self.assertEqual(record["outcome"], "error", record)
+        self.assertEqual(record["error_code"], "content_filter", record)
 
     def test_unreplayed_failure_is_still_audited_as_error(self):
         store, client = self.audited_client()

@@ -65,6 +65,7 @@ class _Observation:
     monotonic_start: float
     attempts: list = field(default_factory=list)
     failed: bool = False
+    failure_seq: int = 0
     terminal: bool = False
     body_finished: bool = False
     status: int | None = None
@@ -76,6 +77,7 @@ class _Observation:
 
     def fail(self, code):
         self.failed = True
+        self.failure_seq += 1
         self.record["error_code"] = safe_label(code, 80) or "upstream_error"
 
     def usage(self, value, source, priority):
@@ -159,25 +161,42 @@ def observe_attempt(stage, **safe_metadata):
 
 
 def observe_failure(code):
+    """记下失败并返回本次请求的失败序号，供 `observe_recovery(through=…)` 界定撤销范围。"""
     observation = _current.get()
-    if observation is not None:
-        observation.fail(code)
+    if observation is None:
+        return None
+    observation.fail(code)
+    return observation.failure_seq
 
 
-def observe_recovery():
-    """标记「先前记录的失败已经被就地重放救回」：请求对下游是完整正常响应。
+def observe_failure_seq():
+    """当前失败序号的快照；没有失败时为 0，调用方原样传给 `observe_recovery` 即可。"""
+    observation = _current.get()
+    return observation.failure_seq if observation is not None else None
+
+
+def observe_recovery(through=None):
+    """标记「`through` 那一次失败已经被就地重放救回」：请求对下游是完整正常响应。
 
     失败尝试仍留在 `attempts` 里（另加一条 `failover_recovered` 标记），只是不再决定 outcome
     —— 否则一次成功的换凭证重放会留下 `outcome=error` + `status_code=200` 这种自相矛盾的
     审计记录，看板和排障都会把它读成失败。
+
+    `through` 是重放前那次失败的序号，只有它仍然是最新一次失败时才撤销：序号对不上说明
+    重放之后的响应自己又记了新失败（换到的账号回了内容审核拒绝就是这种），那次失败必须留下，
+    否则一个被审核拦截的请求会被持久化成 `outcome=success` 且没有 `error_code`。默认 `None`
+    保持旧的「清掉当前失败」语义，给没有序号概念的调用方兜底。
     """
     observation = _current.get()
-    if observation is not None and observation.failed:
-        code = observation.record.get("error_code") or "upstream_error"
-        observation.failed = False
-        observation.record["error_code"] = None
-        if len(observation.attempts) < 32:
-            observation.attempts.append(safe_attempt({"stage": "failover_recovered", "code": code}))
+    if observation is None or not observation.failed:
+        return
+    if through is not None and observation.failure_seq != through:
+        return
+    code = observation.record.get("error_code") or "upstream_error"
+    observation.failed = False
+    observation.record["error_code"] = None
+    if len(observation.attempts) < 32:
+        observation.attempts.append(safe_attempt({"stage": "failover_recovered", "code": code}))
 
 
 class _Parser:

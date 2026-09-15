@@ -70,7 +70,8 @@ from app import trial_rewards
 from app import checkin as checkin_service, model_policy, travel
 from app.model_blocks import ModelBlocks
 from app.observability import (AuditMiddleware, observe_recovery, observe_route,
-                               observe_usage, observe_attempt, observe_failure)
+                               observe_usage, observe_attempt, observe_failure,
+                               observe_failure_seq)
 from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
                                credential_file_lock)
 from app.upstream_io import (ChatSSEAccumulator, UpstreamHTTPError, UpstreamResponseError,
@@ -2997,12 +2998,14 @@ async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cr
     去问绑定规则 —— 否则第二轮查的是默认模型，客户端原来说的 `auto` 的账号/站点限制就丢了。
     """
     tried = []
+    recovered = None
     while True:
         stream = make(routed, cred, headers, url)
         try:
             first = await _preflight_stream(stream, model_name, t0, rid)
         except _StreamFailure as failure:
             await _close_stream(stream)   # 本轮的上游已经终止，关掉只是兜底，不留半开的连接
+            recovered = observe_failure_seq()   # 这一枪记的失败，才是重放有权撤销的那一次
             tried.append(cred)
             limit = _failover_limit()
             surface = HTTPException(status_code=failure.status,
@@ -3026,7 +3029,9 @@ async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cr
             await _close_stream(stream)
             raise
         if tried:
-            observe_recovery()   # 重放救回来的请求对下游是正常响应，不该记成失败
+            # 只撤销重放对应的那一次失败：序号对不上说明换到手的响应自己又记了新失败
+            # （最典型是内容审核拒绝），那次失败要如实留在审计里。
+            observe_recovery(recovered)   # 重放救回来的请求对下游是正常响应，不该记成失败
         return stream, first
 
 
@@ -3047,14 +3052,18 @@ async def _routed_fetch(payload, canonical, model_name, rid, t0, fetch, routed, 
     `canonical` 同 `_routed_stream`：重路由用改写前的规范请求体，判定才落在客户端模型上。
     """
     tried = []
+    recovered = None
     while True:
         try:
             collected = await fetch(routed, cred, headers, url)
             if tried:
-                observe_recovery()   # 同上：换凭证后成功的请求不该记成失败
+                # 同 `_stream_plan`：聚合路径里 `_fetch_checked_chat` 会在返回前就记上审核拒绝，
+                # 无差别撤销会把被拦截的请求写成一次成功。
+                observe_recovery(recovered)   # 换凭证后成功的请求不该记成失败
             return collected
         except (httpx.HTTPError, UpstreamResponseError) as error:
             status, raw = _upstream_failure(error, model_name, t0, rid)
+            recovered = observe_failure_seq()
             tried.append(cred)
             limit = _failover_limit()
             surface = HTTPException(status_code=status, detail=_safe_err_raw(raw, status))
