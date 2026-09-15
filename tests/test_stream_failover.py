@@ -62,6 +62,7 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         self.arm_next = False
         self.stream = True
         self.poison_uid = None
+        self.poison_once = False
         self.poison = lambda request: httpx.Response(429, json=error_body())
         self.logs = []
         self.enterContext(patch.object(converter, "_log", side_effect=self.capture_log))
@@ -82,6 +83,8 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
             self.poison_uid = uid          # 不依赖轮询顺序：下一个被选中的凭证开始失败
         if self.poison_uid is not None and uid == self.poison_uid:
             self.requests.append(request)
+            if self.poison_once:
+                self.poison_uid = None     # 只掐第一枪：后面那一枪是同一凭证上的重放
             return self.poison(request)    # 可以返回错误状态，也可以直接抛传输层异常
         return super().handle_upstream(request)
 
@@ -98,6 +101,11 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         def raise_transport(request):
             raise error_type("synthetic transport failure")
         self.poison = raise_transport
+
+    def poison_transport_once(self, error_type):
+        """只让第一枪失败：测「同一连接/同一凭证」的底层重放，换凭证那条日志压根到不了。"""
+        self.poison_with_transport(error_type)
+        self.poison_once = True
 
     def stream_post(self, endpoint="chat/completions"):
         self.allowed_profiles = set(fixtures.PROFILES)
@@ -197,6 +205,119 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         self.assertLessEqual(len(self.requests), 3, "每轮都要换新凭证，池子耗尽即停")
         self.assertEqual(len(set(self.uids(self.requests))), len(self.requests),
                          "同一凭证不得被打两次")
+
+    # --- 重路由必须沿用客户端请求的模型，不得被上游改写名绕过 ---
+    AUTO_PROFILES = ("intl-work", "intl-cli")
+
+    def arm_auto(self, profiles=None):
+        """账号目录都含 default-model：国际站会把 `auto` 改写成它，国内站不会 —— 所以放宽只有
+        在「改写后的名字」上查规则才会发生，站点绑定那条用例要靠国内站账号当靶子。"""
+        self.auto_profiles = tuple(profiles or self.AUTO_PROFILES)
+        self.configure(profiles=self.auto_profiles,
+                       tables={profile: [fixtures.model("default-model")] for profile in self.auto_profiles})
+
+    def bind_auto(self, name, **rule):
+        """建一个管理库并给 `auto` 下一条路由策略。"""
+        from app import model_policy
+        from app.control_store import ControlStore
+
+        store = ControlStore(self.root / name)
+        self.addCleanup(store.close)
+        converter.CONFIG["control_store"] = store
+        store.update_model("auto", dict(model_policy.default_rule("auto"), **rule), 0)
+        return store
+
+    def auto_post(self):
+        """发一次 model=auto 的流式请求，返回下游响应与真正打出去的上游请求。"""
+        self.allowed_profiles = set(self.auto_profiles)
+        before = len(self.requests)
+        response = self.client.post("/v1/chat/completions",
+                                    json=self.payload(stream=True, selected_model="auto"))
+        return response, self.requests[before:]
+
+    def test_auto_is_rewritten_on_the_international_site(self):
+        """夹具自检：国际站确实把 auto 发成了 default-model，否则下面几条等于没测。"""
+        self.arm_auto()
+        response, sent = self.auto_post()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(sent), 1)
+        import json as _json
+        self.assertEqual(_json.loads(sent[0].content)["model"], "default-model")
+
+    def test_failover_cannot_widen_the_credential_binding(self):
+        """把 `auto` 只绑到 A：A 失败后不许放宽给 B。
+
+        `_route_chat` 会把 auto 改写成 default-model 再发出去；若拿改写后的正文重新选
+        凭证，策略查的是 default-model（没有规则），绑定在 auto 上的限制整个失效。
+        """
+        self.arm_auto()
+        self.bind_auto("bind.sqlite3", credential_ids=[self.entries["intl-work"]["account_key"]])
+        with allow_failover(1):
+            self.poison_with_status(503)
+            response, sent = self.auto_post()
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(len(sent), 1,
+                         f"绑定 auto 的账号失败后不得放宽给别的账号：{self.uids(sent)}")
+
+    def test_failover_cannot_widen_the_site_binding(self):
+        """同上，按站点绑定：`auto` 限定 intl 时，重放不许跑到国内站。"""
+        self.arm_auto(("intl-work", "cn-work"))
+        self.bind_auto("region.sqlite3", region="intl")
+        with allow_failover(3):
+            self.poison_with_status(503)
+            response, sent = self.auto_post()
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(len(sent), 1, f"站点绑定被放宽：{self.uids(sent)}")
+
+    def test_reroute_uses_the_pristine_body_model(self):
+        """直接钉住重路由入参：每一轮选凭证看的都必须是客户端请求的模型名。"""
+        self.arm_auto()
+        self.bind_auto("spy.sqlite3", region="intl")
+        seen = []
+        real = converter._route_chat
+
+        def spy(payload, body, rid, **kwargs):
+            seen.append(body.get("model"))
+            return real(payload, body, rid, **kwargs)
+
+        with allow_failover(1), patch.object(converter, "_route_chat", side_effect=spy):
+            self.poison_with_status(503)
+            response, sent = self.auto_post()
+        self.assertEqual(len(seen), 2, f"应当恰好发生一次重路由：{seen}")
+        self.assertEqual([name for name in seen if name != "auto"], [],
+                         f"重路由拿到了被改写的模型名：{seen}")
+
+    def test_same_credential_write_timeout_replay_carries_the_risk_note(self):
+        """评审 P2：底层连接上的写超时重放也必须带代价标记，两层同一口径。
+
+        第一次写超时、同一凭证第二次就成 —— 这条路径到不了换凭证那行日志，`failover_max=0`
+        时更是完全不经过它，所以标注只能由 `open_backend_stream` 的重试回调自己带上。
+        """
+        store, client = self.audited_client()
+        with patch.dict(converter.CONFIG, {"retry_write_timeout": True, "failover_max": 0}):
+            self.poison_transport_once(httpx.WriteTimeout)
+            response = client.post("/v1/chat/completions", json=self.payload(stream=True))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.requests), 2, self.uids(self.requests))
+        self.assertEqual(len(set(self.uids(self.requests))), 1,
+                         f"底层重放不许换凭证：{self.uids(self.requests)}")
+        self.assertEqual(self.failover_lines(), [], "不该出现换凭证重放的日志")
+        lines = [line for line in self.logs if "写超时重放" in line]
+        self.assertEqual(len(lines), 1, self.logs)
+        self.assertIn("上游可能已处理该请求", lines[0])
+        stages = [attempt.get("stage") for attempt in self.only_record(store)["attempts"]]
+        self.assertIn("write_timeout_retry", stages, stages)
+
+    def test_connect_retry_stays_untagged(self):
+        """建连失败不标记风险：上游手里没有正文，重放确定不重复计费。"""
+        self.audited_client()
+        with patch.dict(converter.CONFIG, {"failover_max": 0}):
+            self.poison_transport_once(httpx.ConnectError)
+            response = self.client.post("/v1/chat/completions", json=self.payload(stream=True))
+        self.assertEqual(response.status_code, 200, response.text)
+        lines = [line for line in self.logs if "建连失败" in line]
+        self.assertEqual(len(lines), 1, self.logs)
+        self.assertNotIn("上游可能已处理该请求", lines[0])
 
     # --- 默认关闭：与上游一致，一次都不多重放 ---
     def test_disabled_by_default_replays_nothing(self):

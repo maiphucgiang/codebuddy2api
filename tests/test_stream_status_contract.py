@@ -14,15 +14,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
 
+import asyncio
 import json
+import time
 import unittest
 from unittest.mock import patch
 
+import anyio
 import httpx
 from fastapi.testclient import TestClient
 
 import converter
 from app import upstream_io
+from app.inbound_limits import ConcurrencyLimitMiddleware
 
 ROUTES = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
 TOOLS = [{"type": "function", "function": {"name": "synthetic_tool", "parameters": {"type": "object"}}}]
@@ -168,6 +172,142 @@ class StreamStatusTests(unittest.TestCase):
                     else:
                         self.assertIn("ok", response.text)
                         self.assertIn("data: [DONE]", response.text)
+
+
+class PreflightDisconnectTests(unittest.IsolatedAsyncioTestCase):
+    """预取窗口里的下游断连：取消要打得断挂起的上游读，并发名额当场归还。
+
+    用真实的中间件顺序手工驱动 ASGI。评审 P1 的场景：预取曾在端点里直接 `await`，而
+    `StreamingResponse.__call__` 是把 `stream_response` 和 `listen_for_disconnect` 放进同一个
+    任务组跑的 —— 端点返回之前没有谁在消费 `http.disconnect`。于是「上游首段卡住 + 客户端已经
+    走了」会一路挂到读超时，`ConcurrencyLimitMiddleware` 的名额跟着陪葬，单并发部署整个网关
+    变 503。这里钉住：断连必须当场收尾（首段之前、以及已经开始流式之后两种），并且下一次请求
+    拿得到名额。
+    """
+
+    PAYLOAD = {"model": "auto", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+
+    def setUp(self):
+        self.enterContext(patch.dict(converter.CONFIG, {
+            "api_key": "", "cred": None, "cred_pool": None, "model_guard": False,
+            "max_images": 16, "image_policy": "truncate", "max_request_bytes": 32 * 1024 * 1024,
+            "log_body_limit": 65536, "log_path": None, "desensitize": False, "no_compact": False,
+            "max_concurrent": 1, "max_collect_bytes": 0}))
+        self.enterContext(patch.object(converter, "_cred_for", return_value=(None, {})))
+        self.enterContext(patch.object(converter, "_log"))
+        self.enterContext(patch.object(converter, "_note_cred_status"))
+        self.enterContext(patch.object(converter, "_note_cred_model_ok"))
+        # 名额层套在真实 app 外面（与 runtime_management.install 的层次一致）。
+        # 每次新建实例：信号量挂在中间件实例上，测试之间不能互相借位。
+        self.app = ConcurrencyLimitMiddleware(converter.app.build_middleware_stack(),
+                                              converter.CONFIG)
+        self.stuck = asyncio.Event()
+        self.closed = 0
+        self.mode = "before-first-segment"
+
+    async def upstream(self, url, headers, body, model_name="?", t0=0.0, rid="", cred=None):
+        """假上游：按模式卡在首段之前或之后；收尾一定要 await，跟真实 httpx 一样。"""
+        try:
+            if self.mode != "before-first-segment":
+                yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {"content": "ok"}}],
+                                             "model": model_name}) + "\n\n"
+            self.stuck.set()      # 「已经挂在上游上」/「首段已经交出去」的信号
+            if self.mode == "done":
+                yield "data: [DONE]\n\n"
+                return
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.01)
+            self.closed += 1
+
+    async def drive(self, *, disconnect):
+        """跑一次请求；返回 (响应状态码或 None, 断连后是否在超时内收尾)。"""
+        sent, queue = [], asyncio.Queue()
+
+        async def receive():
+            return await queue.get()
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {"type": "http", "method": "POST", "path": "/v1/chat/completions",
+                 "raw_path": b"/v1/chat/completions", "query_string": b"", "headers": [],
+                 "scheme": "http", "http_version": "1.1", "server": ("test", 80),
+                 "client": ("127.0.0.1", 1234), "asgi": {"version": "3.0", "spec_version": "2.3"}}
+        await queue.put({"type": "http.request", "body": json.dumps(self.PAYLOAD).encode(),
+                         "more_body": False})
+        with patch.object(converter, "_stream_upstream", new=self.upstream):
+            task = asyncio.create_task(self.app(scope, receive, send))
+            try:
+                await asyncio.wait_for(self.stuck.wait(), 2)
+                if self.mode == "after-first-segment":   # 等响应头真的发出去
+                    for _ in range(400):
+                        if any(m["type"] == "http.response.start" for m in sent):
+                            break
+                        await asyncio.sleep(0.005)
+                if disconnect:
+                    await queue.put({"type": "http.disconnect"})
+                await asyncio.wait_for(task, 2)          # 收尾不干净就会在这里超时（= 名额被占）
+            finally:
+                task.cancel()
+        start = next((m for m in sent if m["type"] == "http.response.start"), None)
+        return start["status"] if start else None, sent
+
+    async def test_disconnect_before_first_segment_aborts_without_a_response(self):
+        """首段还没来就断连：一个字节都不该发出去，上游要当场关掉。"""
+        status, sent = await self.drive(disconnect=True)
+        self.assertIsNone(status, f"客户端已经走了， yet 发出了响应头：{sent}")
+        self.assertEqual(self.closed, 1)
+
+    async def test_slot_is_returned_so_the_next_request_still_runs(self):
+        """名额归还：断连之后紧接着的请求必须是正常响应，而不是「并发已满」的 503。"""
+        await self.drive(disconnect=True)
+        self.stuck = asyncio.Event()
+        self.mode = "done"
+        status, _ = await self.drive(disconnect=False)
+        self.assertEqual(status, 200)
+
+    async def test_disconnect_after_streaming_started_closes_the_upstream(self):
+        """已经开始流式之后断连：取消照常打到挂起的上游读，生成器被关干净。"""
+        self.mode = "after-first-segment"
+        status, sent = await self.drive(disconnect=True)
+        self.assertEqual(status, 200, sent)
+        self.assertEqual(self.closed, 1)
+
+
+class ShieldedCloseTests(unittest.IsolatedAsyncioTestCase):
+    """`_close_stream` 必须扛得住「正在被取消」这件事本身。
+
+    断连时 anyio 的取消作用域会在每个检查点重复取消；不屏蔽的话，生成器 finally 里那个
+     await（httpx 在这里关连接）做到一半就被打断，连接和它的读超时一起留在原地。实测：
+    同样的作用域里不加屏蔽，收尾 await 从来跑不完。
+    """
+
+    async def test_cleanup_await_completes_inside_a_cancelled_scope(self):
+        done = []
+
+        async def upstream():
+            try:
+                yield "data: x\n\n"          # 停在 yield 上被关：真实场景是「两段之间」
+            finally:
+                await asyncio.sleep(0.01)
+                done.append("closed")
+
+        agen = upstream()
+        await agen.__anext__()
+
+        async def worker():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await converter._close_stream(agen)
+                done.append("cleanup-survived")
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(worker)
+            await asyncio.sleep(0)
+            group.cancel_scope.cancel()
+        self.assertEqual(done, ["closed", "cleanup-survived"])
 
 
 if __name__ == "__main__":

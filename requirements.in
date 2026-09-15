@@ -1,5 +1,6 @@
 # Direct dependencies; requirements.txt is the generated, hash-locked install file.
 fastapi
+anyio            # 取消屏蔽：下游断连时仍要把上游连接的收尾做完
 uvicorn[standard]
 httpx
 pytest

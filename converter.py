@@ -23,6 +23,7 @@ codebuddy2api — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI 兼�
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -39,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import anyio   # 断连收尾要屏蔽外层取消：用的正是发起取消的那套机制
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler as _default_http_exception_handler
@@ -2345,6 +2347,7 @@ async def chat_completions(request: Request,
          + (f" | tools={tool_names}" if tool_names else "")
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
     # 凭据选择/到期刷新持线程锁与文件锁并可能同步访问网络：放到受限线程池，不占事件循环
+    prepared = body        # 改写前的规范请求体，换凭证重放按它判定绑定
     body, cred, headers, url = await run_in_threadpool(_route_chat, payload, body, rid)
     _log_json(f"[{rid}] REQUEST BODY (发往后端，预览)", body)
     t0 = time.time()
@@ -2352,14 +2355,14 @@ async def chat_completions(request: Request,
     if client_wants_stream:
         def attempt(routed, cred, headers, url):
             return _stream_upstream(url, headers, routed, model_name, t0, rid, cred=cred)
-        return await _routed_stream(payload, body, model_name, rid, t0, attempt,
-                                    body, cred, headers, url)
+        return _routed_stream(payload, prepared, model_name, rid, t0, attempt,
+                              body, cred, headers, url)
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
     async def fetch(routed, cred, headers, url):
         return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
                                          filter_retry=True)
-    collected = await _routed_fetch(payload, body, model_name, rid, t0, fetch,
+    collected = await _routed_fetch(payload, prepared, model_name, rid, t0, fetch,
                                     body, cred, headers, url)
     _log_finish(model_name, t0, collected, rid)
     if CONFIG.get("control_store") is not None:
@@ -2538,9 +2541,18 @@ def _public_sse_line(line, model_name):
 async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name="?"):
     started, opened = time.monotonic(), False
     def retry(error):
-        observe_attempt("connect_retry", error_code=type(error).__name__,
+        """同一连接上的底层重放：换凭证那条日志到不了这里，风险标记得自己带上。
+
+        建连失败/建连超时上游手里没有正文，标出来反而是噪音；写超时按 opt-in 参与重放时，
+        「正文没写完」证不了上游没动过账，所以必须和换凭证重放同一口径标注（评审 P2）。
+        `stage` 分开记，审计里能一眼看出是哪一类重放。
+        """
+        timeout_on_write = isinstance(error, WRITE_TIMEOUT_TRANSPORT)
+        observe_attempt("write_timeout_retry" if timeout_on_write else "connect_retry",
+                        error_code=type(error).__name__,
                         duration_ms=(time.monotonic() - started) * 1000)
-        _log(f"[{rid}] 建连失败，重试 1/1 | {model_name} | {_network_error_text(error)}")
+        _log(f"[{rid}] {'写超时重放' if timeout_on_write else '建连失败'}，重试 1/1 | {model_name}"
+             f" | {_network_error_text(error)}{_replay_cost_note(error)}")
     try:
         async with open_backend_stream(url, headers, body, read_timeout=timeout, on_retry=retry,
                                        retry_write_timeout=bool(CONFIG.get("retry_write_timeout"))) as response:
@@ -2773,6 +2785,40 @@ class _StreamFailure(Exception):
         super().__init__(f"stream failed before first byte (HTTP {status})")
 
 
+async def _first_segment(agen):
+    """取生成器的第一段输出，但把「我们的等待」和「生成器自己的收尾」分开放。
+
+    直接在当前任务里 `await agen.__anext__()` 也有问题：下游断连时取消打在生成器帧内部的
+    await 上，而 anyio 的取消作用域会在每个检查点重复取消 —— 帧自己的 `finally` 做到一半就
+    被打断（`httpx` 正是在这里关连接），实测那段清理根本跑不完，连接留到读超时。放进子任务
+    之后，外层取消打断的是我们的 `await`，我们只取消子任务一次，再屏蔽着等它把 `finally`
+    走完。结果不取：取消语义下这一轮已经作废，交给调用方关流。
+    """
+    task = asyncio.ensure_future(agen.__anext__())
+    try:
+        return await asyncio.shield(task)
+    except BaseException:
+        task.cancel()
+        with anyio.CancelScope(shield=True):
+            await asyncio.wait([task])
+        if not task.cancelled():
+            task.exception()     # 取回异常，别留给 asyncio 报「never retrieved」
+        raise
+
+
+async def _stream_segments(agen):
+    """逐段读上游，语义等同 `async for chunk in agen`，但每一段都可被干净打断。
+
+    复用 `_first_segment`：断连落在「两段之间」还是「正等下一段」都无所谓，生成器自己的
+    `finally` 都能走完。
+    """
+    while True:
+        try:
+            yield await _first_segment(agen)
+        except StopAsyncIteration:
+            return
+
+
 async def _preflight_stream(agen, model_name, t0, rid):
     """取到第一段输出之后再决定怎么回 200。
 
@@ -2784,7 +2830,7 @@ async def _preflight_stream(agen, model_name, t0, rid):
     （那时状态码已经收不回来了）。
     """
     try:
-        return await agen.__anext__()
+        return await _first_segment(agen)
     except StopAsyncIteration:
         empty = UpstreamResponseError(502, b'{"error":{"message":"upstream returned an empty stream",'
                                       b'"type":"upstream_error","code":"empty_response"}}')
@@ -2795,35 +2841,84 @@ async def _preflight_stream(agen, model_name, t0, rid):
         raise _StreamFailure(status, raw, error) from None
 
 
-def _stream_response(agen, first):
-    """把预取到的第一段接回流，之后保持原有生成器语义。"""
-    async def body():
-        yield first
-        async for chunk in agen:
-            yield chunk
-    return StreamingResponse(body(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+async def _close_stream(agen) -> None:
+    """显式收尾上游生成器，并屏蔽外层取消。
+
+    下游断连时取消正在反复投递（anyio 的取消作用域会在每个检查点再取消一次），不屏蔽的话
+    `httpx` 的关闭做到一半就被打断，上游连接和它的读超时一起留在原地。清理失败不改变已经
+    定型的响应，所以这里只吞掉异常，不吞掉取消。
+    """
+    if agen is None:
+        return
+    with anyio.CancelScope(shield=True):
+        try:
+            await agen.aclose()
+        except Exception:
+            pass
+
+
+def _chunk_bytes(chunk, charset: str = "utf-8"):
+    return chunk if isinstance(chunk, (bytes, memoryview)) else chunk.encode(charset)
+
+
+class _DeferredStreamResponse(StreamingResponse):
+    """把「预取第一段 + 必要的换凭证重放」放进 ASGI 生命周期里做的流式响应。
+
+    预取不能就在端点里 `await`：`StreamingResponse.__call__` 是把 `stream_response` 和
+    `listen_for_disconnect` 放进同一个任务组跑的，端点返回之前根本没有谁在消费
+    `http.disconnect`。上游首段一旦卡住而客户端已经走了，这个 await 会一直挂到读超时，
+    `ConcurrencyLimitMiddleware` 的名额也跟着占满 —— 表现为整个网关 503。搬进
+    `stream_response` 之后，断连取消的就是我们此刻的 await，挂起的上游读被打断，生成器的
+    finally 跑得完，名额立刻归还。
+
+    响应头仍然等到确实有字节可发时才发出，所以「把失败还原成真实状态码」的能力不受影响：
+    失败以 `HTTPException` 抛出，由 ExceptionMiddleware 成形（`/v1/*` 走协议化错误体），
+    那一刻一个字节都还没出去。客户端中途断连则按普通流式断连处理 —— 取消穿出 `__call__`，
+    和响应已经开始之后的行为一致；两种窗口里的读取都走 `_first_segment`，
+    取消之后生成器的收尾仍然跑得完。
+    """
+
+    def __init__(self, plan):
+        self._plan = plan        # async callable -> (上游生成器, 已预取的第一段)
+        super().__init__(content=(), media_type="text/event-stream",
+                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def stream_response(self, send) -> None:
+        agen, first = await self._plan()
+        try:
+            await send({"type": "http.response.start", "status": self.status_code,
+                        "headers": self.raw_headers})
+            await send({"type": "http.response.body", "body": _chunk_bytes(first, self.charset),
+                        "more_body": True})
+            async for chunk in _stream_segments(agen):
+                await send({"type": "http.response.body", "body": _chunk_bytes(chunk, self.charset),
+                            "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            await _close_stream(agen)
 
 
 def _failover_limit() -> int:
     return int(CONFIG.get("failover_max") or 0)
 
 
-async def _routed_stream(payload, body, model_name, rid, t0, make, routed, cred, headers, url):
-    """流式端点：预取失败时按策略换凭证重打，全部失败才把真实状态码回给下游。
+async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cred, headers, url):
+    """预取第一段，失败就按策略换凭证重打；返回 (生成器, 首段)，全线失败才抛 `HTTPException`。
 
     重放只发生在「一个字节都没发给下游」的时候（`_preflight_stream` 保证了这点），所以下游
     看到的仍然是一次正常请求。`make(routed, cred, headers, url)` 每轮只建一个生成器。
+
+    `canonical` 与 `routed` 必须分开：`_route_chat` 会把逻辑模型（`auto`）改写成该站点的
+    默认模型再发出去，所以 `routed` 是「本轮的真实报文」，而重路由只能拿改写前的 `canonical`
+    去问绑定规则 —— 否则第二轮查的是默认模型，客户端原来说的 `auto` 的账号/站点限制就丢了。
     """
     tried = []
     while True:
         stream = make(routed, cred, headers, url)
         try:
             first = await _preflight_stream(stream, model_name, t0, rid)
-            if tried:
-                observe_recovery()   # 重放救回来的请求对下游是正常响应，不该记成失败
-            return _stream_response(stream, first)
         except _StreamFailure as failure:
+            await _close_stream(stream)   # 本轮的上游已经终止，关掉只是兜底，不留半开的连接
             tried.append(cred)
             limit = _failover_limit()
             surface = HTTPException(status_code=failure.status,
@@ -2831,7 +2926,7 @@ async def _routed_stream(payload, body, model_name, rid, t0, make, routed, cred,
             if limit <= 0 or len(tried) > limit or not _failover_safe(failure.error, failure.raw):
                 raise surface from None
             try:
-                attempt = await run_in_threadpool(_route_chat, payload, body, rid,
+                attempt = await run_in_threadpool(_route_chat, payload, canonical, rid,
                                                   tried={_cred_manager(item) for item in tried})
             except HTTPException:
                 raise surface from None      # 换不出别的凭证，就如实回第一次的错
@@ -2841,10 +2936,32 @@ async def _routed_stream(payload, body, model_name, rid, t0, make, routed, cred,
             _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | {model_name} | 上游 HTTP "
                  f"{failure.status} → {profile_for_headers(headers)}"
                  f"{_replay_cost_note(failure.error)}")
+            continue                       # 换一个凭证，再预取一次
+        except BaseException:
+            # 下游断连（取消）或没预料到的错误：先把本轮上游收掉，再把异常原样交出去
+            await _close_stream(stream)
+            raise
+        if tried:
+            observe_recovery()   # 重放救回来的请求对下游是正常响应，不该记成失败
+        return stream, first
 
 
-async def _routed_fetch(payload, body, model_name, rid, t0, fetch, routed, cred, headers, url):
-    """非流式请求：失败时按同一策略换凭证重打（此时一个字节都还没回给下游）。"""
+def _routed_stream(payload, canonical, model_name, rid, t0, make, routed, cred, headers, url):
+    """流式端点入口：返回一个把预取与重放留待 ASGI 生命周期内执行的响应。
+
+    这里刻意「什么都不做就返回」：预取必须发生在 `_DeferredStreamResponse.stream_response`
+    里，那里才有下游断连监听（见该类的说明）。
+    """
+    return _DeferredStreamResponse(
+        lambda: _stream_plan(payload, canonical, model_name, rid, t0, make,
+                             routed, cred, headers, url))
+
+
+async def _routed_fetch(payload, canonical, model_name, rid, t0, fetch, routed, cred, headers, url):
+    """非流式请求：失败时按同一策略换凭证重打（此时一个字节都还没回给下游）。
+
+    `canonical` 同 `_routed_stream`：重路由用改写前的规范请求体，判定才落在客户端模型上。
+    """
     tried = []
     while True:
         try:
@@ -2860,7 +2977,7 @@ async def _routed_fetch(payload, body, model_name, rid, t0, fetch, routed, cred,
             if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
                 raise surface from None
             try:
-                attempt = await run_in_threadpool(_route_chat, payload, body, rid,
+                attempt = await run_in_threadpool(_route_chat, payload, canonical, rid,
                                                   tried={_cred_manager(item) for item in tried})
             except HTTPException:
                 raise surface from None
@@ -2948,6 +3065,7 @@ async def create_response(request: Request,
         f"| anchor_user={projection_stats.get('anchor_user_preserved', False)}"
     )
     # 同上：凭据选择/刷新是阻塞操作，移出事件循环
+    prepared = chat_body        # 改写前的规范请求体，见 `_routed_stream`
     chat_body, cred, headers, url = await run_in_threadpool(_route_chat, payload, chat_body, rid)
     _log_json(f"[{rid}] RESPONSES → CHAT BODY (预览)", chat_body)
     t0 = time.time()
@@ -2955,23 +3073,23 @@ async def create_response(request: Request,
     if client_wants_stream:
         def attempt(routed, cred, headers, url):
             return _stream_responses(url, headers, routed, model_name, t0, rid, cred=cred)
-        return await _routed_stream(payload, chat_body, model_name, rid, t0, attempt,
-                                    chat_body, cred, headers, url)
+        return _routed_stream(payload, prepared, model_name, rid, t0, attempt,
+                              chat_body, cred, headers, url)
 
     return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred,
-                                    payload=payload)
+                                    payload=payload, canonical=prepared)
 
 
 async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False,
-                             payload=None):
+                             payload=None, canonical=None):
     converter = (AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name, parallel_tool_calls=body.get("parallel_tool_calls", True)))
 
     async def fetch(routed, cred, headers, url):
         return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
                                          filter_retry=True)
     try:
-        collected = await _routed_fetch(payload, body, model_name, rid, t0, fetch,
-                                        body, cred, headers, url)
+        collected = await _routed_fetch(payload, body if canonical is None else canonical,
+                                        model_name, rid, t0, fetch, body, cred, headers, url)
         for line in _chat_result_to_sse_lines(_completion_to_merged(collected)):
             converter.feed_line(_public_sse_line(line, model_name))
         converter.finish()
@@ -3054,18 +3172,19 @@ async def create_message(request: Request,
     rid = os.urandom(4).hex()
     _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
     # 同上：凭据选择/刷新是阻塞操作，移出事件循环
+    prepared = chat_body        # 改写前的规范请求体，见 `_routed_stream`
     chat_body, cred, headers, url = await run_in_threadpool(_route_chat, payload, chat_body, rid)
     _log_json(f"[{rid}] ANTHROPIC → CHAT BODY (预览)", chat_body)
     t0 = time.time()
 
     if not _client_wants_stream(payload):
         return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred,
-                                        anthropic=True, payload=payload)
+                                        anthropic=True, payload=payload, canonical=prepared)
 
     def attempt(routed, cred, headers, url):
         return _stream_anthropic(url, headers, routed, model_name, t0, rid, cred=cred)
-    return await _routed_stream(payload, chat_body, model_name, rid, t0, attempt,
-                                chat_body, cred, headers, url)
+    return _routed_stream(payload, prepared, model_name, rid, t0, attempt,
+                          chat_body, cred, headers, url)
 
 
 async def _stream_anthropic(url: str, headers: dict, body: dict,
