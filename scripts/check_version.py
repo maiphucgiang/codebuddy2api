@@ -1,4 +1,4 @@
-"""检查稳定版本格式及发布标签的一致性。"""
+"""Validate stable version syntax and release-tag consistency."""
 
 import os
 import re

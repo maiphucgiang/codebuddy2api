@@ -1,4 +1,4 @@
-"""国际 WorkBuddy 一次性体验领取；账号指纹记账，失败至少退避 24 小时。"""
+"""Track one-time international WorkBuddy trial claims with account-scoped daily failure backoff."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ REQUEST_TIMEOUT = 12.0
 MAX_RESPONSE_BYTES = 64 * 1024
 RESPONSE_DEADLINE = 30.0
 _MAX_BYTES = 1024 * 1024
-_MAX_ACCOUNTS = 2048  # 满时拒绝新增，不能逐出已经领取的永久记录。
+_MAX_ACCOUNTS = 2048  # Reject new entries rather than evict permanent claim records.
 _RESULT_FIELDS = {"ok", "already", "code", "status"}
 _RECORD_FIELDS = _RESULT_FIELDS | {"attempted_at", "finished_at"}
 
@@ -67,7 +67,7 @@ def _trial_headers(headers):
 
 
 def claim_trial(headers: dict) -> dict:
-    """仅一次同域 POST；保留传入身份头，不跟随重定向、不重试、不输出响应原文。"""
+    """Send one same-origin POST without redirects, retries or raw response disclosure."""
     headers = _trial_headers(headers)
     status = None
     started = time.monotonic()
@@ -105,7 +105,7 @@ def claim_trial(headers: dict) -> dict:
     data = envelope.get("data")
     if data is not None and not isinstance(data, dict):
         return result
-    # 不把 code=0 与显式失败（或非布尔成功标志）的矛盾响应当成成功。
+    # A zero code cannot override an explicit failure or malformed success flag.
     for layer in (envelope, data or {}):
         for flag in ("success", "ok"):
             if flag in layer and (type(layer[flag]) is not bool or (code == 0 and not layer[flag])):
@@ -148,15 +148,15 @@ class TrialSaveError(OSError):
 
 
 class TrialLedger:
-    """锁保护的限量 JSON 账本；读改写均在同一跨进程锁内，不缓存磁盘状态。"""
+    """Persist a bounded JSON ledger under one cross-process read-modify-write lock."""
 
     def __init__(self, path):
         path = Path(path)
         if not path.name or path.name in (".", ".."):
             raise ValueError("Trial ledger requires a file path")
-        # 只规范化父目录，不能 resolve 最终文件而跟随其符号链接。
+        # Resolve the parent without following a symlink at the final filename.
         self.path = path.parent.resolve() / path.name
-        # credential_file_lock 的 name 契约是普通 .info 文件名；不限制账本后缀。
+        # Use an .info lock name independently of the ledger filename suffix.
         self._lock_name = "trial-" + hashlib.sha256(self.path.name.encode()).hexdigest() + ".info"
 
     def _lock(self):
@@ -219,7 +219,7 @@ class TrialLedger:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
-            # 文件 fsync 不保证 rename 在掉电后留存；准许 POST 前也同步目录项。
+            # Sync the directory entry before allowing a claim POST.
             if os.name != "nt":
                 directory_fd = os.open(self.path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
                 try:
@@ -233,7 +233,7 @@ class TrialLedger:
                 pass
 
     def begin(self, key, now=None) -> bool:
-        """仅返回 True 才可发送；保存/锁/读取错误向调用方传播。now 为 epoch 秒。"""
+        """Authorize sending only after durable reservation; propagate storage and lock failures."""
         key = _key(key)
         with self._lock():
             current = _timestamp(time.time() if now is None else now)
@@ -250,7 +250,7 @@ class TrialLedger:
             return True
 
     def finish(self, key, result, now=None) -> None:
-        """无 begin 则拒绝；永久状态不被迟到的失败覆盖；忽略额外/秘密字段。"""
+        """Require a reservation, preserve permanent outcomes and ignore unapproved response fields."""
         key, result = _key(key), _safe_result(result)
         with self._lock():
             current = _timestamp(time.time() if now is None else now)
@@ -270,7 +270,7 @@ class TrialLedger:
 
 
     def summary(self, key) -> dict:
-        """返回独立的安全快照，不包含指纹、路径、headers 或原始响应。"""
+        """Return a safe independent snapshot without identities, paths, headers or raw responses."""
         key = _key(key)
         with self._lock():
             return dict(self._load().get(key, _empty_record()))

@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import copy
 import json
@@ -188,7 +188,7 @@ print("ok")
 '''
         result = subprocess.run(
             [sys.executable, "-B", "-c", code],
-            cwd=Path(__file__).resolve().parents[1],  # 仓库根：子进程需 import 应用模块
+            cwd=Path(__file__).resolve().parents[1],  # Allow application imports in the subprocess.
             capture_output=True, text=True, timeout=10, check=True,
         )
         self.assertEqual(result.stdout.strip(), "ok")

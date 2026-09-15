@@ -94,7 +94,7 @@ def install(gateway):
     from .inbound_limits import ConcurrencyLimitMiddleware, InboundBodyLimitMiddleware
     app.add_middleware(InboundBodyLimitMiddleware, config=config)
     app.add_middleware(ConcurrencyLimitMiddleware, config=config)
-    # 最外层先校验请求头；未鉴权的慢请求不得占用推理名额或进入请求体缓冲。
+    # Authenticate headers before consuming inference capacity or buffering request bodies.
     app.add_middleware(InferenceAuthMiddleware, config=config)
     install_pages(app, Path(gateway.__file__).resolve().parent / "web" / "dist")
 

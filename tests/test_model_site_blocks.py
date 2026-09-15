@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""(后端, 模型) 避让回归：官方回 11102「该站点无此模型」后不再反复派发，且能自动绕开/自愈。
-
-合成凭据 + 临时目录，不访问网络、不读取本机 auth/。
-运行：python -B tests/test_model_site_blocks.py
-"""
+"""Test backend/model backoff, routing and recovery with synthetic offline credentials."""
 
 import json
 import os
@@ -16,7 +12,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import converter
 from app.model_blocks import ModelBlocks
@@ -35,7 +31,7 @@ def _error_body(code, message, request_id="0198f5a6b7c8d9e0f1a2b3c4d5e6f7a8"):
 
 
 def test_parse_not_servable_reads_code_field():
-    """11102 只在独立 code 字段上命中，比对整字段而不是整段文本。"""
+    """Match unsupported-model codes only in dedicated response fields."""
     message = f"model [{MODEL}] service info not found"
     assert converter._parse_not_servable(_error_body(11102, message), 404) == ("11102", message)
     assert converter._parse_not_servable(_error_body(11102, "no such model"), 400) is not None
@@ -43,7 +39,7 @@ def test_parse_not_servable_reads_code_field():
 
 
 def test_parse_not_servable_ignores_other_errors():
-    """额度、认证、审核等错误不能进避让表：它们是可重试的凭证级问题。"""
+    """Exclude quota, authentication and filter errors from model backoff."""
     cases = [
         (_error_body(11001, "quota exceeded"), 429),
         (_error_body(1002, "token expired"), 401),
@@ -52,8 +48,8 @@ def test_parse_not_servable_ignores_other_errors():
         (b"", 404),
         (_error_body("other", "internal error"), 400),
         (json.dumps({"error": {"message": "rate limit reached"}}).encode(), 429),
-        (_error_body("other", "boom", request_id="req-11102"), 404),   # 11102 只在 requestId 里
-        (_error_body(11102, "service info not found"), 429),           # 只认 400/404
+        (_error_body("other", "boom", request_id="req-11102"), 404),   # Incidental request ID
+        (_error_body(11102, "service info not found"), 429),           # Only 400/404 qualifies.
     ]
     for raw, status in cases:
         assert converter._parse_not_servable(raw, status) is None, (raw, status)
@@ -61,15 +57,15 @@ def test_parse_not_servable_ignores_other_errors():
 
 
 def test_parse_not_servable_reads_wrapped_error_object():
-    """OpenAI 风格的 {"error": {...}} 包装同样能识别。"""
+    """Recognize unsupported-model errors inside OpenAI error envelopes."""
     raw = json.dumps({"error": {"code": "11102", "message": "model service info not found"}}).encode()
     assert converter._parse_not_servable(raw, 404) is not None
-    assert converter._parse_not_servable(b'{"requestId": "11102"}', 404) is None   # 只有 ID 不算
+    assert converter._parse_not_servable(b'{"requestId": "11102"}', 404) is None   # IDs are not error codes.
     print("✅ test_parse_not_servable_reads_wrapped_error_object")
 
 
 class ModelBlocksTests(unittest.TestCase):
-    """避让表本身：TTL 半开、指数退避、落盘与立即解除。"""
+    """Test backoff expiry, exponential delays, persistence and immediate clearing."""
 
     def test_expiry_is_half_open_not_blacklist(self):
         blocks = ModelBlocks(ttl_s=60, max_ttl_s=600)
@@ -77,7 +73,7 @@ class ModelBlocksTests(unittest.TestCase):
         blocks.note("https://a", "m", code="11102", now=now)
         self.assertTrue(blocks.blocked("https://a", "m", now=now))
         self.assertEqual(blocks.until("https://a", "m", now=now + 59), blocks.until("https://a", "m", now=now))
-        self.assertFalse(blocks.blocked("https://a", "m", now=now + 61))   # 到期放行重试
+        self.assertFalse(blocks.blocked("https://a", "m", now=now + 61))   # Allow probes after expiry.
         self.assertEqual(blocks.until("https://a", "m", now=now + 61), 0.0)
 
     def test_repeated_hits_back_off(self):
@@ -94,7 +90,7 @@ class ModelBlocksTests(unittest.TestCase):
         blocks.note("https://a", "m", now=now)
         self.assertTrue(blocks.clear("https://a", "m", now=now + 1))
         self.assertFalse(blocks.blocked("https://a", "m", now=now + 1))
-        self.assertFalse(blocks.clear("https://a", "m", now=now + 1))   # 幂等
+        self.assertFalse(blocks.clear("https://a", "m", now=now + 1))   # Idempotent clearing
 
     def test_persistence_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,7 +121,7 @@ class ModelBlocksTests(unittest.TestCase):
 
 
 class PoolRoutingTests(unittest.TestCase):
-    """池内路由：绕开缺模型的后端，全部后端都缺时快速失败，实测通了自动解除。"""
+    """Route around unavailable models and clear backoff after confirmed availability."""
 
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -166,17 +162,17 @@ class PoolRoutingTests(unittest.TestCase):
                                    model, region=region)
 
     def test_missing_model_is_not_picked_again(self):
-        """国际站回 11102 之后：请求自动落到国内站，而不是继续打国际站。"""
+        """Route to an eligible domestic backend after an international unsupported-model response."""
         cm, _ = self.by_endpoint[INTL_ENDPOINT]
         self.pool.note_status(cm, 404, model=MODEL, raw=_error_body(11102, "service info not found"))
         self.assertTrue(self.pool._blocks.blocked(INTL_ENDPOINT, MODEL))
-        self.assertIsNone(self.pool.model_block_until(MODEL))            # 还有后端可派发
+        self.assertIsNone(self.pool.model_block_until(MODEL))            # Another backend remains eligible.
         (picked_cm, _generation), _headers = self.cred_for()
         self.assertIs(picked_cm, self.by_endpoint[DOMESTIC_ENDPOINT][0])
         self.assertFalse(self.pool._blocks.blocked(DOMESTIC_ENDPOINT, MODEL))
 
     def test_error_code_field_decodes_to_block(self):
-        """note_status 是唯一入口：404/400 + 11102 记避让，429 走原模型冷却。"""
+        """Separate unsupported-model responses from quota cooldowns."""
         cm, cid = self.by_endpoint[DOMESTIC_ENDPOINT]
         self.pool.note_status(cm, 429, model=MODEL, raw=_error_body(4290, "quota"))
         self.assertFalse(self.pool._blocks.blocked(DOMESTIC_ENDPOINT, MODEL))
@@ -186,7 +182,7 @@ class PoolRoutingTests(unittest.TestCase):
         self.assertTrue(self.pool._blocks.blocked(INTL_ENDPOINT, MODEL))
 
     def test_fast_failure_when_no_backend_serves_it(self):
-        """所有后端都没有该模型：404 明确回给客户端，不再拿空回复让下游编故事。"""
+        """Return HTTP 404 when every backend lacks the requested model."""
         for endpoint in (DOMESTIC_ENDPOINT, INTL_ENDPOINT):
             cm, _ = self.by_endpoint[endpoint]
             self.pool.note_status(cm, 404, model=MODEL, raw=_error_body(11102, "service info not found"))
@@ -198,12 +194,12 @@ class PoolRoutingTests(unittest.TestCase):
         detail = caught.exception.detail["error"]
         self.assertIn(MODEL, detail["message"])
         self.assertEqual(detail["type"], "invalid_request_error")
-        # 避让是 (后端, 模型) 粒度：同后端的别的模型照旧派发
+        # Backend/model backoff does not affect other models on the same backend.
         (picked_cm, _), _headers = self.cred_for(model=OTHER_MODEL)
         self.assertIn(picked_cm, [cm for cm, _ in self.by_endpoint.values()])
 
     def test_block_is_reported_when_only_one_backend_lists_the_model(self):
-        """目录里只有一个后端能服务它，而那个后端已避让：回 404，不要给下游可重试的 503。"""
+        """Return HTTP 404 when the only capable backend is blocked."""
         converter.CONFIG["model_catalogs"][INTL_PROFILE] = [
             {"id": OTHER_MODEL, "name": OTHER_MODEL, "supportsToolCall": True,
              "credits": {"input": 1, "output": 2}}]
@@ -215,7 +211,7 @@ class PoolRoutingTests(unittest.TestCase):
             self.cred_for()
         self.assertEqual(caught.exception.status_code, 404)
         self.assertIn(MODEL, caught.exception.detail["error"]["message"])
-        # 国际站目录里还有的模型照常派发，避让没有被扩大化。
+        # Other international models remain eligible.
         (picked_cm, _), _headers = self.cred_for(model=OTHER_MODEL)
         self.assertIn(picked_cm, [cm for cm, _ in self.by_endpoint.values()])
 
@@ -314,7 +310,7 @@ class PoolRoutingTests(unittest.TestCase):
 
 
     def test_region_scoped_fast_failure(self):
-        """只在国际站内全部避让时才拒 intl 请求；cn 请求照旧通过。"""
+        """Keep international model backoff isolated from domestic requests."""
         cm, _ = self.by_endpoint[INTL_ENDPOINT]
         self.pool.note_status(cm, 404, model=MODEL, raw=_error_body(11102, "service info not found"))
         self.assertIsNotNone(self.pool.model_block_until(MODEL, region="intl"))
@@ -325,7 +321,7 @@ class PoolRoutingTests(unittest.TestCase):
         self.assertIsNotNone(self.cred_for(region="cn"))
 
     def test_success_clears_the_block(self):
-        """后端悄悄上线该模型：一次 200 就解除避让，不必等 TTL。"""
+        """Clear model backoff immediately after a successful response."""
         cm, _ = self.by_endpoint[INTL_ENDPOINT]
         self.pool.note_status(cm, 404, model=MODEL, raw=_error_body(11102, "service info not found"))
         self.assertTrue(self.pool._blocks.blocked(INTL_ENDPOINT, MODEL))
@@ -334,7 +330,7 @@ class PoolRoutingTests(unittest.TestCase):
         self.assertFalse(self.pool.note_model_ok(cm, MODEL))
 
     def test_blocks_survive_restart(self):
-        """避让表落盘：重启后不必重新踩一次坑。"""
+        """Restore persisted model backoff across restarts."""
         cm, _ = self.by_endpoint[INTL_ENDPOINT]
         self.pool.note_status(cm, 404, model=MODEL, raw=_error_body(11102, "service info not found"))
         reopened = converter.CredentialPool(
@@ -344,7 +340,7 @@ class PoolRoutingTests(unittest.TestCase):
         self.assertEqual([row["endpoint"] for row in reopened.model_blocks_detail()], [INTL_ENDPOINT])
 
     def test_alias_auto_is_blocked_under_client_name(self):
-        """intl 把 auto 改写成 default-model 送上去：避让仍记在客户端可见的名字上。"""
+        """Track the public auto model despite its international upstream alias."""
         cm, _ = self.by_endpoint[INTL_ENDPOINT]
         self.pool.note_status(cm, 404, model="default-model",
                               raw=_error_body(11102, "service info not found"))
@@ -353,7 +349,7 @@ class PoolRoutingTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    # CI 用 python -B 直接执行每个测试文件且不装 pytest：先跑模块级检查，再交给 unittest。
+    # Direct CI execution runs module-level checks before unittest without requiring pytest.
     for fn in (test_parse_not_servable_reads_code_field,
                test_parse_not_servable_ignores_other_errors,
                test_parse_not_servable_reads_wrapped_error_object):

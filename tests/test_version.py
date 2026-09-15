@@ -1,8 +1,8 @@
-"""版本文件、应用版本及发布标签校验。"""
+"""Validate version files, application version and release tags."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import tempfile
 import unittest

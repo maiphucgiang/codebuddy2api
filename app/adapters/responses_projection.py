@@ -1,25 +1,4 @@
-"""
-responses_projection — /v1/responses 的后端投影层。
-
-目标
-----
-Codex CLI 会把大量运行时提示、完整工具 schema、长历史、以及工具输出一并塞进
-/v1/responses 请求里。腾讯后端对这类 agentic payload 很容易触发内容审核，或者
-因为上下文过长而表现不稳定。
-
-本模块在保持外部 OpenAI Responses 兼容的前提下，只对发往后端的 Chat body 做
-"最小语义闭包"投影：
-
-- 添加短 system 基线，仅压缩有可信边界的 Codex/Claude Code harness
-- 完整保留自定义 system 和最新真实用户正文，harness 上下文独立限额
-- 保留最近一段真实 assistant/tool 链路
-- 把更早历史压缩成规则摘要
-- 把 tool schema 收敛成结构字段
-- 把超长 tool output / tool arguments 压缩成可继续推理的摘要
-
-含图片时保留消息历史与图片块，只压缩上下文、助手/工具文本及工具元数据。
-真实用户正文不做局部截断；超大请求由既有网关请求上限拒绝。
-"""
+"""Compact trusted harness context, history and tools while preserving user text and images."""
 
 from __future__ import annotations
 
@@ -107,7 +86,7 @@ SCHEMA_KEEP_KEYS = {
 
 
 def project_responses_chat_body(body: dict, *, keep_tool_metadata: bool = False) -> tuple[dict, dict]:
-    """把 Responses 转出来的 Chat body 投影成更适合腾讯后端的最小上下文。"""
+    """Project a Responses-derived Chat body into bounded upstream context."""
     projected = dict(body)
     messages = list(body.get("messages") or [])
     tools = list(body.get("tools") or [])
@@ -293,11 +272,7 @@ def _project_content(content: Any, transform) -> Any:
 
 
 def _project_harness_content(content: Any, context_limit: int) -> tuple[Any, bool, bool]:
-    """Budget only recognized context; never truncate real user/system text.
-
-    Parse each text block independently: a wrapper crossing block boundaries is
-    conservatively retained. Images and unknown blocks count as real content.
-    """
+    """Budget recognized context within each block; preserve real text, images and unknown blocks."""
     matched = False
     has_user_text = isinstance(content, list) and any(
         isinstance(block, dict) and block.get("type") != "text" for block in content

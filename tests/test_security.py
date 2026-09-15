@@ -1,8 +1,8 @@
-"""凭据导入、健康接口和会话标识的安全回归测试。"""
+"""Test credential imports, public health and session identity security."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import asyncio
 import hashlib

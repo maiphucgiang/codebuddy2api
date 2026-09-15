@@ -136,12 +136,12 @@ class AuditStoreTests(unittest.TestCase):
         self.assertEqual(self.store.storage()["last_error"], "TimeoutError")
 
     def test_v1_ingest_table_migrates_with_backfilled_timestamps(self):
-        """v1 库（ingest 无 created_at）打开即迁移：列回填、索引建立、保留期内仍可去重。"""
+        """Migrate v1 ingest timestamps and indexes while preserving retained deduplication."""
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "audit.sqlite3"
             with closing(sqlite3.connect(str(path))) as db:
                 db.execute("BEGIN IMMEDIATE")
-                db.execute("CREATE TABLE ingest (id TEXT PRIMARY KEY, kind TEXT NOT NULL)")  # v1 形状
+                db.execute("CREATE TABLE ingest (id TEXT PRIMARY KEY, kind TEXT NOT NULL)")  # Legacy schema
                 db.execute("INSERT INTO ingest VALUES('legacy-req', 'request')")
                 db.execute("PRAGMA user_version=1")
                 db.execute("COMMIT")
@@ -175,7 +175,7 @@ class AuditStoreTests(unittest.TestCase):
         self.store.record_request(self.record("old", started_at=time.time() - 31 * 86400))
         self.assertIsNone(self.store.get_request("old"))
         self.assertEqual(self.store.dashboard(90)["summary"]["requests"], 2)
-        # 去重行与明细同截止期过期：超过保留期的旧 ID 不再判定为重复（防重放仅限保留期内）
+        # Deduplication expires with request details rather than blocking IDs permanently.
         self.assertTrue(self.store.record_request(self.record("old"))["recorded"])
         health = self.store.storage()
         for name in ("db_bytes", "wal_bytes", "shm_bytes"):
@@ -422,7 +422,7 @@ class AuditStoreTests(unittest.TestCase):
             if not health["pending_cleanup"]:
                 break
         self.assertFalse(health["pending_cleanup"])
-        # 去重行与明细同截止期过期：ingest 数归零，聚合统计不受影响
+        # Deduplication expires with details without affecting aggregate statistics.
         self.assertEqual(self.assert_accounting(), (0, 0, 0, 0))
         self.assertEqual(self.aggregate_snapshot(), aggregates)
         self.assertFalse(health["degraded"])

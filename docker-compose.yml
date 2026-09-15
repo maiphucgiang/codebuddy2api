@@ -1,4 +1,4 @@
-# 使用兼容旧版 Compose 的语法；.env 自动参与变量插值，Shell 环境优先。
+# Support legacy Compose syntax; shell variables override automatic .env interpolation.
 version: "3.8"
 
 
@@ -10,20 +10,19 @@ services:
     ports:
       - "${CODEBUDDY2API_BIND:-127.0.0.1}:${CODEBUDDY2API_PORT:-8787}:8787"
     volumes:
-      # .info 凭证、control.sqlite3、logs.sqlite3 及 SQLite WAL/SHM 共用持久目录。
-      # SQLite 需要可写的本地文件系统；不要只挂载单个数据库文件。
+      # Persist credentials, SQLite databases and WAL/SHM files in one writable local directory.
       - "${CODEBUDDY2API_AUTH_PATH:-./auth}:/data/auth"
     environment:
       CODEBUDDY2API_KEY: ${CODEBUDDY2API_KEY:-}
       CODEBUDDY2API_ADMIN_CSRF: ${CODEBUDDY2API_ADMIN_CSRF:-true}
-      # 未设置时不注入环境变量，保留 WebUI 配置能力。
+      # Unset variables remain configurable through the WebUI.
       CODEBUDDY2API_KEEP_TOOL_METADATA:
       CODEBUDDY2API_MAX_IMAGES: ${CODEBUDDY2API_MAX_IMAGES:-16}
       CODEBUDDY2API_IMAGE_POLICY: ${CODEBUDDY2API_IMAGE_POLICY:-truncate}
       CODEBUDDY2API_MAX_REQUEST_BYTES: ${CODEBUDDY2API_MAX_REQUEST_BYTES:-33554432}
       CODEBUDDY2API_LOG_BODY_LIMIT: ${CODEBUDDY2API_LOG_BODY_LIMIT:-65536}
       CODEBUDDY2API_LOG: ${CODEBUDDY2API_LOG:-}
-      # 容器内固定 0.0.0.0；对外暴露边界由上方 BIND 端口映射控制（默认仅回环）
+      # Bind container interfaces; host port mapping controls external access.
       CODEBUDDY2API_ALLOW_OPEN_NOAUTH: "true"
       CODEBUDDY_AUTH_DIR: /data/auth
     command: >

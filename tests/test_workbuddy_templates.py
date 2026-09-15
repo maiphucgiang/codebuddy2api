@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""WorkBuddy 固定模板适配回归；不依赖服务、网络或第三方测试框架。
-
-直接运行：python3 -B tests/test_workbuddy_templates.py
-"""
+"""Test WorkBuddy template adaptation without services, network access or external test frameworks."""
 
 import copy
 import re
@@ -213,7 +210,7 @@ class WorkBuddyBodyTests(unittest.TestCase):
         actual = out["messages"][0]["content"]
         self.assertIn(CODEBUDDY + "." + behavior, actual)
         self.assertNotIn("runtime-payload-sentinel", actual)
-        self.assertIn("tool-inventory-sentinel", actual)  # 无明确闭合边界的尾段保留。
+        self.assertIn("tool-inventory-sentinel", actual)  # Preserve tails without a trusted closing boundary.
         self.assertIn("Environment context is provided by the harness.", actual)
         self.assertNotIn("Runtime tool, agent,", actual)
         self.assertEqual(desensitize_body(out, compact_harness=False), out)
@@ -282,7 +279,7 @@ class WorkBuddyGitStatusTests(unittest.TestCase):
                 for blocks in (False, True):
                     for compact in (False, True):
                         with self.subTest(header=header, identity=identity, blocks=blocks, compact=compact):
-                            # 敏感词、标记和多空行是哨兵：gitStatus 不走词表或 runtime/compact 裁剪。
+                            # Sentinel terms, markers and whitespace must remain unchanged in gitStatus.
                             tail = (
                                 "\nCurrent branch: feature/Claude-Code-malware\n\n\n"
                                 "Status:\n M Anthropic.txt\n?? malware-notes.md\n"
@@ -376,16 +373,16 @@ class WorkBuddyGitStatusTests(unittest.TestCase):
 
 
 class WordBoundaryTests(unittest.TestCase):
-    """敏感词只在真实词边界命中：含关键词的标识符/路径不得被插入零宽空格。"""
+    """Match complete template terms without changing keyword-containing identifiers or paths."""
     def test_identifiers_and_paths_containing_terms_are_untouched(self):
         for text in ("~/.agents/skills/x", "skillset", "mysandbox", "attacksurface",
-                     "data_exfiltration", "killall5", "weaponsmith"):  # 含 kill/sandbox/attack/weapon 等词项
+                     "data_exfiltration", "killall5", "weaponsmith"):  # Terms embedded in identifiers
             with self.subTest(text=text):
                 self.assertEqual(desensitize_text(text), text)
     def test_standalone_terms_still_split(self):
         self.assertEqual(desensitize_text("kill the process"), "kill".replace("k", "k" + ZWSP, 1) + " the process")
         self.assertNotEqual(desensitize_text("Sandbox mode"), "Sandbox mode")
-        self.assertNotEqual(desensitize_text("a kill-switch"), "a kill-switch")  # 连字符是边界
+        self.assertNotEqual(desensitize_text("a kill-switch"), "a kill-switch")  # Hyphens form word boundaries.
         self.assertEqual(desensitize_text("skills."), "skills.")
 
 

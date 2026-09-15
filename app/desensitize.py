@@ -1,8 +1,4 @@
-"""可选的客户端模板适配：固定句替换、运行时摘要与零宽词表。
-
-默认只处理 system，可选 developer 和已识别的 harness user；真实对话不改写。
-只缓解固定模板误拦，不保证上游接受请求，也不改变对真实输入的审核。
-"""
+"""Adapt selected roles and trusted harness templates while preserving real conversation content."""
 
 from __future__ import annotations
 
@@ -11,13 +7,12 @@ from typing import Any, Iterable
 
 from app.harness_context import parse_harness_text
 
-# 零宽空格：插入到关键词内部，打断后端的关键词匹配，但模型/人眼读起来无差别。
+# Insert a zero-width separator within matched template terms.
 _ZWSP = "\u200b"
 
-# 触发审核的"合规声明高频词"（来自真实被拦截的客户端 system 模板）。
-# 全部是"拒绝作恶"语境里常见的英文术语。大小写不敏感匹配。
+# Case-insensitive terms found in known client compliance templates.
 SENSITIVE_TERMS: list[str] = [
-    # 原有词表
+    # Shared template terms
     "DoS",
     "DDoS",
     "exploit",
@@ -49,7 +44,7 @@ SENSITIVE_TERMS: list[str] = [
     "botnet",
     "zero-day",
     "0day",
-    # Codex CLI system prompt 里额外的高频触发词
+    # Codex template terms
     "vulnerability",
     "vulnerabilities",
     "red teaming",
@@ -94,7 +89,7 @@ SENSITIVE_TERMS: list[str] = [
     "kill",
     "violence",
     "violent",
-    # Claude Code / Anthropic 品牌词（避免竞争品牌词触发审核）
+    # Claude Code template terms
     "Claude Code",
     "Claude Opus",
     "Claude Sonnet",
@@ -105,9 +100,7 @@ SENSITIVE_TERMS: list[str] = [
     "noreply@anthropic.com",
 ]
 
-# 编译成一个大正则，按词长降序，避免短词先吃掉长词。
-# 词边界用显式环视而不是 \b：词表含连字符/@等标点词，\b 语义不可靠；
-# 前后若是字母数字下划线则不匹配，skills 这类含关键词的标识符/路径不再被误改。
+# Match longer terms first and preserve identifier boundaries.
 _PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
     + "|".join(re.escape(t) for t in sorted(SENSITIVE_TERMS, key=len, reverse=True))
@@ -115,7 +108,7 @@ _PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# 只改已知客户端模板；不全局清除空白或零宽字符。
+# Limit substitutions to known templates without globally stripping whitespace.
 def _template_pattern(text: str) -> re.Pattern:
     words = [(_ZWSP + "*").join(re.escape(char) for char in word) for word in text.split(" ")]
     return re.compile(r"(?<!\w)" + r"[\s\u200b]+".join(words) + _ZWSP + r"*(?!\w)", re.IGNORECASE)
@@ -182,16 +175,15 @@ def _is_claude_system(text: str) -> bool:
             or "You are Claude Code" in text)
 
 
-# Codex CLI 会把大量运行时上下文包装进一条 user 消息里；这些不是用户真正提问，
-# 里面常含 permissions / sandbox / skills 等说明，也会触发后端审核。
+# Trusted harness wrappers distinguish runtime context from real user requests.
 _HARNESS_USER_MARKERS = (
     "# AGENTS.md instructions",
     "<environment_context>",
     "<permissions instructions>",
     "<collaboration_mode>",
     "<skills_instructions>",
-    "<system-reminder>",           # Claude Code 注入的运行时上下文
-    "# claudeMd",                  # Claude Code CLAUDE.md 注入
+    "<system-reminder>",           # Claude Code runtime context
+    "# claudeMd",                  # Injected CLAUDE.md context
 )
 
 _CODEX_SYSTEM_MARKERS = (
@@ -215,15 +207,15 @@ _SKILLS_MARKERS = (
 
 
 def _zero_width_split(term: str) -> str:
-    """在词内部插入零宽空格。如 'DoS' -> 'Do\\u200bS'。"""
+    """Insert a zero-width separator inside a matched term."""
     if len(term) <= 1:
         return term
-    # 在第 1 个字符后插入即可（足够打断子串匹配，且改动最小）
+    # One separator after the first character is sufficient.
     return term[0] + _ZWSP + term[1:]
 
 
 def desensitize_text(text: str) -> str:
-    """先替换已知客户端模板，再对词表插入零宽空格。"""
+    """Apply known template substitutions and word-level zero-width separators."""
     if not text:
         return text
     context = _GIT_STATUS_CONTEXT.search(text)
@@ -234,9 +226,9 @@ def desensitize_text(text: str) -> str:
 
 
 def _iter_text_blocks(content):
-    """遍历 OpenAI content（字符串或 [{type, text}, ...]）里的文本块，返回 (容器, key)。"""
+    """Yield text containers and keys from string or block-based Chat content."""
     if isinstance(content, str):
-        yield content, None  # 字符串：调用方直接替换
+        yield content, None  # The caller replaces plain strings directly.
     elif isinstance(content, list):
         for blk in content:
             if isinstance(blk, dict) and blk.get("type") == "text":
@@ -244,7 +236,7 @@ def _iter_text_blocks(content):
 
 
 def _content_to_text(content) -> str:
-    """把字符串或 content blocks 规整成纯文本，便于识别注入模板。"""
+    """Extract plain text from content blocks for trusted-template detection."""
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         parts = []
@@ -256,21 +248,21 @@ def _content_to_text(content) -> str:
 
 
 def _looks_like_harness_user_message(content) -> bool:
-    """判断 user 消息是否其实是 Codex/CLI 注入的上下文，而非用户自然输入。"""
+    """Identify trusted harness context rather than natural user input."""
     text = _content_to_text(content)
     return any(marker in text for marker in _HARNESS_USER_MARKERS)
 
 
 def _prune_runtime_fragments(role: str, text: str) -> str:
-    """只处理有可信边界的上下文，不猜测未知段落或裁掉其后的指令。"""
+    """Compact only context with trusted boundaries, preserving unknown text and trailing instructions."""
     return parse_harness_text(text).render() if text else text
 
 
 def _compact_harness_message(role: str, content) -> str | None:
-    """保留既有 system 压缩策略；user 由结构化提取路径单独处理。"""
+    """Compact system context independently of structured user-context extraction."""
     if isinstance(content, list) and any(
             not isinstance(block, dict) or block.get("type") != "text" for block in content):
-        return None  # 摘要不能吞掉图片或未知内容块。
+        return None  # Summaries must not discard images or unknown blocks.
     text = _content_to_text(content)
     if not text:
         return None
@@ -298,7 +290,7 @@ def _compact_harness_message(role: str, content) -> str | None:
 
 
 def _desensitize_tool_value(value: Any, strip_metadata: bool = False):
-    """递归处理 tool 定义，必要时移除高风险描述字段。"""
+    """Recursively adapt tool metadata and remove optional descriptions when configured."""
     if isinstance(value, dict):
         new_value = {}
         for key, item in value.items():
@@ -330,11 +322,7 @@ def desensitize_messages(messages: Iterable[dict],
                          roles: tuple[str, ...] = ("system",),
                          desensitize_harness_user: bool = False,
                          compact_harness: bool = False) -> list[dict]:
-    """对指定角色的消息文本做脱敏，返回新的 messages 列表（不修改原对象）。
-
-    默认只处理 system 角色（合规模板集中地）。可选处理 developer，
-    以及 Codex 注入的 harness user 上下文；真实用户输入保持原样。
-    """
+    """Copy and adapt selected roles or trusted harness text without altering real user input."""
     out: list[dict] = []
     for m in messages:
         if not isinstance(m, dict):
@@ -345,11 +333,11 @@ def desensitize_messages(messages: Iterable[dict],
         if role == "user" and desensitize_harness_user:
             should_desensitize = _looks_like_harness_user_message(m.get("content"))
 
-        nm = dict(m)  # 浅拷贝，不污染调用方
+        nm = dict(m)  # Preserve caller-owned message objects.
         content = m.get("content")
         text = _content_to_text(content) if role == "user" and desensitize_harness_user else ""
         if _GIT_STATUS_CONTEXT.match(text) and re.search(r"(?m)^Current branch:", text):
-            # 官方 gitStatus 是上下文，不压缩分支/状态，也不改其中的普通词。
+            # Preserve official gitStatus context without rewriting branches or status text.
             nm["content"] = _replace_git_status_content(content)
             out.append(nm)
             continue
@@ -394,7 +382,7 @@ def desensitize_body(body: dict, roles: tuple[str, ...] = ("system",),
                      desensitize_tools: bool = False,
                      compact_harness: bool = False,
                      strip_tool_metadata: bool = False) -> dict:
-    """对请求体里的 messages / tools 做脱敏，返回新的 body（浅拷贝）。"""
+    """Return a shallow request copy with adapted messages and tool metadata."""
     changed = False
     nb = dict(body)
     if body.get("messages"):
@@ -412,7 +400,7 @@ def desensitize_body(body: dict, roles: tuple[str, ...] = ("system",),
 
 
 # ---------------------------------------------------------------------------
-# 自测：python3 desensitize.py
+# Standalone template adaptation checks
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -435,13 +423,13 @@ if __name__ == "__main__":
     print("=== messages 脱敏（只处理 system）===")
     msgs = [
         {"role": "system", "content": "Refuse DoS attacks and exploit development."},
-        {"role": "user", "content": "explain DoS attacks"},  # 不应被改
+        {"role": "user", "content": "explain DoS attacks"},  # Preserve real user text.
     ]
     out = desensitize_messages(msgs)
     for m in out:
         print(f"  [{m['role']}] {m['content']!r}")
     print()
-    # 验证：脱敏后 system 改了，user 没改
+    # Only system templates may change.
     assert "\u200b" in out[0]["content"], "system 应被脱敏"
     assert "\u200b" not in out[1]["content"], "user 不应被脱敏"
     print("✓ 自测通过：system 被脱敏，user 保持原样")

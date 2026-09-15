@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""账号候选目录、选择器兼容性、缓存隔离与倍率的离线回归。"""
+"""Test account catalogs, selector compatibility, cache isolation and model rates offline."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import base64
 import json
@@ -23,7 +23,7 @@ def jwt(issuer):
 
 
 def config_payload():
-    """账号根表四项、cli agent 只声明其中两项，形状对齐官方 /v3/config。"""
+    """Model an official catalog with four root entries and two CLI selector entries."""
     def entry(identifier, credits, tools=True):
         item = {"id": identifier, "name": identifier, "credits": credits}
         if tools:
@@ -120,7 +120,7 @@ class CacheScopeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "model-catalog.json"
             cache = ModelCatalogCache(path)
-            cache.put("domestic", [{"id": "legacy"}])          # 升级前写的缓存
+            cache.put("domestic", [{"id": "legacy"}])          # Legacy cache entry
             self.assertEqual(cache.serves("domestic"), [])
             self.assertEqual(ModelCatalogCache(path).models("domestic"), [{"id": "legacy"}])
 
@@ -148,7 +148,7 @@ class CacheScopeTests(unittest.TestCase):
 
 
 class AccountScopeHelperTests(unittest.TestCase):
-    """converter._account_scope：选择器优先、根表补名字、缺目录不外借。"""
+    """Preserve selector metadata, supplement root names and forbid borrowing missing catalogs."""
 
     def test_scope_models_is_the_subset(self):
         account = {"models": [{"id": "picker"}], "serves": [{"id": "root"}]}
@@ -174,7 +174,7 @@ class AccountScopeHelperTests(unittest.TestCase):
 
 
 class FreeTierWithRootScopeTests(unittest.TestCase):
-    """根表补进来的名字按它自己的倍率计费，绝不把 x0.00 借给付费模型。"""
+    """Use each root model's own rate without borrowing a free selector rate."""
 
     def setUp(self):
         data = config_payload()

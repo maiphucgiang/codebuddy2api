@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""inbound_limits.py — 推理端点入站原始字节限量。
-
-端点先 await request.json() 再检查处理后的上游请求体，原始入站大小无人管：大 JSON、
-被忽略的顶层字段、将被剥离的图片都在解析前已经占用了内存。本中间件在 ASGI receive 层
-累计原始字节（含 chunked 传输，不看 Content-Length），超限直接 413，不进入 JSON 解析。
-缓冲体随后原样回放给下游，端点行为不变。
-"""
+"""Bound raw inference request bytes before JSON parsing and replay accepted bodies unchanged."""
 
 from __future__ import annotations
 
@@ -20,9 +14,7 @@ _BODY_PATHS = (*_GATED_PATHS, "/v1/messages/count_tokens")
 
 
 class ConcurrencyLimitMiddleware:
-    """推理端点并发上限：占满立即 503，不排队放大聚合内存。
-
-    信号量从进入持有到响应体发完（含流式），覆盖整个上游连接生命周期。"""
+    """Reject excess inference concurrency with HTTP 503 and retain slots through response completion."""
 
     def __init__(self, app, config):
         self.app = app
@@ -48,7 +40,7 @@ class ConcurrencyLimitMiddleware:
         if limit <= 0:
             return await self.app(scope, receive, send)
         gate = self._gate()
-        if gate.locked():  # 无空闲名额：立即失败并给出重试提示
+        if gate.locked():  # Reject overload without queueing request bodies.
             error = {"message": "inference concurrency limit reached, retry later",
                      "type": "rate_limit_error", "code": "concurrency_limit"}
             payload = {"error": error}
@@ -69,7 +61,7 @@ class ConcurrencyLimitMiddleware:
 
 
 class InboundBodyLimitMiddleware:
-    """仅缓冲生成及 token 估算 POST；其他路由不读取请求体。"""
+    """Buffer only inference and token-estimation POST bodies."""
 
     def __init__(self, app, config):
         self.app = app
@@ -104,7 +96,7 @@ class InboundBodyLimitMiddleware:
         async def replay():
             nonlocal replayed
             if replayed:
-                return await receive()  # 请求体结束不等于断连，继续监听真实连接。
+                return await receive()  # Body completion does not imply client disconnect.
             replayed = True
             return {"type": "http.request", "body": buffered, "more_body": False}
 
@@ -112,7 +104,7 @@ class InboundBodyLimitMiddleware:
 
     @staticmethod
     async def _reject(send, path: str, limit: int):
-        # 与协议化错误处理一致的外形（middle ware 在路由之前，自行成形）
+        # Middleware builds protocol-shaped errors before routing.
         if path.startswith("/v1/messages"):
             payload = {"type": "error", "error": {"type": "invalid_request_error",
                                                   "message": f"request body exceeds {limit} bytes",

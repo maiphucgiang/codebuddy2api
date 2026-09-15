@@ -1,4 +1,4 @@
-"""WorkBuddy 请求适配、审核识别和重试边界；仅使用 MockTransport。"""
+"""Test WorkBuddy adaptation, filter detection and retry boundaries using MockTransport."""
 import asyncio
 import copy
 import json
@@ -39,7 +39,7 @@ def reply(text=REFUSAL, *, field="content", finish="stop"):
 
 
 def payload(route, *, stream=False, tools=False, identity=IDENTITY.lower()):
-    # 小写身份走 Responses 的保守投影，保留可供兜底压缩的模板。
+    # Lowercase identity uses conservative Responses projection and retains fallback context.
     system = (identity + ".\n" + BRANCH + ": main\n## Planning\n"
               + "Read relevant source files, preserve project conventions, and verify changes with tests.\n" * 5)
     user = {"role": "user", "content": "List the repository files."}
@@ -305,8 +305,7 @@ class EndpointFilterTests(unittest.TestCase):
                         self.assert_one_request()
                         self.credential_status.assert_not_called()
                         self.failures.assert_called_once_with("content_filter")
-                        # 审核拒绝同样落在第一个字节之前，流式必须与 stream=False 吃同一个真实
-                        # 状态码；一律 200 + 带内 error 会让下游把失败当成空回答静默结束会话。
+                        # Pre-response filter failures use the same HTTP status in both response modes.
                         self.assertEqual(response.status_code, 502 if status == 200 else status,
                                          response.text)
                         self.assertIn("content_filter", response.text)
@@ -373,8 +372,7 @@ class EndpointFilterTests(unittest.TestCase):
                         self.respond = respond
                         response = self.post(route, stream=stream)
                         self.assert_one_request()
-                        # chat / messages 的真流式此时已经吐过拒绝文本，收不回状态码，只能带内
-                        # 报错；responses 总是先聚合再落字节，失败时一个字节都没发出去 → 真实 502。
+                        # Chat/Messages may already have sent bytes; Responses still fails before headers.
                         already_streamed = stream and route != "/v1/responses"
                         self.assertEqual(response.status_code, 200 if already_streamed else 502,
                                          response.text)

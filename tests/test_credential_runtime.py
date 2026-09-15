@@ -1,8 +1,8 @@
-"""凭证真实刷新、并发去重、扫描与熔断回归；只使用临时凭据和 mock 上游。"""
+"""Test credential refresh, concurrency, discovery and cooldowns with temporary files and mocks."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import json
 import os
@@ -136,7 +136,7 @@ class CredentialRuntimeTests(unittest.TestCase):
         self.assertIs(pool.first(), manager)
         self.assertEqual(pool._entries[0]["fail_until"], 0)
         self.assertIn("reimported-synthetic-token", manager.get_headers()["Authorization"])
-        self.assertIsNone(pool.pick("session", "glm-5.3-flash"))  # 配额冷却不随重新登录清除
+        self.assertIsNone(pool.pick("session", "glm-5.3-flash"))  # Relogin preserves quota cooldown.
 
     def test_duplicate_notice_is_not_emitted_on_every_request(self):
         path = self.credential(age=0)

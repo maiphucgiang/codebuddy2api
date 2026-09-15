@@ -31,6 +31,10 @@ const labels: Record<string, string> = {
   checkin: "签到状态",
   last_success: "上次成功状态",
   state: "阶段",
+  phase: "操作阶段",
+  error_kind: "失败类型",
+  http_status: "上游 HTTP 状态",
+  stale: "状态待核验",
   at: "记录时间",
   claimed: "本次已领取",
   departed: "本次已派出",
@@ -157,7 +161,32 @@ const statuses: Record<string, string> = {
   runtime: "运行事件",
   admin: "管理操作",
 };
+const travelStates: Record<string, string> = {
+  idle: "空闲",
+  traveling: "旅行中",
+  arrived: "已到达",
+  unknown: "未知",
+  unavailable: "不可用",
+};
+const travelPhases: Record<string, string> = {
+  status: "状态查询",
+  claim: "领取",
+  after_claim: "领取后核验",
+  config: "地点配置",
+  depart: "派遣",
+  after_depart: "派遣后核验",
+};
+const travelErrors: Record<string, string> = {
+  http: "上游 HTTP 错误",
+  business: "上游业务拒绝",
+  protocol: "响应格式异常",
+  timeout: "请求超时",
+  network: "网络失败",
+};
 const times = new Set([
+  "at",
+  "arrive_at",
+  "server_now",
   "started_at",
   "finished_at",
   "fetched_at",
@@ -237,7 +266,13 @@ export function DataValue({
             name,
           )
         ? ownLabel(statuses, value)
-        : undefined;
+        : name === "phase"
+          ? ownLabel(travelPhases, value)
+          : name === "error_kind"
+            ? ownLabel(travelErrors, value)
+            : name === "state"
+              ? ownLabel(travelStates, value)
+              : undefined;
     return <span className={s.valueText}>{label ?? (value || "—")}</span>;
   }
   if (typeof value !== "object") return <span className={s.valueMuted}>未知</span>;

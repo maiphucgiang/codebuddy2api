@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Chat SSE 边界回归；仅使用内存数据和 MockTransport。"""
+"""Test Chat SSE boundaries with in-memory data and MockTransport."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import json
 import unittest
@@ -223,16 +223,16 @@ class AccumulatorTests(unittest.TestCase):
 
 
 class OutputBudgetTests(unittest.TestCase):
-    """聚合收集预算与错误体有界读取。"""
+    """Test collection budgets and bounded error-body reads."""
 
     def test_collect_budget_aborts_oversized_aggregation(self):
-        acc = ChatSSEAccumulator(max_collect_bytes=10)  # 两片各 8B，第二片超预算
+        acc = ChatSSEAccumulator(max_collect_bytes=10)  # The second eight-byte chunk exceeds the budget.
         acc.feed_line('data: {"choices":[{"index":0,"delta":{"content":"12345678"}}]}')
         with self.assertRaises(UpstreamResponseError) as caught:
             acc.feed_line('data: {"choices":[{"index":0,"delta":{"content":"12345678"}}]}')
         self.assertEqual(caught.exception.status, 502)
         self.assertIn(b"response_too_large", caught.exception.raw)
-        # 预算内不受影响
+        # Within-budget output remains valid.
         acc = ChatSSEAccumulator(max_collect_bytes=1024)
         acc.feed_line('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}')
         acc.feed_line("data: [DONE]")
@@ -317,7 +317,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(requests[0].method, "POST")
 
     async def test_body_not_accepted_is_replayed_on_a_fresh_connection(self):
-        """建连失败 / 建连超时：上游手里没有正文，换新连接重放一次不会重复计费。"""
+        """Retry connection failures once before any request body is accepted."""
         real_client = httpx.AsyncClient
         for error_type in (httpx.ConnectError, httpx.ConnectTimeout):
             with self.subTest(error=error_type.__name__):
@@ -339,7 +339,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([request.method for request in attempts], ["POST", "POST"])
 
     async def test_write_timeout_is_not_replayed_without_the_opt_in(self):
-        """写超时只证明正文没写完，证不了上游没处理已收到的部分：默认不重放。"""
+        """Do not replay incomplete writes by default because accepted bytes may be processed."""
         real_client = httpx.AsyncClient
         for error_type in upstream_io.WRITE_TIMEOUT:
             with self.subTest(error=error_type.__name__):
@@ -358,7 +358,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(attempts), 1, "默认必须一次都不重放")
 
     async def test_write_timeout_is_replayed_only_when_opted_in(self):
-        """`retry_write_timeout=True` 是运维显式承担计费歧义，重放行为与建连失败一致。"""
+        """Allow explicit write-timeout replay with acknowledged billing ambiguity."""
         real_client = httpx.AsyncClient
         for error_type in upstream_io.WRITE_TIMEOUT:
             with self.subTest(error=error_type.__name__):
@@ -381,7 +381,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([request.method for request in attempts], ["POST", "POST"])
 
     async def test_ambiguous_transport_failures_never_replay_post(self):
-        """请求体已经发出（甚至响应已经开始）的失败有计费歧义，一律交给调用方按协议返回。"""
+        """Propagate ambiguous post-send failures without automatic replay."""
         real_client = httpx.AsyncClient
         for error_type in (httpx.ReadError, httpx.ReadTimeout, httpx.WriteError,
                            httpx.RemoteProtocolError):

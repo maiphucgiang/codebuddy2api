@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""CLI/WorkBuddy 产品目录解析、请求隔离与 schema2 缓存回归；纯 mock/临时目录。
-
-运行：.venv/bin/python -B tests/test_catalog.py
-"""
+"""Test product catalog parsing, request isolation and versioned caches with offline fixtures."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
@@ -190,7 +187,7 @@ class CatalogSelectionTests(unittest.TestCase):
                 "app.credits.select_product_models", wraps=select_product_models) as select:
             factory.return_value.__enter__.return_value = client
             self.assertEqual(fetch_model_catalog(token, "CLI/test"), [data["models"][1]])
-            # 选择器与账号根表两个作用域共用一次拉取，解析各调一次。
+            # Parse selector and account scopes from the same upstream response.
             select.assert_has_calls([call(data, "cli"), call(data, "cli", scope="account")])
             self.assertEqual(select.call_count, 2)
             self.assertEqual(client.get.call_count, 1, "两个作用域必须共用一次 /v3/config")

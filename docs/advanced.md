@@ -79,6 +79,8 @@ Use a source/image build and Compose configuration containing this feature; recr
 | `POST /admin/sync` | Synchronize all enabled accounts' balances, catalogs and usage; no check-in or trial claims |
 | `POST /admin/credentials/{id}/{action}` | Single-account `refresh`, `checkin`, `sync`, `travel-status` (query only), `travel` (claim then dispatch), or `trial` (one-time trial credits) |
 
+Travel results include `phase`, optional safe `error_kind`/`http_status`/`code`, and snapshot `remaining_seconds`. `claimed`/`departed` remain true for confirmed writes even if a later query sets `ok=false` and `stale=true`; query status before another attempt.
+
 Pages use `/dashboard/*`, management APIs use `/admin/*`, and clients retain `/v1/*`. `/cn` and `/intl` API prefixes are not registered. Automatic model routing requires no client URL changes.
 
 Management requires an API key. The WebUI exchanges that key for an HttpOnly management Cookie, which only authorizes `/admin/*`, not `/v1/*`. API clients send `Authorization: Bearer <key>` or `X-Api-Key`. An empty key preserves legacy unauthenticated inference only, not management. `/health` never exposes account, path or exception details.

@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""reasoning_content（思考）透传回归测试：聚合、伪流式重放、Anthropic/Responses 映射。
-
-直接运行：python3 tests/test_reasoning.py
-"""
+"""Test reasoning aggregation, SSE replay and Anthropic/Responses mappings."""
 
 import asyncio
 import json
@@ -10,7 +7,7 @@ import sys
 from pathlib import Path
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import httpx
 
@@ -31,7 +28,7 @@ _SSE = (
 
 
 def _parse_sse_events(raw: str) -> list[dict]:
-    """把 SSE 文本解析为事件 dict 列表（兼容有无 event: 行）。"""
+    """Parse SSE data events with optional event-name lines."""
     events = []
     for block in raw.strip().split("\n\n"):
         if not block.strip():
@@ -43,7 +40,7 @@ def _parse_sse_events(raw: str) -> list[dict]:
 
 
 class TestChatAggregation(unittest.TestCase):
-    """Chat SSE 聚合必须保留 reasoning_content。"""
+    """Preserve reasoning_content during Chat SSE aggregation."""
 
     def test_collect_stream_keeps_reasoning(self):
         resp = httpx.Response(200, content=_SSE.encode("utf-8"))
@@ -77,14 +74,14 @@ class TestChatAggregation(unittest.TestCase):
             content += delta.get("content") or ""
         self.assertEqual(reasoning, "思考一思考二")
         self.assertIn("正文", content)
-        # reasoning 分片必须先于 content 分片
+        # Reasoning deltas precede text deltas.
         first_reasoning = next(i for i, l in enumerate(lines) if "reasoning_content" in l)
         first_content = next(i for i, l in enumerate(lines) if '"content": "正' in l or '"content":"正' in l)
         self.assertLess(first_reasoning, first_content)
 
 
 class TestReplayEnvelope(unittest.TestCase):
-    """聚合重放的 chunk 必须带完整 chat.completion.chunk 信封（id/object/created），usage chunk 同样。"""
+    """Include complete Chat chunk envelopes in content and usage replay events."""
     def test_replayed_chunks_share_stable_envelope(self):
         merged = _merge_chat_sse_text(_SSE)
         lines = _chat_result_to_sse_lines(merged)
@@ -100,7 +97,7 @@ class TestReplayEnvelope(unittest.TestCase):
 
 
 class TestAnthropicThinking(unittest.TestCase):
-    """reasoning_content 必须映射为 Anthropic thinking content block。"""
+    """Map reasoning_content to Anthropic thinking blocks."""
 
     def test_stream_thinking_events(self):
         conv = AnthropicStreamConverter(model="m")
@@ -115,7 +112,7 @@ class TestAnthropicThinking(unittest.TestCase):
         deltas = [e for e in events if e["type"] == "content_block_delta"
                   and e["delta"]["type"] == "thinking_delta"]
         self.assertEqual("".join(d["delta"]["thinking"] for d in deltas), "思考一思考二")
-        # thinking 块在 text 块开始前已关闭
+        # Thinking closes before text begins.
         stops = [e for e in events if e["type"] == "content_block_stop"]
         self.assertEqual(stops[0]["index"], 0)
 
@@ -139,7 +136,7 @@ class TestAnthropicThinking(unittest.TestCase):
 
 
 class TestResponsesReasoning(unittest.TestCase):
-    """reasoning_content 必须映射为 Responses reasoning item（位于 message 之前）。"""
+    """Place Responses reasoning items before message items."""
 
     def test_stream_reasoning_item(self):
         conv = ResponsesStreamConverter(model="m")

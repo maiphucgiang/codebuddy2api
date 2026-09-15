@@ -337,7 +337,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertIs(self.store.snapshot()["settings"][key], True)
 
     def test_failover_settings_are_hot_and_persisted(self):
-        """换凭证重放与写超时开关都要能在系统设置里改完立即生效，不需要重启进程。"""
+        """Apply failover and write-timeout settings without restarting the process."""
         current = self.client.get("/admin/settings", headers=self.headers).json()
         items = {item["key"]: item for item in current["items"]}
         for key, kind, default in (("failover_max", "integer", 0), ("retry_write_timeout", "boolean", False)):
@@ -443,7 +443,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertFalse(response.json()["results"][0]["ok"])
 
     def test_upload_normalizes_token_aliases_to_canonical_fields(self):
-        """只含 access_token/token 别名的凭据：落盘内容必须折叠为 accessToken，别名键移除。"""
+        """Persist token aliases as accessToken and remove alias keys."""
         data = self.credential()
         auth = data.pop("auth")
         data["auth"] = {**{k: v for k, v in auth.items() if k != "accessToken"},

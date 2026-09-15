@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Local synthetic image-policy/adapter/projection regression tests.
-
-Run: .venv/bin/python -B tests/test_request_limits.py
-No converter import, account access, image decoding or upstream requests.
-"""
+"""Test image limits and protocol adaptation with synthetic data and no upstream access."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from copy import deepcopy
 import json

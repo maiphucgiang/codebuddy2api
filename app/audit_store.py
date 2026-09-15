@@ -1,14 +1,5 @@
-"""Bounded, metadata-only SQLite audit storage (no import-time I/O).
-
-Methods are synchronous: ASGI callers must offload them. Lock and SQLite busy
-waits are capped at 250ms; SQL has a cooperative 1s progress deadline (not a hard
-wall-clock guarantee for filesystem I/O). Failures are observable, not retried.
-Aggregates intentionally outlive all detail eviction. Ingest dedup rows expire with the
-same retention cutoff as their details, so the dedup table cannot grow without bound.
-Detail accounting is transactional; indexed cleanup commits bounded batches.
-Large budget/retention reductions converge on subsequent writes or detail reads
-(including storage()), reported as pending_cleanup until complete. This is a
-logical detail budget, not a bound on aggregate, dedup, or physical file size.
+"""Store metadata-only SQLite audits with bounded waits; detail eviction preserves aggregates.
+ASGI callers must offload synchronous methods; capacity limits cover logical detail storage only.
 """
 from __future__ import annotations
 
@@ -148,8 +139,7 @@ class AuditStore:
             raise
 
     def _migrate_ingest_time(self):
-        # v1 → v2：去重表获得时间维度。旧行用对应明细的时间回填，没有明细的按现在计，
-        # 随后与明细同截止期过期，不再无限期滞留。
+        # Backfill dedup timestamps so retention can expire them alongside request details.
         columns = [row[1] for row in self._db.execute("PRAGMA table_info(ingest)").fetchall()]
         if "created_at" not in columns:
             self._db.execute("ALTER TABLE ingest ADD COLUMN created_at REAL")
@@ -351,7 +341,7 @@ class AuditStore:
             if time.monotonic() >= deadline:
                 break
             self._db.execute(f"DELETE FROM {table} WHERE id=?", (record_id,))
-        # 去重行与明细同截止期过期：保留期之外不再防重放，也不再无限增长
+        # Expire dedup records with request details to bound retention growth.
         for row in self._db.execute("SELECT id FROM ingest WHERE created_at<? ORDER BY created_at LIMIT ?",
                                     (cutoff, _CLEANUP_BATCH)):
             if time.monotonic() >= deadline:

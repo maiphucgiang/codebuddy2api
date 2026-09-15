@@ -79,6 +79,8 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `POST /admin/sync` | 同步全部启用账号的余额、目录和用量，不签到、不领取试用 |
 | `POST /admin/credentials/{id}/{action}` | 单账号 `refresh`、`checkin`、`sync`、`travel-status`（仅查询）、`travel`（领取后派出）或 `trial`（一次性体验积分） |
 
+旅行结果包含 `phase`、可选的安全诊断 `error_kind`/`http_status`/`code` 和查询时的 `remaining_seconds`。后续查询失败会设置 `ok=false`、`stale=true`，但保留已确认的 `claimed`/`departed`；再次操作前先查询核验。
+
 页面使用 `/dashboard/*`，管理 API 使用 `/admin/*`，客户端保留原 `/v1/*`；不注册 `/cn`、`/intl` API 前缀。模型自动选路不要求客户端改变地址。
 
 管理必须配置 API key；WebUI 使用同 key 建立 HttpOnly 管理 Cookie，Cookie 仅授权 `/admin/*`，不能用于 `/v1/*`。命令行 API 请求携带 `Authorization: Bearer <key>` 或 `X-Api-Key`。空 key 仅保留推理接口的历史无鉴权行为，不开放管理；`/health` 不返回账号、路径或异常详情。

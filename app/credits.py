@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""credits.py — 每日签到 + 积分查询 + 快过期优先调度支持。
-
-HTTP 流程（官方 Web 端接口，Bearer 鉴权）：
-  签到  POST {host}/billing/meter/daily-checkin（兜底 /v2/...）
-  积分  POST {host}/v2/billing/meter/get-user-resource
-财务域名按 site_routing 的凭据身份解析选择固定品牌 host，不跨产品或地域兜底。
-"""
+"""Manage check-in, balances and credit-aware scheduling within each account's product and region."""
 
 import base64
 from copy import deepcopy
@@ -26,7 +20,7 @@ BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.3
               "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 REQUEST_TIMEOUT = 12.0
 
-# 财务使用官方 Web 品牌站；国内 CLI 的 chat/config 入口 copilot 不适用于此处。
+# Billing uses product websites rather than the CLI chat endpoint.
 BILLING_PROFILE_HOSTS = {
     "cn-cli": "https://www.codebuddy.cn",
     "cn-work": "https://www.workbuddy.cn",
@@ -36,25 +30,25 @@ BILLING_PROFILE_HOSTS = {
 CHECKIN_PATHS = ("/v2/billing/meter/daily-checkin",)
 CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
 RESOURCE_PATH = "/v2/billing/meter/get-user-resource"
-CONFIG_PATH = "/v3/config"  # cbc CLI CloudProductProvider 同源：云端模型表
+CONFIG_PATH = "/v3/config"  # Official cloud model catalog
 RESOURCE_PRODUCT_CODE = "p_tcaca"
 CREDITS_PAGE_SIZE = 100
-CREDITS_MAX_PAGES = 20  # 2000 个积分包封顶；到顶必须 partial 标记，不得装作完整
+CREDITS_MAX_PAGES = 20  # Mark capped results partial instead of reporting complete balances.
 
 _INACTIVE_RE = re.compile(r"未开启|未开始|未开放|已过期|无.*活动|活动.*(?:结束|关闭|暂停)", re.I)
 _ALREADY_RE = re.compile(r"已签到|已领取|已经.*(?:签到|领取)|重复签到|already", re.I)
 
 
 class AuthExpiredError(Exception):
-    """签到/积分接口 401：token 失效（重试无意义，由上层记录）。"""
+    """Signal an expired token from a billing HTTP 401 response."""
 
 
 # ---------------------------------------------------------------------------
-# 域名选择
+# Billing host selection
 # ---------------------------------------------------------------------------
 
 def token_issuer_origin(access_token: str) -> str | None:
-    """解码 JWT payload 的 iss 字段，返回 origin（如 https://www.codebuddy.cn）。"""
+    """Decode the JWT issuer and return its origin."""
     try:
         part = access_token.split(".")[1]
         part += "=" * ((4 - len(part) % 4) % 4)
@@ -67,13 +61,13 @@ def token_issuer_origin(access_token: str) -> str | None:
 
 
 def hosts_for_token(access_token: str, domain: str = "") -> list[str]:
-    """复用凭据身份解析，仅返回同 profile 财务 host；未知或冲突提示直接拒绝。"""
+    """Resolve the credential's billing host, rejecting unknown or conflicting identities."""
     profile = profile_for_auth({"accessToken": access_token, "domain": domain})
     return [BILLING_PROFILE_HOSTS[profile]]
 
 
 def _web_headers(api_host: str, access_token: str, uid: str = "", domain: str = "") -> dict:
-    """财务端点保留官方 Web 协议，不套用模型目录的 CLI/WorkBuddy 身份头。"""
+    """Build website billing headers independently of CLI model catalog headers."""
     return {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
@@ -88,7 +82,7 @@ def _web_headers(api_host: str, access_token: str, uid: str = "", domain: str = 
 
 
 def _post_json(client: httpx.Client, url: str, headers: dict, body: dict) -> tuple[int, dict]:
-    """POST JSON 并解析响应；401 抛 AuthExpiredError；返回 (status, payload)。"""
+    """POST JSON and return status/payload, raising AuthExpiredError on HTTP 401."""
     r = client.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
     if r.status_code == 401:
         raise AuthExpiredError("登录身份过期")
@@ -100,11 +94,11 @@ def _post_json(client: httpx.Client, url: str, headers: dict, body: dict) -> tup
 
 
 # ---------------------------------------------------------------------------
-# 每日签到
+# Daily check-in
 # ---------------------------------------------------------------------------
 
 def classify_checkin_result(http_ok: bool, code, message: str) -> dict:
-    """兼容旧签到文案与桌面业务码，不把活动未开放误判为已领取。"""
+    """Normalize check-in codes without confusing inactive activities with completed claims."""
     try:
         ncode = int(code) if type(code) in (int, str) else None
     except ValueError:
@@ -135,7 +129,7 @@ def _checkin_request(access_token, uid, domain, path):
 
 
 def daily_checkin(access_token: str, uid: str = "", domain: str = "") -> dict:
-    """仅调用同 profile 的桌面 Bearer 接口；发送后失败不重放领取。"""
+    """Call the same-profile check-in endpoint without replaying uncertain claims."""
     status, payload, url = _checkin_request(access_token, uid, domain, CHECKIN_PATHS[0])
     message = payload.get("msg") or payload.get("message") or ""
     result = classify_checkin_result(200 <= status < 300, payload.get("code"), message)
@@ -146,7 +140,7 @@ def daily_checkin(access_token: str, uid: str = "", domain: str = "") -> dict:
 
 
 def fetch_checkin_status(access_token: str, uid: str = "", domain: str = "") -> dict:
-    """查询活动状态；不完整响应不能授权领取。"""
+    """Query activity status without authorizing claims from incomplete responses."""
     status, payload, _ = _checkin_request(access_token, uid, domain, CHECKIN_STATUS_PATH)
     result = classify_checkin_result(200 <= status < 300, payload.get("code"),
                                      payload.get("msg") or payload.get("message") or "")
@@ -167,7 +161,7 @@ def fetch_checkin_status(access_token: str, uid: str = "", domain: str = "") -> 
 
 
 # ---------------------------------------------------------------------------
-# 积分查询（分段 + 过期时间）
+# Credit segments and expiry
 # ---------------------------------------------------------------------------
 
 _REMAINING_FIELDS = (
@@ -207,7 +201,7 @@ def _first_number(item: dict, fields) -> float | None:
 
 
 def _parse_ts(value) -> float | None:
-    """秒/毫秒 epoch 或 'YYYY-MM-DD HH:MM:SS' → epoch 秒。"""
+    """Convert epoch seconds, milliseconds or formatted timestamps to epoch seconds."""
     if value is None or value == "":
         return None
     if isinstance(value, (int, float)) or re.match(r"^\d+(?:\.\d+)?$", str(value).strip()):
@@ -237,7 +231,7 @@ def _first_text(item: dict, fields) -> str:
 
 
 def extract_segments(accounts: list) -> list[dict]:
-    """从资源 Account 列表提取积分段（remaining>0），SlicePeriodUsageDetails 有明细则展开。"""
+    """Extract positive credit segments, expanding slice-level usage when available."""
     out = []
     for account in accounts or []:
         if not isinstance(account, dict):
@@ -261,7 +255,7 @@ def extract_segments(accounts: list) -> list[dict]:
 
 
 def merge_segments(segments: list) -> list[dict]:
-    """按 (package_code|source, expires_at) 合并同包多记录，按过期时间升序（无过期时间排最后）。"""
+    """Merge matching package/expiry segments and sort unknown expiries last."""
     merged: dict = {}
     for s in segments or []:
         if not s or float(s.get("remaining") or 0) <= 0:
@@ -287,7 +281,7 @@ def merge_segments(segments: list) -> list[dict]:
 
 
 def soonest_expiry(segments: list, now: float | None = None) -> float | None:
-    """未过期且有余量积分段的最早过期时间；全部无过期时间/无段时返回 None。"""
+    """Return the earliest known expiry among unexpired positive balances."""
     now = time.time() if now is None else now
     exps = [s["expires_at"] for s in segments or []
             if s.get("expires_at") is not None and s["expires_at"] > now
@@ -296,7 +290,7 @@ def soonest_expiry(segments: list, now: float | None = None) -> float | None:
 
 
 def _resource_body(page: int) -> dict:
-    """与官方 Web 端一致：有效状态 [0,3]，结束时间范围 现在 ~ +101 年（只取未过期包）。"""
+    """Build the official active-package filter for future expiry dates."""
     fmt = "%Y-%m-%d %H:%M:%S"
     return {
         "PageNumber": page,
@@ -309,7 +303,7 @@ def _resource_body(page: int) -> dict:
 
 
 def _fetch_accounts_page(client, url: str, headers: dict, page: int, *, retry_empty: bool) -> list:
-    """拉一页积分包（限次重试）；返回 Accounts 列表，失败抛 RuntimeError，401 抛 AuthExpiredError。"""
+    """Fetch one credit page with bounded retries, distinguishing expired authentication."""
     last_err: Exception | None = None
     for attempt in range(3):
         try:
@@ -329,7 +323,7 @@ def _fetch_accounts_page(client, url: str, headers: dict, page: int, *, retry_em
             raise RuntimeError(str(payload.get("msg") or f"积分接口 code={code}"))
         data = payload.get("data") or {}
         resp = (data.get("Response") or {}).get("Data") or (data.get("data") or {}).get("Response", {}).get("Data") or data
-        # 区分「合法的零余额」与「结构缺失的未知失败」：只有 Accounts/accounts 键存在才算有效响应
+        # Missing account structure is not a confirmed zero balance.
         accounts = None
         if isinstance(resp, dict) and isinstance(resp.get("Accounts"), list):
             accounts = resp["Accounts"]
@@ -339,7 +333,7 @@ def _fetch_accounts_page(client, url: str, headers: dict, page: int, *, retry_em
             last_err = RuntimeError("积分接口返回缺少 Accounts 结构")
             time.sleep(0.3 * (attempt + 1))
             continue
-        if not accounts and retry_empty and attempt < 2:  # 偶发空 Accounts，重试一次
+        if not accounts and retry_empty and attempt < 2:  # Retry a transient empty page once.
             time.sleep(0.3 * (attempt + 1))
             continue
         return accounts
@@ -347,9 +341,7 @@ def _fetch_accounts_page(client, url: str, headers: dict, page: int, *, retry_em
 
 
 def fetch_credits(access_token: str, uid: str = "", domain: str = "") -> dict:
-    """查询剩余积分：{credits, count, segments, soonest_expiry, partial}。401 抛 AuthExpiredError。
-
-    分页遍历到不足一页为止；达到 CREDITS_MAX_PAGES 上限时 partial=True，调用方不得把结果当完整值。"""
+    """Fetch credit segments and mark page-limited results partial; HTTP 401 raises AuthExpiredError."""
     host = hosts_for_token(access_token, domain)[0]
     url = host + RESOURCE_PATH
     headers = _web_headers(host, access_token, uid, domain)
@@ -362,7 +354,7 @@ def fetch_credits(access_token: str, uid: str = "", domain: str = "") -> dict:
             if page > CREDITS_MAX_PAGES:
                 partial = True
                 break
-            rows = _fetch_accounts_page(client, url, headers, page, retry_empty=True)  # 空页在任何页都可能是瞬时现象，一律重试
+            rows = _fetch_accounts_page(client, url, headers, page, retry_empty=True)  # Empty pages may be transient.
             accounts.extend(rows)
             if len(rows) < CREDITS_PAGE_SIZE:
                 break
@@ -375,7 +367,7 @@ def fetch_credits(access_token: str, uid: str = "", domain: str = "") -> dict:
 
 
 def select_product_models(data: dict, product: str = "cli", *, scope: str = "picker") -> list[dict]:
-    """按产品解析选择器或账号根表候选，保留禁用与 availableModels 筛选。"""
+    """Parse product selector/root catalogs while honoring disabled and available-model filters."""
     if product not in ("cli", "workbuddy"):
         raise ValueError("未知模型目录产品")
     if scope not in ("picker", "account"):
@@ -412,7 +404,7 @@ def select_product_models(data: dict, product: str = "cli", *, scope: str = "pic
     if available is not None and (not isinstance(available, list) or not all(text(value) for value in available)):
         invalid("data.availableModels")
 
-    # WorkBuddy 5.5.2 AvailableModelsFilterProvider：空 availableModels 表示不附加过滤。
+    # WorkBuddy treats an empty availableModels list as no additional filter.
     def finish(items):
         return deepcopy([model for model in items if not model.get("disabled")
                          and (not available or model["id"] in available)])
@@ -467,7 +459,7 @@ def select_cli_models(data: dict) -> list[dict]:
 
 def fetch_model_scopes(access_token: str, user_agent: str = "", *, domain: str = "",
                        uid: str = "", enterprise_id: str = "") -> dict[str, list[dict]]:
-    """一次请求解析选择器与账号根表；候选模型是否可服务仍需上游确认。"""
+    """Fetch selector and account-root catalogs without assuming every candidate is servable."""
     auth = {"accessToken": access_token, "domain": domain}
     profile = profile_for_auth(auth)
     headers = catalog_headers(auth, {"uid": uid, "enterpriseId": enterprise_id}, user_agent=user_agent)
@@ -495,60 +487,53 @@ def fetch_model_scopes(access_token: str, user_agent: str = "", *, domain: str =
 
 def fetch_model_catalog(access_token: str, user_agent: str = "", *, domain: str = "",
                         uid: str = "", enterprise_id: str = "") -> list[dict]:
-    """该凭据产品的选择器模型目录；账号可服务的全量见 fetch_model_scopes。"""
+    """Return selector models for this credential's product."""
     return fetch_model_scopes(access_token, user_agent, domain=domain, uid=uid,
                               enterprise_id=enterprise_id)["picker"]
 
 
 # ---------------------------------------------------------------------------
-# 积分折算为金额（OpenAI 余额口径）
+# OpenAI-compatible billing estimates
 # ---------------------------------------------------------------------------
 
-# 官方无任何金额接口（实测 12 个候选端点全 404），也不公开 credit↔token 单价；
-# 折算锚点取官方《计费概述》旗舰版连续包月 700 元 / 50,000 积分 = 0.014 元/Credit。
-CREDIT_PRICE_CNY = 0.014   # 国内：旗舰版连续包月 700 元 / 50,000 积分摊算
-CREDIT_PRICE_USD = 0.03    # 国际：Pro 加量包 $15 / 500 Credits（与国内不同体系，须分开折算）
+# Estimate monetary value using independent domestic and international package rates.
+CREDIT_PRICE_CNY = 0.014   # CNY 700 / 50,000 credits
+CREDIT_PRICE_USD = 0.03    # USD 15 / 500 credits
 USD_RATE_CNY = 7.15
 
 
 def is_international_host(host: str) -> bool:
-    """国际站判定。.ai 与国内站账号/积分完全隔离（实测国内 token 打 .ai 一律 401）。"""
+    """Identify international .ai sites with independent accounts and credits."""
     return bool(host) and ".ai" in str(host).lower()
 
 USAGE_PATH = "/billing/meter/get-user-request-usage"
-USAGE_MAX_DAYS = 30   # 官方硬限制：时间跨度 >31 天静默返回 total=0（不报错）
+USAGE_MAX_DAYS = 30   # The upstream returns empty totals beyond its 31-day window.
 USAGE_PAGE_SIZE = 200
 USAGE_MAX_PAGES = 30
 
 
 def credits_to_usd(amount: float, price_cny: float = CREDIT_PRICE_CNY,
                    rate: float = USD_RATE_CNY) -> float:
-    """Credits → 美元：先按订阅摊算折算人民币，再按汇率换美元。"""
+    """Estimate USD value from the CNY credit price and exchange rate."""
     return float(amount or 0) * price_cny / rate
 
 
 def usd_per_credit(is_intl: bool, price_cny: float = CREDIT_PRICE_CNY,
                    price_usd: float = CREDIT_PRICE_USD,
                    rate: float = USD_RATE_CNY) -> float:
-    """每 Credit 的美元价值：国际站用 USD 单价，国内站按 CNY 单价除以汇率。"""
+    """Return the regional USD value per credit."""
     return price_usd if is_intl else price_cny / rate
 
 
 def dedupe_by_identity(creds_snapshot: dict) -> dict:
-    """按账号身份折叠 ledger 快照：同一身份只保留一条余额记录。
-
-    键是凭据绝对路径，只作索引不作身份（见 CreditLedger.bind_identity）：换
-    CODEBUDDY_AUTH_DIR、搬动项目目录或同一份凭据被重复登记时，同一账号会在多个键下
-    各留一份余额，而积分属于账号、不属于文件，逐键相加会把一份余额算好几次。
-    取舍优先级：有分段数据 > 无数据，其次 fetched_at 更新。未绑定身份的历史条目
-    无法安全判定归属，原样保留。"""
+    """Deduplicate account balances, preferring segmented and newer data while retaining unknown identities."""
     winners: dict[str, tuple] = {}
     for cred_id, entry in (creds_snapshot or {}).items():
         if not isinstance(entry, dict):
             continue
         identity = str(entry.get("identity") or "")
         if not identity:
-            continue          # 未绑定身份：归属未知，不参与合并
+            continue          # Unknown owners cannot be merged safely.
         balance = entry.get("credits") or {}
         rank = (bool(balance.get("segments")), float(balance.get("fetched_at") or 0.0))
         if identity not in winners or rank > winners[identity][0]:
@@ -557,17 +542,14 @@ def dedupe_by_identity(creds_snapshot: dict) -> dict:
     out = {}
     for cred_id, entry in (creds_snapshot or {}).items():
         identity = str(entry.get("identity") or "") if isinstance(entry, dict) else ""
-        if identity and cred_id not in keep:      # 同身份的落选路径
+        if identity and cred_id not in keep:      # Drop duplicate paths for a known identity.
             continue
         out[cred_id] = entry
     return out
 
 
 def aggregate_credits(creds_snapshot: dict) -> dict:
-    """汇总 ledger 快照，并按国内/国际分组（两站积分独立、单价不同，必须分组折算）。
-
-    顶层为合计值，groups 内为各组明细；含剩余、额度差已用、最早过期时间。
-    同一账号在多个凭据路径下重复记账时只算一次，见 dedupe_by_identity。"""
+    """Deduplicate accounts and aggregate regional balances, usage and earliest expiry."""
     groups = {k: {"remaining": 0.0, "used_by_quota": 0.0, "soonest_expiry": None}
               for k in ("domestic", "international")}
     for e in dedupe_by_identity(creds_snapshot).values():
@@ -595,10 +577,7 @@ def aggregate_credits(creds_snapshot: dict) -> dict:
 
 def fetch_request_usage(access_token: str, days: int = USAGE_MAX_DAYS,
                         uid: str = "", domain: str = "") -> dict:
-    """拉官方用量明细，按 日期×模型 聚合实际扣减的 credits。
-
-    返回 {by_day: {'YYYY-MM-DD': {model: credits}}, total_credits, requests, partial}。
-    跨度超 31 天官方会静默返回空，故 days 强制夹到 USAGE_MAX_DAYS。"""
+    """Query the supported usage window and aggregate actual credit deductions by day and model."""
     days = max(1, min(int(days or USAGE_MAX_DAYS), USAGE_MAX_DAYS))
     host = hosts_for_token(access_token, domain)[0]
     url = host + USAGE_PATH
@@ -621,7 +600,7 @@ def fetch_request_usage(access_token: str, days: int = USAGE_MAX_DAYS,
             if code not in (0, None):
                 raise RuntimeError(f"用量明细接口 code={code}: {str(payload.get('msg'))[:120]}")
             data = payload.get("data")
-            # HTTP 200 但缺少业务结构不是「零用量」：total 缺失还会让分页提前中断
+            # Missing business data must not be treated as zero usage or complete pagination.
             if not isinstance(data, dict) or not isinstance(data.get("data"), list) \
                     or not isinstance(data.get("total"), (int, float)):
                 raise RuntimeError("用量明细接口返回缺少 data.data/total 结构")
@@ -639,17 +618,17 @@ def fetch_request_usage(access_token: str, days: int = USAGE_MAX_DAYS,
             if requests >= int(data["total"]) or not rows:
                 break
         else:
-            partial = True  # 达到页数上限仍可能有剩余：标记不完整，不装作全量
+            partial = True  # The page cap may hide additional usage.
     return {"by_day": by_day, "total_credits": round(total_credits, 2), "requests": requests,
             "partial": partial}
 
 
 # ---------------------------------------------------------------------------
-# CreditLedger：按凭证缓存签到/积分状态，JSON 原子持久化
+# Atomic JSON persistence for per-credential credit and check-in state
 # ---------------------------------------------------------------------------
 
 class CreditLedger:
-    """{cred_id: {checkin, credits, error}} 持久化缓存；soonest_expiry 供凭证池排序。"""
+    """Persist per-credential check-in and balance snapshots for expiry-aware scheduling."""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -679,12 +658,12 @@ class CreditLedger:
         return self._data["creds"].setdefault(cred_id, {"checkin": {}, "credits": {}, "error": None})
 
     def entry(self, cred_id: str) -> dict:
-        """单凭证快照；未知凭证返回空字典且不创建条目。"""
+        """Return a credential snapshot without creating unknown entries."""
         with self._lock:
             return deepcopy(self._data["creds"].get(cred_id) or {})
 
     def bind_identity(self, cred_id: str, identity: str) -> bool:
-        """路径只作索引；未知或不同账号的旧余额不得转移给新身份。"""
+        """Bind balance ownership independently of file paths, rejecting stale identity data."""
         with self._lock:
             entry = self._data["creds"].get(cred_id) or {}
             if entry.get("identity") == identity:
@@ -694,12 +673,12 @@ class CreditLedger:
             return True
 
     def remove(self, cred_id: str):
-        """凭证身份/站点替换时删除旧积分、签到与错误状态，幂等持久化。"""
+        """Clear persisted credit, check-in and error state after an identity change."""
         with self._lock:
             self._data["creds"].pop(cred_id, None)
             self._save()
 
-    # ---- 签到 ----
+    # Check-in state
 
     def checkin_done(self, cred_id: str, day: str) -> bool:
         with self._lock:
@@ -721,7 +700,7 @@ class CreditLedger:
             self._entry(cred_id)["travel"] = deepcopy(result)
             self._save()
 
-    # ---- 积分 ----
+    # Credit balances
 
     def update_credits(self, cred_id: str, result: dict):
         with self._lock:
@@ -732,8 +711,8 @@ class CreditLedger:
                 "segments": deepcopy(result.get("segments") or []),
                 "soonest_expiry": result.get("soonest_expiry"),
                 "fetched_at": time.time(),
-                "intl": bool(result.get("intl")),  # 站点归属：国内/国际积分与单价均独立
-                "partial": bool(result.get("partial")),  # 分页到顶：余额被低估，下游必须可见
+                "intl": bool(result.get("intl")),  # Regional credits use independent pricing.
+                "partial": bool(result.get("partial")),  # Expose incomplete pagination.
             }
             e["error"] = None
             self._save()
@@ -744,7 +723,7 @@ class CreditLedger:
             self._save()
 
     def soonest_expiry_of(self, cred_id: str) -> float | None:
-        """pick 排序键：该凭证最早过期积分时间；无数据返回 None（排最后）。"""
+        """Return the earliest credit expiry, or None when unavailable."""
         with self._lock:
             return soonest_expiry((self._data["creds"].get(cred_id) or {}).get("credits", {}).get("segments"))
 
@@ -754,10 +733,7 @@ class CreditLedger:
 
 
 class ModelCatalogCache:
-    """云端模型表按站点分组持久化缓存，TTL 内不重复拉取。
-
-    v1 根模型表保留供降级，但不视为 fresh；各组成功刷新后才升级 CLI 语义。
-    空目录同样缓存。每组版本独立，避免刷新一站后另一站旧数据误判 fresh。"""
+    """Cache scoped model catalogs by client version; legacy shared catalogs are not fresh account data."""
 
     SCHEMA_VERSION = 2
 
@@ -788,13 +764,13 @@ class ModelCatalogCache:
                                                  if d["version"] == self.SCHEMA_VERSION
                                                  and entry.get("version") == self.SCHEMA_VERSION
                                                  else 1)}
-                    # 根表是后加的作用域：形状不对就当没有，不能让一条坏数据毁掉整组目录。
+                    # Ignore malformed root entries without discarding the selector catalog.
                     serves = entry.get("serves")
                     if isinstance(serves, list) and all(isinstance(m, dict) for m in serves):
                         groups[group]["serves"] = deepcopy(serves)
                 self._data = {"version": self.SCHEMA_VERSION, "groups": groups}
             except (OSError, ValueError):
-                pass  # 无法读取时不清除已载入的目录。
+                pass  # Keep the loaded catalog when disk reads fail.
 
     def _save(self):
         try:
@@ -808,12 +784,12 @@ class ModelCatalogCache:
 
     @staticmethod
     def group_for_token(access_token: str) -> str:
-        """凭证所属站点组：domestic / international。"""
+        """Return the credential's domestic or international cache group."""
         return ("international" if is_international_host(hosts_for_token(access_token)[0])
                 else "domestic")
 
     def fresh(self, group: str) -> bool:
-        """该组缓存是否仍在 TTL 内（在则本轮无需拉云端）。"""
+        """Check whether the group's cache remains within its TTL."""
         with self._lock:
             g = self._data["groups"].get(group) or {}
             age = time.time() - float(g.get("fetched_at") or 0)
@@ -824,7 +800,7 @@ class ModelCatalogCache:
             return deepcopy((self._data["groups"].get(group) or {}).get("models") or [])
 
     def age(self, group: str) -> float | None:
-        """缓存年龄秒数（包括空目录）；仅未知组返回 None。"""
+        """Return cache age in seconds, including empty catalogs; unknown groups return None."""
         with self._lock:
             g = self._data["groups"].get(group)
             return time.time() - float(g.get("fetched_at") or 0) if g is not None else None
@@ -839,6 +815,6 @@ class ModelCatalogCache:
             self._save()
 
     def serves(self, group: str) -> list[dict]:
-        """返回账号根表候选；旧缓存无此字段时返回空，由调用方回退选择器。"""
+        """Return root catalog candidates, or an empty list when legacy caches omit them."""
         with self._lock:
             return deepcopy((self._data["groups"].get(group) or {}).get("serves") or [])

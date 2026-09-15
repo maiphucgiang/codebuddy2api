@@ -1,4 +1,4 @@
-"""根据凭据选择固定的地域/产品入口，不把输入域名直接作为请求目标。"""
+"""Select fixed product/region endpoints from credential identity, never arbitrary input URLs."""
 
 import base64
 import binascii
@@ -23,7 +23,7 @@ DOMAIN_PROFILES = {
     "www.codebuddy.ai": "intl-cli",
     "www.workbuddy.ai": "intl-work",
 }
-# CLI 2.149.0 与 WorkBuddy 5.5.2 的 ExternalLinkAuthenticationProvider 使用相同相对路径。
+# Verified CLI and WorkBuddy packages share these relative authentication paths.
 _REFRESH_PATH = "/v2/plugin/auth/token/refresh"
 
 
@@ -60,7 +60,7 @@ def _known_host(value: str, *, issuer: bool = False) -> str:
 
 
 def normalize_domain(value: str) -> str:
-    """仅规范化已知 HTTPS 主机，拒绝用户信息、端口与任意路径。"""
+    """Normalize known HTTPS hosts while rejecting userinfo, ports and arbitrary paths."""
     return _known_host(value)
 
 
@@ -82,7 +82,7 @@ def _hints(auth):
 
 
 def site_for_auth(auth: dict) -> str:
-    """JWT 仅作固定站点选择提示，签名与账户权限仍由上游验证。"""
+    """Use JWT claims only as routing hints; upstream validates signatures and account permissions."""
     domain, issuer = _hints(auth)
     sites = {profile_site(DOMAIN_PROFILES[host]) for host in (domain, issuer) if host}
     if len(sites) > 1:
@@ -93,7 +93,7 @@ def site_for_auth(auth: dict) -> str:
 def profile_for_auth(auth: dict) -> str:
     site_for_auth(auth)
     domain, issuer = _hints(auth)
-    # copilot.tencent.com 是共享国内入口；品牌信息优先取明确的账号域。
+    # Explicit account domains disambiguate the shared domestic copilot endpoint.
     branded = [host for host in (domain, issuer) if host and host != "copilot.tencent.com"]
     profiles = {DOMAIN_PROFILES[host] for host in branded}
     if len(profiles) > 1:

@@ -28,6 +28,6 @@ COPY converter.py ./
 COPY app/ ./app/
 COPY --from=frontend /web/dist/ ./web/dist/
 EXPOSE 8787
-# 容器内监听 0.0.0.0 是硬需求；对外暴露边界在端口映射层（compose 默认只绑回环）
+# Listen on container interfaces; host port mapping controls external access.
 ENV CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true
 CMD ["python3", "converter.py", "--host", "0.0.0.0", "--port", "8787", "--skip-check"]

@@ -1,8 +1,5 @@
-"""Metadata-only observation for the three public inference POST endpoints.
-
-Request bodies and headers are never inspected. Response parsing retains two
-16 KiB buffers at most, discards oversized SSE lines/JSON, and never changes the ASGI wire. Route
-hooks should provide model/account identifiers (never a credential file/token).
+"""Observe inference metadata with bounded response parsing; never inspect request bodies or headers.
+Preserve the ASGI wire and exclude credential files or tokens from route metadata.
 """
 from __future__ import annotations
 
@@ -26,12 +23,7 @@ def _mapping(value):
 
 
 def normalize_usage(usage):
-    """Keep provider counters independent; cache/reasoning are not extra total.
-
-No total is fabricated: Anthropic input/cache semantics differ from OpenAI.
-A known zero is retained. `usage_source` identifies observation provenance, not
-an inferred billing rate; credit is never derived from token counts.
-"""
+    """Preserve provider usage counters and known zeroes without inventing totals or billing credits."""
     usage = _mapping(usage)
     result = {}
     aliases = {"input_tokens": ("input_tokens", "prompt_tokens"),
@@ -161,7 +153,7 @@ def observe_attempt(stage, **safe_metadata):
 
 
 def observe_failure(code):
-    """记下失败并返回本次请求的失败序号，供 `observe_recovery(through=…)` 界定撤销范围。"""
+    """Record a failure and return its sequence number for scoped recovery."""
     observation = _current.get()
     if observation is None:
         return None
@@ -170,23 +162,13 @@ def observe_failure(code):
 
 
 def observe_failure_seq():
-    """当前失败序号的快照；没有失败时为 0，调用方原样传给 `observe_recovery` 即可。"""
+    """Return the current failure sequence, or zero when no failure exists."""
     observation = _current.get()
     return observation.failure_seq if observation is not None else None
 
 
 def observe_recovery(through=None):
-    """标记「`through` 那一次失败已经被就地重放救回」：请求对下游是完整正常响应。
-
-    失败尝试仍留在 `attempts` 里（另加一条 `failover_recovered` 标记），只是不再决定 outcome
-    —— 否则一次成功的换凭证重放会留下 `outcome=error` + `status_code=200` 这种自相矛盾的
-    审计记录，看板和排障都会把它读成失败。
-
-    `through` 是重放前那次失败的序号，只有它仍然是最新一次失败时才撤销：序号对不上说明
-    重放之后的响应自己又记了新失败（换到的账号回了内容审核拒绝就是这种），那次失败必须留下，
-    否则一个被审核拦截的请求会被持久化成 `outcome=success` 且没有 `error_code`。默认 `None`
-    保持旧的「清掉当前失败」语义，给没有序号概念的调用方兜底。
-    """
+    """Mark a matching failure recovered while retaining attempts and any newer failure."""
     observation = _current.get()
     if observation is None or not observation.failed:
         return
@@ -329,12 +311,7 @@ class AuditMiddleware:
 
         async def observed_receive():
             message = await receive()
-            # Some ASGI servers (uvicorn) synthesise ``http.disconnect`` once the
-            # response is complete, because ``receive`` has nothing left to yield.
-            # Starlette's ``listen_for_disconnect`` helper, used for
-            # ``spec_version < 2.4`` servers, therefore always observes a trailing
-            # disconnect even for a fully delivered stream.  Only treat the event
-            # as a client abort when the body was still in flight.
+            # Ignore disconnect events synthesized after the response body is complete.
             if message.get("type") == "http.disconnect" and not observation.body_finished:
                 nonlocal cancelled
                 cancelled = True

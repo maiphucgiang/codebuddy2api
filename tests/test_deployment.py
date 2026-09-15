@@ -1,8 +1,8 @@
-"""部署模板、Docker 运行文件与 Python 3.12 语法的离线回归。"""
+"""Test deployment templates, Docker runtime files and Python 3.12 syntax offline."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import ast
 import pathlib
@@ -16,7 +16,7 @@ import unittest
 from textwrap import dedent
 
 
-ROOT = Path(__file__).resolve().parents[1]  # 仓库根
+ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DEFAULTS = {
     "max_images": 16, "image_policy": "truncate",
     "max_request_bytes": 33554432, "log_body_limit": 65536,
@@ -51,12 +51,12 @@ def docker_sources():
 
 
 def _local_dependency(source: str, module: str) -> str | None:
-    """把一条 import 映射到仓库内的运行时文件；外部依赖返回 None。"""
-    if module.startswith("."):  # 包内相对导入：相对当前文件所在目录解析
+    """Resolve repository runtime imports, returning None for external dependencies."""
+    if module.startswith("."):  # Resolve package-relative imports from the source directory.
         base = pathlib.PurePosixPath(source).parent
         candidate = (base / module.lstrip(".").replace(".", "/")).with_suffix(".py")
         return str(candidate) if (ROOT / str(candidate)).is_file() else None
-    if not module.startswith("app."):  # 仅校验仓库内运行时模块
+    if not module.startswith("app."):  # Validate only repository runtime modules.
         return None
     candidate = pathlib.PurePosixPath(module.replace(".", "/")).with_suffix(".py")
     if (ROOT / str(candidate)).is_file():
@@ -122,7 +122,7 @@ class DeploymentTests(unittest.TestCase):
                 target = Path(directory) / filename
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / filename, target)
-            # 不在仓库内导入运行时；临时 HOME、净环境及审计钩子阻断联网和凭据访问。
+            # Isolate imports and block network or credential access with a temporary HOME and audit hooks.
             command = dedent("""\
                 import os
                 import sys

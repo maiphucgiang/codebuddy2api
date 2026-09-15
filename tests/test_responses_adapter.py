@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""
-test_responses_adapter.py — 验证 Responses API 适配层的转换逻辑。
-
-直接运行：python3 tests/test_responses_adapter.py
-"""
+"""Test Responses request and response adaptation."""
 
 import json
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from app.adapters.responses_adapter import (
     responses_request_to_chat,
@@ -19,7 +15,7 @@ from app.adapters.responses_projection import project_responses_chat_body
 
 
 def test_simple_text_request():
-    """测试：简单文本 input → messages 转换。"""
+    """Convert plain text input into Chat messages."""
     req = {
         "model": "glm-5.2",
         "input": "Hello, how are you?",
@@ -34,7 +30,7 @@ def test_simple_text_request():
 
 
 def test_array_input_request():
-    """测试：数组 input（user + assistant + function_call + function_call_output）。"""
+    """Convert mixed message, function-call and function-output items."""
     req = {
         "model": "glm-5.2",
         "input": [
@@ -65,7 +61,7 @@ def test_array_input_request():
 
 
 def test_tools_conversion():
-    """测试：Responses 扁平 tools 格式 → Chat 嵌套格式。"""
+    """Convert flat Responses tools to nested Chat definitions."""
     req = {
         "model": "glm-5.2",
         "input": "test",
@@ -84,7 +80,7 @@ def test_tools_conversion():
 
 
 def test_max_output_tokens():
-    """测试：max_output_tokens → max_tokens。"""
+    """Map max_output_tokens to max_tokens."""
     req = {"model": "glm-5.2", "input": "test", "max_output_tokens": 4096}
     chat = responses_request_to_chat(req)
     assert chat["max_tokens"] == 4096
@@ -92,7 +88,7 @@ def test_max_output_tokens():
 
 
 def test_developer_role():
-    """测试：developer role → system。"""
+    """Normalize developer roles to system roles."""
     req = {"model": "glm-5.2", "input": [
         {"role": "developer", "content": "Be concise."},
         {"role": "user", "content": "Hi"},
@@ -104,7 +100,7 @@ def test_developer_role():
 
 
 def test_typed_developer_message_request():
-    """测试：typed message + developer role 也能映射为 system。"""
+    """Normalize developer roles inside typed messages."""
     req = {
         "model": "glm-5.2",
         "input": [
@@ -119,7 +115,7 @@ def test_typed_developer_message_request():
 
 
 def test_desensitize_harness_user_and_tools():
-    """测试：harness user 注入块会被摘要，tool 描述会脱敏，真实 user 不改。"""
+    """Compact trusted harness input and tool metadata while preserving real user text."""
     body = {
         "messages": [
             {"role": "system", "content": "Refuse exploit development."},
@@ -146,7 +142,7 @@ def test_desensitize_harness_user_and_tools():
 
 
 def test_compact_harness_messages_and_strip_tool_metadata():
-    """测试：Codex 注入长提示被压缩，tool 描述可直接裁掉；user 原话不被整段替换。"""
+    """Compact long Codex templates without replacing the user's actual request."""
     body = {
         "messages": [
             {"role": "system", "content": "You are a coding agent running in the Codex CLI. # How you work\nUse sandbox and escalation."},
@@ -176,7 +172,7 @@ def test_compact_harness_messages_and_strip_tool_metadata():
 
 
 def test_no_compact_still_prunes_codex_runtime_metadata():
-    """测试：保留全文模式仍会裁掉 Codex 注入的运行时元数据大段文本。"""
+    """Remove trusted runtime metadata even when full conversation text is preserved."""
     body = {
         "messages": [
             {
@@ -224,7 +220,7 @@ def test_no_compact_still_prunes_codex_runtime_metadata():
     assert "# AGENTS.md instructions" not in harness_text
     assert "Repository instructions and durable user context are provided." in harness_text
     assert "Environment context is provided by the harness." in harness_text
-    # skill 里的 kill 会被 desensitize_text 插入零宽空格，断言前先剥离，避免与脱敏逻辑耦合
+    # Remove inserted separators to isolate harness compaction from term adaptation.
     assert "Runtime skill metadata is available" in harness_text.replace("​", "")
     assert harness_text.strip().replace("​", "").endswith("test")
     assert out["messages"][2]["content"] == "test"
@@ -232,7 +228,7 @@ def test_no_compact_still_prunes_codex_runtime_metadata():
 
 
 def test_responses_projection_compacts_codex_harness_and_tools():
-    """测试：Codex 风格请求会在首发阶段直接投影为短 system + 极简 schema。"""
+    """Project Codex requests into short system context and minimal tool schemas."""
     body = {
         "messages": [
             {
@@ -288,7 +284,7 @@ def test_responses_projection_compacts_codex_harness_and_tools():
 
 
 def test_responses_projection_preserves_recent_tool_chain_and_summarizes_history():
-    """测试：较早轮次会被摘要，最近 tool 链保持完整。"""
+    """Summarize older turns while retaining the recent tool chain."""
     big_output = "Chunk ID: a1\nWall time: 0.0\nProcess exited with code 0\nOutput:\n" + "\n".join(
         f"line {i}" for i in range(40)
     )
@@ -367,7 +363,7 @@ def test_responses_projection_preserves_recent_tool_chain_and_summarizes_history
 
 
 def test_responses_projection_shrinks_large_tool_arguments():
-    """测试：超长 tool arguments 会压缩成结构化 JSON 摘要。"""
+    """Compact oversized tool arguments into structured JSON summaries."""
     long_cmd = "echo " + ("x" * 1600)
     body = {
         "messages": [
@@ -409,11 +405,7 @@ def _agentic_tool():
 
 
 def test_responses_projection_keeps_user_text_sharing_harness_message():
-    """测试：harness 与用户原话同条时，用户原文和 reminder 正文必须保留。
-
-    回归：旧实现在 user 命中 harness 标记时直接 continue，整条消息连同
-    用户真话一起被丢掉，后端完全看不到用户这一轮说了什么。
-    """
+    """Preserve user and reminder text embedded in messages containing harness context."""
     body = {
         "model": "auto",
         "tools": _agentic_tool(),
@@ -437,7 +429,7 @@ def test_responses_projection_keeps_user_text_sharing_harness_message():
 
 
 def test_responses_projection_keeps_last_user_when_it_carries_harness():
-    """测试：最坏情况下（含真话的 harness 恰为最后一条 user）用户真话仍保留。"""
+    """Preserve real text when the final user message also contains harness context."""
     body = {
         "model": "auto",
         "tools": _agentic_tool(),
@@ -456,10 +448,10 @@ def test_responses_projection_keeps_last_user_when_it_carries_harness():
 
 
 def test_stream_converter_text():
-    """测试：Chat SSE 文本流 → Responses 事件流。"""
+    """Convert Chat text SSE into Responses events."""
     conv = ResponsesStreamConverter(model="glm-5.2")
 
-    # 模拟 Chat SSE chunks
+    # Synthetic Chat SSE chunks
     chunks = [
         'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
         'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}',
@@ -476,13 +468,11 @@ def test_stream_converter_text():
                 if evt_line.startswith("data: "):
                     all_events.append(json.loads(evt_line[6:]))
 
-    # 收尾
     finish = conv.finish()
     for evt_line in finish.strip().split("\n\n"):
         if evt_line.startswith("data: "):
             all_events.append(json.loads(evt_line[6:]))
 
-    # 验证事件类型序列
     types = [e["type"] for e in all_events]
     assert "response.created" in types
     assert "response.in_progress" in types
@@ -494,11 +484,9 @@ def test_stream_converter_text():
     assert "response.output_item.done" in types
     assert "response.completed" in types
 
-    # 验证最终文本
     text_done = [e for e in all_events if e["type"] == "response.output_text.done"][0]
     assert text_done["text"] == "Hello world"
 
-    # 验证 completed response
     completed = [e for e in all_events if e["type"] == "response.completed"][0]
     resp = completed["response"]
     assert resp["status"] == "completed"
@@ -510,7 +498,7 @@ def test_stream_converter_text():
 
 
 def test_stream_converter_function_call():
-    """测试：Chat SSE tool_calls → Responses function_call 事件。"""
+    """Convert Chat tool-call SSE into Responses function-call events."""
     conv = ResponsesStreamConverter(model="glm-5.2")
 
     chunks = [
@@ -540,7 +528,6 @@ def test_stream_converter_function_call():
     assert "response.function_call_arguments.done" in types
     assert "response.completed" in types
 
-    # 验证 function call arguments
     args_done = [e for e in all_events if e["type"] == "response.function_call_arguments.done"][0]
     assert args_done["arguments"] == '{"cmd": "ls"}'
 
@@ -548,7 +535,7 @@ def test_stream_converter_function_call():
 
 
 def test_nonstream_response():
-    """测试：非流式 Response 对象生成。"""
+    """Build a non-streaming Response object."""
     conv = ResponsesStreamConverter(model="glm-5.2")
     conv.feed_line('data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}')
     conv.feed_line('data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}')
@@ -564,7 +551,7 @@ def test_nonstream_response():
 
 
 def test_finish_reason_maps_to_terminal_status():
-    """长度截断与内容过滤不得标记 completed：流式发 response.incomplete，非流式带 incomplete_details。"""
+    """Report truncated or filtered output as incomplete in streaming and aggregated responses."""
     conv = ResponsesStreamConverter(model="glm-5.2")
     conv.feed_line('data: {"id":"c2","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}')
     conv.feed_line('data: {"id":"c2","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}')
@@ -590,7 +577,7 @@ def test_finish_reason_maps_to_terminal_status():
 
 
 def test_stream_events_carry_sequence_and_item_ids():
-    """每个事件带递增 sequence_number；text/reasoning/argument 增量事件带所属 item_id。"""
+    """Emit monotonic sequence numbers and item IDs on every corresponding delta."""
     conv = ResponsesStreamConverter(model="glm-5.2")
     chunks = [
         'data: {"id":"s1","choices":[{"index":0,"delta":{"reasoning_content":"想"},"finish_reason":null}]}',
@@ -614,7 +601,7 @@ def test_stream_events_carry_sequence_and_item_ids():
 
 
 def test_usage_maps_cached_tokens_and_omits_when_unknown():
-    """上游 cached_tokens/cache_read_input_tokens 透传；都没有时不出 input_tokens_details。"""
+    """Preserve known cache counters and omit details when upstream counters are absent."""
     conv = ResponsesStreamConverter(model="m")
     conv.feed_line('data: {"id":"u1","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}')
     conv.feed_line('data: {"id":"u1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":7}}}')
@@ -634,7 +621,7 @@ def test_usage_maps_cached_tokens_and_omits_when_unknown():
 
 
 def test_reasoning_effort_and_text_format_are_mapped():
-    """reasoning.effort / text.format 进入上游请求；顶层字段优先；不支持的 format 显式报错。"""
+    """Map reasoning and text format options with explicit top-level precedence."""
     chat = responses_request_to_chat({"input": "hi", "reasoning": {"effort": "high"},
                                       "text": {"format": {"type": "json_object"}}})
     assert chat["reasoning_effort"] == "high"
@@ -642,7 +629,7 @@ def test_reasoning_effort_and_text_format_are_mapped():
 
     chat = responses_request_to_chat({"input": "hi", "reasoning_effort": "low",
                                       "reasoning": {"effort": "high"}})
-    assert chat["reasoning_effort"] == "low"  # 顶层显式字段优先
+    assert chat["reasoning_effort"] == "low"  # Explicit top-level fields take precedence.
 
     chat = responses_request_to_chat({"input": "hi", "text": {"format": {
         "type": "json_schema", "name": "answer", "strict": True,
@@ -664,7 +651,7 @@ def test_reasoning_effort_and_text_format_are_mapped():
     print("✅ test_reasoning_effort_and_text_format_are_mapped")
 
 def test_parallel_tool_calls_roundtrip():
-    """parallel_tool_calls 透传到上游请求，且响应对象如实回报请求值而非固定 True。"""
+    """Preserve the requested parallel_tool_calls setting in upstream and response objects."""
     chat = responses_request_to_chat({"input": "hi", "parallel_tool_calls": False})
     assert chat["parallel_tool_calls"] is False
     conv = ResponsesStreamConverter(model="m", parallel_tool_calls=False)

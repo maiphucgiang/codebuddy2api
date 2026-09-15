@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""登录命令的扫码轮询、凭据保存和退出行为；运行 python3 tests/test_login.py。"""
+"""Test browser login polling, credential persistence and command exit behavior."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import contextlib
 import io
@@ -82,7 +82,7 @@ class LoginTests(unittest.TestCase):
         self.assertEqual(auth_oauth.validate_cred_data(credential), ("u1", None))
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
-        self.assertIsNone(pool.pick(None, region="cn"))  # 内部过滤不能把国际账号当作国内账号。
+        self.assertIsNone(pool.pick(None, region="cn"))  # Never treat international credentials as domestic.
         self.assertEqual(pool.pick(None).summary()["uid"], "u1")
         self.assertIn("账号已保存", self.stdout.getvalue())
         self.assert_no_tokens_printed()

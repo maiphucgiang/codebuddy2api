@@ -1,11 +1,8 @@
-"""账号/租户目录、路径复用和启动屏障回归；仅临时合成凭据与 mock，无联网。
-
-运行：.venv/bin/python -B -m unittest -v tests/test_identity_sync.py
-"""
+"""Test account catalogs, path reuse and startup synchronization with synthetic offline credentials."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import io
 import json
@@ -25,7 +22,7 @@ DOMAINS = {"cn-cli": "www.codebuddy.cn", "cn-work": "www.workbuddy.cn",
 
 
 def scopes(items):
-    """选择器子集与账号根表来自同一次拉取；测试里让两者相同，只验证账号隔离与调度。"""
+    """Use matching selector/root fixtures to isolate account routing behavior."""
     return {"picker": items, "account": items}
 
 
@@ -69,7 +66,7 @@ class IdentitySyncTests(unittest.TestCase):
         self.addCleanup(c.invalidate_model_table)
 
     def write_credential(self, name="slot.info", **kwargs):
-        # 与真实导入一致使用原子替换，避免同大小原地写入命中文件系统时间戳粒度。
+        # Atomic replacement avoids timestamp-resolution ambiguity from equal-size in-place writes.
         return c.atomic_write_credential(self.root, name, json.dumps(credential(**kwargs)).encode("utf-8"))
 
     def configure(self, *paths):
@@ -267,7 +264,7 @@ class IdentitySyncTests(unittest.TestCase):
         self.assertTrue(self.pool._eligible(entries["A"], "free-only"))
         self.assertEqual({self.picked_uid("paid-only") for _ in range(6)}, {"B"})
         self.assertEqual(self.picked_uid("free-only"), "A")
-        # 余额恢复后重新进入付费模型轮询。
+        # Restored balances rejoin paid-model rotation.
         self.ledger.update_credits(entries["A"]["id"], {
             "credits": 100, "intl": False, "segments": [], "soonest_expiry": None})
         self.assertEqual({self.picked_uid("paid-only") for _ in range(6)}, {"A", "B"})

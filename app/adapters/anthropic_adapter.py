@@ -1,13 +1,4 @@
-"""
-anthropic_adapter.py — Anthropic Messages API ↔ OpenAI Chat Completions API 适配层。
-
-Claude Code / CC Switch 使用 Anthropic Messages API（POST /v1/messages），
-而 CodeBuddy 后端只支持 OpenAI Chat Completions 协议。本模块做双向转换：
-  请求：Anthropic Messages 格式 → OpenAI Chat 格式
-  响应：OpenAI Chat SSE → Anthropic Messages SSE 事件流
-
-Anthropic Messages API 参考：https://docs.anthropic.com/en/docs/messages
-"""
+"""Translate requests and SSE responses between Anthropic Messages and OpenAI Chat."""
 
 from __future__ import annotations
 
@@ -17,7 +8,7 @@ import time
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# ID 生成
+# ID generation
 # ---------------------------------------------------------------------------
 
 def _rand_id(prefix: str = "") -> str:
@@ -25,7 +16,7 @@ def _rand_id(prefix: str = "") -> str:
 
 
 def map_usage_to_anthropic(u: dict) -> dict:
-    """OpenAI 风格 usage → Anthropic 风格；缓存读从 input_tokens 中扣除。"""
+    """Map Chat usage to Anthropic counters, subtracting cache reads from input tokens."""
     cached = (u.get("cache_read_input_tokens")
               or (u.get("prompt_tokens_details") or {}).get("cached_tokens")
               or 0)
@@ -38,28 +29,21 @@ def map_usage_to_anthropic(u: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 请求转换：Anthropic → Chat
+# Anthropic to Chat requests
 # ---------------------------------------------------------------------------
 
 def anthropic_request_to_chat(body: dict) -> dict:
-    """将 Anthropic Messages API 请求体转换为 OpenAI Chat Completions 请求体。
-
-    关键映射：
-      system → messages[0] role=system
-      messages[].content (blocks) → content (string) / tool_calls / tool role
-      tools[].input_schema → tools[].function.parameters
-      metadata / thinking → 丢弃
-    """
+    """Convert Anthropic instructions, message blocks and tools to a Chat request."""
     messages: list[dict] = []
 
-    # system → 首条 system 消息
+    # Place system instructions first.
     system = body.get("system")
     if system:
         sys_content = _extract_system_text(system)
         if sys_content:
             messages.append({"role": "system", "content": sys_content})
 
-    # messages → 消息转换
+    # Convert message content.
     for m in body.get("messages", []):
         if not isinstance(m, dict):
             continue
@@ -67,7 +51,7 @@ def anthropic_request_to_chat(body: dict) -> dict:
 
     chat: dict[str, Any] = {"messages": messages, "stream": True}
 
-    # model（透传，不做映射）
+    # Preserve the requested model.
     if "model" in body:
         chat["model"] = body["model"]
 
@@ -90,16 +74,16 @@ def anthropic_request_to_chat(body: dict) -> dict:
                 chat["tool_choice"] = "required" if kind == "any" else kind
             else:
                 raise ValueError("unsupported tool_choice type")
-            # 禁止并行工具调用的约束必须传到上游，不接受后静默丢失
+            # Preserve the caller's restriction on parallel tool calls.
             if isinstance(tc.get("disable_parallel_tool_use"), bool):
                 chat["parallel_tool_calls"] = not tc["disable_parallel_tool_use"]
         elif isinstance(tc, str):
             chat["tool_choice"] = tc if tc in ("none", "auto", "required") else {"type": "function", "function": {"name": tc}}
-    # 透传常见参数
+    # Forward supported parameters.
     for key in ("temperature", "top_p", "stop", "top_k"):
         if key in body:
             chat[key] = body[key]
-    # Anthropic 正式停止序列字段；显式 stop 优先
+    # Explicit stop takes precedence over Anthropic stop_sequences.
     stop_sequences = body.get("stop_sequences")
     if stop_sequences is not None and "stop" not in chat:
         if not isinstance(stop_sequences, list) or not all(isinstance(s, str) for s in stop_sequences):
@@ -110,7 +94,7 @@ def anthropic_request_to_chat(body: dict) -> dict:
 
 
 def _extract_system_text(system) -> str:
-    """提取 system 字段为纯文本字符串。支持 string 和 [{type:text, text:...}] 数组。"""
+    """Extract plain system text from a string or text-block array."""
     if isinstance(system, str):
         return system
     if isinstance(system, list):
@@ -123,22 +107,22 @@ def _extract_system_text(system) -> str:
 
 
 def _convert_anthropic_message(msg: dict) -> list[dict]:
-    """将单个 Anthropic 消息转换为 OpenAI 格式的消息（可能为多条）。"""
+    """Convert one Anthropic message into one or more Chat messages."""
     role = msg.get("role", "")
     content = msg.get("content")
 
-    # 简单字符串 content
+    # Plain text content
     if isinstance(content, str):
         return [{"role": role, "content": content}]
 
-    # 空 content
+    # Empty content
     if not isinstance(content, list) or not content:
         return []
 
-    # content blocks → 需要解析
+    # Structured content blocks
     blocks = content
 
-    # 检查是否包含 tool_result（role=user 时）
+    # User messages may contain tool results.
     if role == "user":
         result: list[dict] = []
         user_blocks: list[dict] = []
@@ -149,24 +133,24 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
             if bt in ("text", "image"):
                 user_blocks.append(block)
             elif bt == "tool_result":
-                # tool_result → 独立的 tool 消息
+                # Emit each tool result as a separate tool message.
                 tc_id = block.get("tool_use_id", "")
                 output = block.get("content", "")
                 if isinstance(output, list):
                     output = _convert_content_blocks(output)
                 if block.get("is_error") is True:
-                    # Chat 协议无等价字段：失败标记编码进正文；含图片的列表内容前置文本块而非拼接
+                    # Encode tool failure as text while preserving image blocks.
                     if isinstance(output, list):
                         output = [{"type": "text", "text": "[tool execution failed]"}] + output
                     else:
                         output = "[tool execution failed]\n" + (output or "")
                 result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
         if user_blocks:
-            # 工具结果必须紧随 assistant 的 tool_calls；普通文本排在它们之后
+            # Tool results must immediately follow their assistant tool calls.
             result.append({"role": "user", "content": _convert_content_blocks(user_blocks)})
         return result
 
-    # assistant 角色
+    # Assistant content
     if role == "assistant":
         content_out = _convert_content_blocks(blocks)
         tool_calls: list[dict] = []
@@ -196,7 +180,7 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
 
 
 def _convert_content_blocks(blocks: list) -> str | list[dict]:
-    """保留图片与文本顺序；纯文本仍使用原来的字符串表示。"""
+    """Preserve image/text order and use strings for text-only content."""
     parts = []
     has_image = False
     for block in blocks:
@@ -227,16 +211,12 @@ def _convert_content_blocks(blocks: list) -> str | list[dict]:
 
 
 def _convert_anthropic_tools(tools: list) -> list:
-    """将 Anthropic 格式的 tools 转为 OpenAI Chat 格式。
-
-    Anthropic:  {"name": "...", "description": "...", "input_schema": {...}}
-    Chat:       {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
-    """
+    """Convert Anthropic tool definitions to Chat function objects."""
     result = []
     for t in tools:
         if not isinstance(t, dict):
             continue
-        # 已经是 Chat 格式
+        # Already in Chat format.
         if "function" in t:
             result.append(t)
             continue
@@ -250,52 +230,43 @@ def _convert_anthropic_tools(tools: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# 响应转换：Chat SSE → Anthropic Messages SSE
+# Chat SSE to Anthropic Messages events
 # ---------------------------------------------------------------------------
 
 class AnthropicStreamConverter:
-    """将 OpenAI Chat SSE 流实时转换为 Anthropic Messages SSE 事件流。
-
-    用法：
-      converter = AnthropicStreamConverter(model="deepseek-v4-pro")
-      for line in backend_sse:
-          events = converter.feed_line(line)
-          if events:
-              yield events.encode()
-      yield converter.finish().encode()
-    """
+    """Convert Chat SSE increments to Anthropic Messages events."""
 
     def __init__(self, model: str = "unknown"):
         self.msg_id = _rand_id("msg_")
         self.model = model
         self.created_at = int(time.time())
 
-        # 状态
+        # Stream state
         self._emitted_start = False
 
-        # text 内容块
+        # Text block state
         self._text_content = ""
         self._text_block_open = False
         self._text_block_idx = 0
 
-        # thinking 内容块（上游 reasoning_content → Anthropic thinking block）
+        # Map reasoning_content to thinking blocks.
         self._thinking_content = ""
         self._thinking_block_open = False
         self._thinking_block_idx = 0
 
-        # tool_use 内容块（index → {id, name, args, block_idx, open}）
+        # Tool blocks indexed by upstream call position.
         self._tool_uses: dict[int, dict] = {}
         self._next_block_idx = 0
 
-        # 结束信息
+        # Completion metadata
         self._finish_reason: str | None = None
         self._usage: dict | None = None
         self._content_filter: bool = False
 
-    # ---- 公开接口 ----
+    # Public methods
 
     def feed_line(self, line: str) -> str:
-        """处理一行 SSE（如 'data: {...}'），返回 Anthropic SSE 事件字符串。"""
+        """Convert one SSE line into Anthropic event text."""
         line = line.strip()
         if not line or not line.startswith("data:"):
             return ""
@@ -309,24 +280,24 @@ class AnthropicStreamConverter:
         return self._process_chunk(chunk)
 
     def finish(self) -> str:
-        """流结束，发出收尾事件。"""
+        """Emit final events and close the message."""
         events: list[str] = []
 
-        # 关闭 thinking 块
+        # Close thinking blocks.
         if self._thinking_block_open:
             events.append(self._evt(
                 "content_block_stop", {"index": self._thinking_block_idx}
             ))
             self._thinking_block_open = False
 
-        # 关闭 text 块
+        # Close text blocks.
         if self._text_block_open:
             events.append(self._evt(
                 "content_block_stop", {"index": self._text_block_idx}
             ))
             self._text_block_open = False
 
-        # 关闭 tool_use 块
+        # Close tool blocks.
         for tc in self._tool_uses.values():
             if tc.get("open"):
                 events.append(self._evt(
@@ -334,7 +305,7 @@ class AnthropicStreamConverter:
                 ))
                 tc["open"] = False
 
-        # stop_reason 映射
+        # Map the finish reason.
         sr = self._finish_reason or "stop"
         stop_map = {
             "stop": "end_turn",
@@ -356,7 +327,7 @@ class AnthropicStreamConverter:
         return "".join(events)
 
     def get_nonstream_response(self) -> dict:
-        """获取完整的非流式 Message 响应对象。"""
+        """Return the complete non-streaming Message response."""
         content = self._build_content_blocks()
         sr = self._finish_reason or "stop"
         stop_map = {
@@ -379,7 +350,7 @@ class AnthropicStreamConverter:
             resp["usage"] = map_usage_to_anthropic(self._usage)
         return resp
 
-    # ---- 内部 ----
+    # Internal helpers
 
     def _process_chunk(self, chunk: dict) -> str:
         events: list[str] = []
@@ -387,7 +358,7 @@ class AnthropicStreamConverter:
         if chunk.get("model"):
             self.model = chunk["model"]
 
-        # 首次 → message_start
+        # Emit message_start once.
         if not self._emitted_start:
             events.append(self._evt("message_start", {
                 "message": {
@@ -408,7 +379,7 @@ class AnthropicStreamConverter:
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
-            # thinking delta（reasoning_content → thinking block，位于正文之前）
+            # Emit reasoning before text.
             thinking = delta.get("reasoning_content")
             if thinking:
                 self._thinking_content += thinking
@@ -425,10 +396,10 @@ class AnthropicStreamConverter:
                     "delta": {"type": "thinking_delta", "thinking": thinking},
                 }))
 
-            # Anthropic 没有 refusal 文本块；使用 text 保留原始拒绝说明。
+            # Anthropic has no refusal block; preserve refusal text as ordinary content.
             content = (delta.get("content") or "") + (delta.get("refusal") or "")
             if content:
-                # 正文开始时关闭 thinking 块（thinking 必须位于正文之前）
+                # Close thinking before text begins.
                 if self._thinking_block_open:
                     events.append(self._evt("content_block_stop", {
                         "index": self._thinking_block_idx
@@ -469,7 +440,7 @@ class AnthropicStreamConverter:
                     slot["name"] = fn["name"]
 
                 if not slot["open"]:
-                    # thinking 块先于 tool_use 关闭（reasoning → tool_call 无正文时）
+                    # Close thinking before a tool block begins.
                     if self._thinking_block_open:
                         events.append(self._evt("content_block_stop", {
                             "index": self._thinking_block_idx
@@ -491,7 +462,7 @@ class AnthropicStreamConverter:
             if finish:
                 self._finish_reason = finish
 
-                # finish_reason 出现时关闭当前打开的块
+                # Close open blocks when the upstream finishes.
                 if self._thinking_block_open:
                     events.append(self._evt("content_block_stop", {
                         "index": self._thinking_block_idx
@@ -514,15 +485,15 @@ class AnthropicStreamConverter:
         return "".join(events)
 
     def _evt(self, event_type: str, data: dict) -> str:
-        """格式化一个 Anthropic SSE 事件（含 event: 行）。"""
+        """Format an Anthropic SSE event with its event name."""
         payload = {"type": event_type, **data}
         return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     def _build_content_blocks(self) -> list[dict]:
-        """构造完整的 content blocks 数组（用于非流式响应）。"""
+        """Build content blocks for a non-streaming response."""
         blocks: list[dict] = []
 
-        # thinking block（须位于 text 之前）
+        # Thinking must precede text.
         if self._thinking_content:
             blocks.append({"type": "thinking", "thinking": self._thinking_content})
 
@@ -538,7 +509,7 @@ class AnthropicStreamConverter:
                 "name": tc["name"],
                 "input": {},
             }
-            # 尝试将 args 解析为 JSON object
+            # Parse tool arguments as a JSON object.
             try:
                 block["input"] = json.loads(tc["args"])
             except (json.JSONDecodeError, ValueError):

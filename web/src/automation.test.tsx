@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, expect, it, vi } from "vite-plus/test";
 import { Credentials } from "./pages/Credentials";
 import { api, credentialResponse, useResource } from "./api";
+import { TravelSummary } from "./Travel";
 
 vi.mock("./api", async (original) => ({
   ...(await original<typeof import("./api")>()),
@@ -163,4 +164,95 @@ it("disables switches when an older backend omits them and rejects malformed typ
   expect(() => credentialResponse({ credentials: [{ id: "bad", auto_checkin: "false" }] })).toThrow(
     "自动任务状态必须为布尔值",
   );
+});
+
+it("shows server-provided travel locations and snapshot durations without triggering requests", () => {
+  const { rows } = fixture();
+  Object.assign(rows[0].travel, {
+    location_name: "海边书店",
+    remaining_seconds: 3661,
+    phase: "after_depart",
+    stale: false,
+  });
+  const post = vi.spyOn(api, "post");
+  render(<Credentials />);
+  expect(screen.getByText("旅行地点：海边书店")).toBeTruthy();
+  expect(screen.getByText("查询时剩余：1 小时 2 分钟")).toBeTruthy();
+  expect(screen.getByText("派遣后核验")).toBeTruthy();
+  expect(post).not.toHaveBeenCalled();
+});
+
+it("keeps confirmed departure visible when its status read fails", async () => {
+  fixture();
+  vi.spyOn(api, "post").mockResolvedValue({
+    data: {
+      results: [
+        {
+          id: "cn",
+          name: "cn.info",
+          action: "travel",
+          ok: false,
+          departed: true,
+          stale: true,
+          state: "unknown",
+          phase: "after_depart",
+          error_kind: "http",
+          http_status: 503,
+          code: 123,
+          remaining_seconds: 300,
+          message: "派遣已确认，后续状态查询失败；勿重复派出",
+        },
+      ],
+    },
+  });
+  render(<Credentials />);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "旅行领派 cn.info" })));
+  expect(screen.getByText("部分完成")).toBeTruthy();
+  expect(screen.getByText("派遣后核验")).toBeTruthy();
+  expect(screen.getByText("上游 HTTP 错误")).toBeTruthy();
+  expect(screen.getByText(/HTTP 503/)).toBeTruthy();
+  expect(screen.getByText(/业务码 123/)).toBeTruthy();
+  expect(screen.queryByText(/查询时剩余/)).toBeNull();
+});
+
+it("shows nested travel diagnostics independently from checkin", async () => {
+  fixture();
+  vi.spyOn(api, "post").mockResolvedValue({
+    data: {
+      results: [
+        {
+          id: "cn",
+          name: "cn.info",
+          action: "checkin",
+          ok: false,
+          checkin_ok: true,
+          message: "签到成功；地点配置查询失败，未派出",
+          travel: { phase: "config", http_status: 404, error_kind: "http", code: 12 },
+        },
+      ],
+    },
+  });
+  render(<Credentials />);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "签到 cn.info" })));
+  expect(screen.getByText("部分完成")).toBeTruthy();
+  expect(screen.getByText("地点配置")).toBeTruthy();
+  expect(screen.getByText(/HTTP 404/)).toBeTruthy();
+});
+
+it("does not invent a duration or a claimed credit amount", () => {
+  const { rerender } = render(<TravelSummary trip={{ state: "traveling", claimed: true }} />);
+  expect(screen.getByText("领取已确认，积分数额未返回")).toBeTruthy();
+  expect(screen.queryByText(/查询时剩余/)).toBeNull();
+  for (const remaining of [null, true, "300", -1, NaN, Infinity]) {
+    rerender(<TravelSummary trip={{ state: "traveling", remaining_seconds: remaining }} />);
+    expect(screen.queryByText(/查询时剩余/)).toBeNull();
+  }
+  rerender(<TravelSummary trip={{ state: "traveling", remaining_seconds: 300, stale: true }} />);
+  expect(screen.queryByText(/查询时剩余/)).toBeNull();
+  rerender(<TravelSummary trip={{ state: "arrived", remaining_seconds: 300 }} />);
+  expect(screen.queryByText(/查询时剩余/)).toBeNull();
+  rerender(<TravelSummary trip={{ claimed: true, claimed_credit: 0 }} />);
+  expect(screen.queryByText(/积分数额未返回/)).toBeNull();
+  rerender(<TravelSummary trip={{ state: "traveling", remaining_seconds: 0 }} />);
+  expect(screen.getByText(/预计已到达，请查询核验/)).toBeTruthy();
 });

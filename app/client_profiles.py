@@ -1,4 +1,4 @@
-"""CLI 与 WorkBuddy 产品身份头分开生成，共享认证字段与底层协议头。"""
+"""Build separate CLI and WorkBuddy identity headers with shared authentication fields."""
 
 import hashlib
 import json
@@ -27,7 +27,7 @@ SDK_HEADERS = {
 
 
 def identity_headers(profile: str) -> dict:
-    """版本来自已核对的官方包，不读取本机桌面用户配置或机器标识。"""
+    """Use verified package versions without reading desktop settings or device identities."""
     if profile_product(profile) == "cli":
         return {"User-Agent": CLI_USER_AGENT, "X-IDE-Type": "CLI", "X-IDE-Name": "CLI", "X-IDE-Version": CLI_VERSION}
     name = "WorkBuddy AI" if profile_region(profile) == "intl" else "WorkBuddy"
@@ -62,12 +62,12 @@ def catalog_headers(auth: dict, account: dict | None = None, *, user_agent="") -
         headers["x-client-platform"] = "cli"
         if user_agent:
             headers["User-Agent"] = user_agent
-    # WorkBuddy coordinator 不带 x-client-platform: cli，否则会取得另一产品的模型表。
+    # A CLI platform header would select the wrong product catalog for WorkBuddy.
     return headers
 
 
 def account_key(profile: str, uid, enterprise_id="") -> str:
-    """稳定产品/账号/租户指纹，不包含 token 或本地路径。"""
+    """Hash product, account and tenant identity without tokens or local paths."""
     identity = json.dumps([profile, str(uid or ""), str(enterprise_id or "")],
                           ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()

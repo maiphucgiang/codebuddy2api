@@ -1,9 +1,5 @@
-"""Bounded, dependency-free log previews; never use these helpers for wire data.
-
-Only common credential fields/token shapes are recognized, not arbitrary secrets.
-Text inspection is limited to the first ``max_bytes`` characters. Structured
-previews additionally cap string length, depth, total nodes and container width;
-truncated previews need not be valid JSON. No image data is decoded.
+"""Create bounded log-only previews that redact common credentials without decoding images.
+These helpers do not recognize every possible secret and must not modify wire data.
 """
 
 import itertools
@@ -129,13 +125,7 @@ def _redact_assignments(text):
 
 
 def _image_header(text, start, end):
-    """Find the earliest image MIME whose parameter chain ends at ``end``.
-
-    Walk semicolon-separated segments backwards, at most twice per character.
-    A comma always stops the walk, so different base64 terminators cannot cause
-    overlapping header scans. Invalid/empty parameters stop earlier candidates,
-    but a valid image prefix inside the final segment is still recognized.
-    """
+    """Find the earliest valid image header before the terminator without overlapping scans."""
     candidate = None
     cursor = end
     while cursor > start:
@@ -166,13 +156,7 @@ def _image_header(text, start, end):
 
 
 def _redact_image_urls(text):
-    """O(n) time/space in the already bounded preview, including failed URLs.
-
-    Terminator searches advance monotonically. Header scans occupy disjoint
-    comma-delimited regions, body scans occupy disjoint matches, and output
-    slices never overlap. In particular, repeated data:image prefixes without
-    a base64 terminator need no header scan at all.
-    """
+    """Redact image URLs in linear time and space within the bounded preview."""
     parts = []
     end = 0
     for marker in _IMAGE_BASE64.finditer(text):
@@ -229,13 +213,7 @@ class _Writer:
 
 
 def sanitize_log_text(text: str, max_bytes: int = 65536) -> str:
-    """Redact common text credentials and cap the entire UTF-8 result.
-
-    Zero disables body output; negative/non-integer limits raise ValueError /
-    TypeError. Work is bounded by the supplied limit, not the original text
-    length. Any inspected-but-incomplete credential is redacted before clipping.
-    Normal error types, HTTP statuses and request IDs are not token patterns.
-    """
+    """Redact common credentials within the UTF-8 byte budget; zero disables preview output."""
     _check_limit(max_bytes)
     if max_bytes == 0:
         return ""
@@ -246,14 +224,7 @@ def sanitize_log_text(text: str, max_bytes: int = 65536) -> str:
 
 
 def format_log_body(value, max_bytes: int = 65536) -> str:
-    """Return a non-mutating, bounded JSON-like preview of a JSON value.
-
-    Credential fields are replaced without visiting their values. Large strings
-    retain only a sanitized prefix and character count; wide/deep containers
-    retain a few children and a count/limit summary. No whole-body serialization,
-    deep copy, image decoding, custom repr calls or external state is involved.
-    The output (including all truncation markers) fits ``max_bytes`` UTF-8 bytes.
-    """
+    """Build a bounded redacted JSON-like preview without mutating or fully serializing the input."""
     _check_limit(max_bytes)
     if max_bytes == 0:
         return ""

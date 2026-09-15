@@ -102,7 +102,7 @@ class ControlStore:
         if not isinstance(data["models"], dict) or not isinstance(data["credentials"], dict):
             raise ValueError("管理数据库策略无效")
         for source, rule in data["models"].items():
-            validate_model(source, rule, data["models"], legacy_scopes=True)  # 旧联合范围保持原有交集，编辑时再显式转换。
+            validate_model(source, rule, data["models"], legacy_scopes=True)  # Preserve legacy scope intersections.
         for identity, metadata in data["credentials"].items():
             _identifier(identity, "账号指纹")
             if (not isinstance(metadata, dict) or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel"}

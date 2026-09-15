@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""test_auth_oauth.py — 验证 auth_oauth.py 的入库校验/.info 拼装/OAuth 状态机与 converter 保活调度。
-
-直接运行：python3 tests/test_auth_oauth.py
-"""
+"""Test credential validation, OAuth state transitions, persistence and keepalive scheduling."""
 
 import base64
 import json
@@ -12,7 +9,7 @@ import time
 import threading
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from app import auth_oauth
 from app.auth_oauth import (
@@ -37,25 +34,24 @@ def _cred(uid="u1", domain="www.codebuddy.cn", token=None):
 
 def test_validate_cred_data():
     assert validate_cred_data(_cred()) == ("u1", None)
-    assert validate_cred_data(_cred(domain="www.workbuddy.ai"))[1] is None       # 国际站
-    assert validate_cred_data(_cred(domain="copilot.tencent.com"))[1] is None    # 新版 Keycloak issuer
-    # domain 缺失时靠 JWT issuer 兜底
+    assert validate_cred_data(_cred(domain="www.workbuddy.ai"))[1] is None       # International site
+    assert validate_cred_data(_cred(domain="copilot.tencent.com"))[1] is None    # Keycloak issuer
+    # Fall back to the JWT issuer when the domain is absent.
     c = _cred()
     c["auth"].pop("domain")
     assert validate_cred_data(c) == ("u1", None)
-    # accounts[0] 兜底（无 account 键）
+    # Fall back to accounts[0] when account is absent.
     c = _cred()
     c["accounts"] = [c.pop("account")]
     assert validate_cred_data(c) == ("u1", None)
-    # 拒绝项
     assert validate_cred_data(None)[1]
-    assert validate_cred_data({"account": {"uid": "u"}})[1]                      # 缺 token
-    assert validate_cred_data({"auth": {"accessToken": "t", "domain": "www.codebuddy.cn"}})[1]  # 缺 uid
+    assert validate_cred_data({"account": {"uid": "u"}})[1]                      # Missing token
+    assert validate_cred_data({"auth": {"accessToken": "t", "domain": "www.codebuddy.cn"}})[1]  # Missing UID
     bad = _cred(domain="evil.example.com")
     bad["auth"]["accessToken"] = "not-a-jwt"
     uid, err = validate_cred_data(bad)
     assert uid is None and "允许列表" in err
-    # 时间戳必须有限且合理：NaN/Infinity/bool/0/超范围都拒绝
+    # Reject nonfinite, Boolean, zero and out-of-range timestamps.
     for field in ("expiresAt", "lastRefreshTime"):
         for bad_ts in (float("nan"), float("inf"), float("-inf"), True, 0, -1,
                        4102444800000, 99999999999999, 10**1000, -(10**1000)):
@@ -67,9 +63,9 @@ def test_validate_cred_data():
             c["auth"][field] = valid_ts
             assert validate_cred_data(c) == ("u1", None)
     c = _cred()
-    c["auth"]["expiresAt"] = 1893456000000  # 2030-01-01 毫秒
+    c["auth"]["expiresAt"] = 1893456000000  # 2030-01-01 in milliseconds
     assert validate_cred_data(c) == ("u1", None)
-    # 严格解析拒绝非标准常量
+    # Reject nonstandard JSON constants.
     from app.auth_oauth import loads_strict
     for text in ('{"a": NaN}', '{"a": Infinity}', '{"a": -Infinity}'):
         try:
@@ -87,8 +83,8 @@ def test_helpers():
     assert _normalize_origin("") == ""
     assert _token_issuer_origin(_jwt("https://www.workbuddy.cn/auth/realms/c")) == "https://www.workbuddy.cn"
     assert _token_issuer_origin("bad") == ""
-    assert _norm_ts(1_700_000_000) == 1_700_000_000_000        # 秒 → 毫秒
-    assert _norm_ts(1_700_000_000_000) == 1_700_000_000_000    # 毫秒保持
+    assert _norm_ts(1_700_000_000) == 1_700_000_000_000        # Seconds to milliseconds
+    assert _norm_ts(1_700_000_000_000) == 1_700_000_000_000    # Milliseconds unchanged
     assert _norm_ts("1700000000") == 1_700_000_000_000
     assert _norm_ts(True) is None and _norm_ts(-1) is None and _norm_ts("x") is None
     print("✅ test_helpers")
@@ -102,18 +98,18 @@ def test_build_auth_file():
     c = build_auth_file(tok, acc)
     a, au = c["account"], c["auth"]
     assert a["uid"] == "u9" and a["lastLogin"] is True and a["pluginEnabled"] is True
-    assert a["type"] == "personal" and a["extra"] == 1                       # 保留上游额外字段
+    assert a["type"] == "personal" and a["extra"] == 1                       # Preserve extra fields.
     assert au["accessToken"] == "at" and au["refreshToken"] == "rt"
-    assert au["tokenType"] == "Bearer" and au["idToken"] == "keep-me"        # 不裁剪白名单
+    assert au["tokenType"] == "Bearer" and au["idToken"] == "keep-me"        # Preserve upstream metadata.
     assert abs(au["expiresAt"] - (now + 7200_000)) < 2000
     assert au["expiresIn"] <= 7200 and au["lastRefreshTime"] >= now - 2000
     assert au["refreshExpiresAt"] > au["expiresAt"]
     assert c["accounts"] == c["allAccounts"] and c["accounts"][0]["uid"] == "u9"
-    # snake_case + expiresAt 秒级时间戳兼容
+    # Accept snake_case aliases and second-based expiry.
     c2 = build_auth_file({"access_token": "x", "refresh_token": "y", "expires_at": 1_800_000_000},
                          {"uid": "u"})
     assert c2["auth"]["accessToken"] == "x" and c2["auth"]["expiresAt"] == 1_800_000_000_000
-    # 无过期信息
+    # Missing expiry metadata
     c3 = build_auth_file({"accessToken": "x"}, {"uid": "u"})
     assert c3["auth"]["expiresIn"] == 0 and "expiresAt" not in c3["auth"]
     print("✅ test_build_auth_file")
@@ -124,7 +120,7 @@ def test_merge_existing_accounts():
     existing = {"allAccounts": [{"uid": "old1"}, {"uid": "new", "stale": True}, {"uid": "old2"}]}
     merged = merge_existing_accounts(cred, existing)
     uids = [a["uid"] for a in merged["allAccounts"]]
-    assert uids == ["old1", "old2", "new"]                # 去重且新账号最后
+    assert uids == ["old1", "old2", "new"]                # Deduplicate and append the new account.
     assert merged["accounts"][-1]["uid"] == "new"
     same = merge_existing_accounts(build_auth_file({"accessToken": "x"}, {"uid": "new"}), None)
     assert [a["uid"] for a in same["allAccounts"]] == ["new"]
@@ -140,7 +136,7 @@ class _Resp:
 
 
 class _FakeClient:
-    """按 URL 路由的假 httpx.Client；calls 记录 (method, path)。"""
+    """Route synthetic HTTP requests by URL and record method/path calls."""
     routes = {}
     calls = []
 
@@ -184,17 +180,17 @@ def test_oauth_full_flow():
     m = _manager(routes)
     r = m.start("cn")
     assert r["login_id"].startswith("oa_") and r["expires_in"] == 600
-    assert r["verification_uri"] == "https://www.codebuddy.cn/login?state=st-1"  # 缺省兜底链接
-    assert m.poll(r["login_id"]) == {"done": False}                              # 未授权
+    assert r["verification_uri"] == "https://www.codebuddy.cn/login?state=st-1"  # Default authorization URL
+    assert m.poll(r["login_id"]) == {"done": False}                              # Authorization pending
     granted["v"] = True
     r2 = m.poll(r["login_id"])
     assert r2["done"] and r2["uid"] == "u1" and r2["nickname"] == "甲"
     assert r2["cred"]["auth"]["accessToken"] == "at"
     assert _FakeClient.last_headers["Authorization"] == "Bearer at"
     assert _FakeClient.last_headers["X-Domain"] == "www.codebuddy.cn"
-    r3 = m.poll(r["login_id"])                                                   # 重复轮询取缓存结果
+    r3 = m.poll(r["login_id"])                                                   # Reuse the cached result.
     assert r3["done"] and r3["uid"] == "u1"
-    assert validate_cred_data(r3["cred"])[1] is None                             # 产出必过入库校验
+    assert validate_cred_data(r3["cred"])[1] is None                             # Validate before persistence.
     print("✅ test_oauth_full_flow")
 
 
@@ -234,7 +230,7 @@ def test_oauth_edge_cases():
     m = _manager({"/auth/state": {"code": 0, "data": {"state": "s", "authUrl": "https://x/qr"}},
                   "/auth/token": {"code": 0, "data": {"accessToken": "at"}},
                   "/login/account": {"code": 0, "data": {}}})
-    assert m.start("intl")["verification_uri"] == "https://x/qr"                 # 优先用上游 authUrl
+    assert m.start("intl")["verification_uri"] == "https://x/qr"                 # Prefer upstream authUrl.
     try:
         m.start("xx")
         raise AssertionError("应拒绝未知站点")
@@ -247,19 +243,19 @@ def test_oauth_edge_cases():
     except RuntimeError as e:
         assert "限流" in str(e)
     assert m2.poll("oa_ghost")["error"] == "登录请求不存在或已过期"
-    # 账号接口无 uid
+    # Missing account UID
     m_acc = _manager({"/auth/state": {"code": 0, "data": {"state": "s"}},
                       "/auth/token": {"code": 0, "data": {"accessToken": "at"}},
                       "/login/account": {"code": 0, "data": {}}})
     r = m_acc.start("cn")
     rr = m_acc.poll(r["login_id"])
     assert rr["done"] and "uid" in rr["error"]
-    # 超时
+    # Expired authorization
     m3 = _manager({"/auth/state": {"code": 0, "data": {"state": "s"}}}, timeout_s=1)
     r = m3.start()
     m3._states[r["login_id"]]["expires_at"] = time.time() - 1
     assert m3.poll(r["login_id"])["error"] == "登录超时，请重新发起"
-    # 上游抖动视为未完成
+    # Transient upstream failures leave authorization pending.
     class _Boom(_FakeClient):
         def get(self, url, headers=None):
             raise ConnectionError("boom")
@@ -272,7 +268,7 @@ def test_oauth_edge_cases():
 
 
 class _StubCM:
-    """假 CredentialManager：summary 可控，refresh_if_due 记录调度调用。"""
+    """Provide controllable credential summaries and record refresh scheduling."""
     def __init__(self, summary, fail=False):
         self._s = summary
         self._lock = threading.RLock()
@@ -314,18 +310,18 @@ def test_keepalive_refresh():
     es = [{"id": f"/tmp/{i}.info", "cm": cm, "fail_until": 0.0, "uid": str(i)}
           for i, cm in enumerate([fresh, stale, never, expiring, failing])]
     pool = _pool_with(es)
-    pool.cooldown = lambda cm, reason="", **kw: None  # 单测不触发熔断副作用
+    pool.cooldown = lambda cm, reason="", **kw: None  # Isolate refresh scheduling from cooldowns.
     pool.refresh_due()
-    assert fresh.refreshed == 0                    # 刚刷过 → 不动
-    assert stale.refreshed == 1                    # >24h → 保活
-    assert never.refreshed == 1                    # 无记录 → 保活
-    assert expiring.refreshed == 1                 # 临期 → 原有逻辑
-    assert failing.refreshed == 1                  # 保活失败已尝试
-    assert es[4]["keepalive_after"] > now          # 失败后退避 1h
+    assert fresh.refreshed == 0                    # Recently refreshed
+    assert stale.refreshed == 1                    # Idle longer than 24 hours
+    assert never.refreshed == 1                    # No prior refresh
+    assert expiring.refreshed == 1                 # Near expiry
+    assert failing.refreshed == 1                  # Failed refresh attempted
+    assert es[4]["keepalive_after"] > now          # Back off after failure.
     failing.refreshed = 0
     pool.refresh_due()
-    assert failing.refreshed == 0                  # 退避期内不再骚扰
-    # 关掉保活
+    assert failing.refreshed == 0                  # Respect retry backoff.
+    # Disable keepalive.
     stale2 = _StubCM({"token_expired": False, "token_expires_at": far_future, "last_refresh_time": 0})
     pool2 = _pool_with([{"id": "/tmp/x.info", "cm": stale2, "fail_until": 0.0, "uid": "x"}])
     pool2.refresh_due(keepalive_s=0)
@@ -334,7 +330,7 @@ def test_keepalive_refresh():
 
 
 def test_oauth_endpoint_import(tmp_path=None):
-    """poll 完成后的入库路径：同 uid 覆盖已有文件并热加载（不起服务，直接调处理函数）。"""
+    """Persist completed OAuth results and reload matching account files without starting a server."""
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
         old = _cred(uid="u-old")
@@ -345,7 +341,7 @@ def test_oauth_endpoint_import(tmp_path=None):
         cred = build_auth_file({"accessToken": "new-at", "refreshToken": "new-rt",
                                 "domain": "www.codebuddy.cn", "expiresIn": 7200},
                                {"uid": "u1", "nickname": "新"})
-        # 模拟端点入库段：同 uid 覆盖 named.info
+        # Replace the existing named credential for the same UID.
         target = next((f for f in sorted(d.glob("*.info")) if converter._cred_uid(f) == "u1"), None)
         assert target and target.name == "named.info"
         existing = json.loads(target.read_text(encoding="utf-8"))
@@ -355,7 +351,7 @@ def test_oauth_endpoint_import(tmp_path=None):
         assert final["auth"]["accessToken"] == "new-at"
         assert final["account"]["lastLogin"] is True
         assert validate_cred_data(final)[1] is None
-        # 新账号（无同名文件）→ <uid>.info
+        # New accounts use a UID-based filename.
         assert not (d / "u2.info").exists()
         cred2 = build_auth_file({"accessToken": "z", "domain": "www.codebuddy.cn"}, {"uid": "u2"})
         (d / "u2.info").write_text(json.dumps(cred2), encoding="utf-8")

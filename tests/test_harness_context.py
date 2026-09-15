@@ -1,4 +1,4 @@
-"""结构化 harness 提取回归；仅使用内存文本，不调用上游。"""
+"""Test structured harness extraction using in-memory text without upstream calls."""
 import copy
 from pathlib import Path
 import subprocess

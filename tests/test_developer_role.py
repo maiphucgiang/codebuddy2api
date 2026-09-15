@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""developer 角色归一化回归测试。
-
-上游（copilot.tencent.com / workbuddy.ai）会把 role:"developer" 拒绝为
-非官方通道（HTTP 400 / code 11128 "Illegal API invocation from an unapproved
-channel"）；官方 CLI/WorkBuddy 只发 "system"，而 pi 等 OpenAI 兼容 harness 把
-系统提示词以 "developer" 发送。归一化时不得修改调用方的原始 messages。
-
-直接运行：python -B tests/test_developer_role.py
-"""
+"""Normalize developer roles for upstream compatibility without mutating caller messages."""
 
 import copy
 import sys
@@ -35,7 +27,7 @@ def _prepare(messages, *, desensitize=False, **extra):
 
 class DeveloperRoleNormalization(unittest.TestCase):
     def test_leading_developer_becomes_system(self):
-        """pi 的典型形态：单条 developer + user，必须变成 system 且不再补占位 system。"""
+        """Convert leading developer instructions without adding duplicate system messages."""
         body = _prepare([
             {"role": "developer", "content": "You are an expert coding assistant."},
             {"role": "user", "content": "hi"},
@@ -44,7 +36,7 @@ class DeveloperRoleNormalization(unittest.TestCase):
         self.assertEqual(body["messages"][0]["content"], "You are an expert coding assistant.")
 
     def test_developer_moved_to_front_when_not_first(self):
-        """developer 不在首位时，归一化后仍应被搬到首条 system 位置。"""
+        """Move normalized developer instructions to the first system position."""
         body = _prepare([
             {"role": "user", "content": "hi"},
             {"role": "developer", "content": "rules"},
@@ -53,7 +45,7 @@ class DeveloperRoleNormalization(unittest.TestCase):
         self.assertEqual(body["messages"][0]["content"], "rules")
 
     def test_existing_system_first_is_untouched(self):
-        """workbuddy 形态：本来就是 system，行为不变。"""
+        """Preserve existing system-message behavior."""
         body = _prepare([
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "hi"},
@@ -62,7 +54,7 @@ class DeveloperRoleNormalization(unittest.TestCase):
         self.assertEqual(body["messages"][0]["content"], "You are a helpful assistant.")
 
     def test_no_developer_role_leaks_upstream(self):
-        """任意组合下，发往上游的 messages 都不允许再出现 developer。"""
+        """Never send developer roles upstream."""
         body = _prepare([
             {"role": "developer", "content": "a"},
             {"role": "user", "content": "b"},
@@ -72,14 +64,14 @@ class DeveloperRoleNormalization(unittest.TestCase):
         self.assertNotIn("developer", [m["role"] for m in body["messages"]])
 
     def test_missing_system_still_gets_placeholder(self):
-        """完全没有 system/developer 时，仍保留原有占位逻辑。"""
+        """Retain placeholder instructions when no system or developer message exists."""
         body = _prepare([{"role": "user", "content": "hi"}])
         self.assertEqual(body["messages"][0]["role"], "system")
         self.assertEqual(body["messages"][0]["content"], "You are a helpful assistant.")
 
 
 class CallerPayloadNotMutated(unittest.TestCase):
-    """归一化只改发往上游的副本；调用方原始 payload 必须保持 deep-equal。"""
+    """Normalize upstream copies without mutating caller-owned payloads."""
 
     def _assert_untouched(self, raw_messages, *, desensitize):
         raw_body = {"model": "auto", "messages": raw_messages, "stream": False}

@@ -1,4 +1,4 @@
-"""识别明确的上游审核拒绝；不把正文中的审核关键词当作失败。"""
+"""Recognize explicit upstream filter refusals without matching ordinary content keywords."""
 from __future__ import annotations
 
 import json
@@ -27,7 +27,7 @@ def is_filter_error(raw: bytes) -> bool:
 
 
 class ContentFilterDetector:
-    """有界跟踪已校验的 SSE delta，纯拒绝才允许请求级兜底。"""
+    """Inspect validated SSE with bounded storage and allow fallback only for pure refusals."""
 
     def __init__(self):
         self.text = {"content": "", "refusal": ""}

@@ -80,15 +80,8 @@ def apply_image_policy(
     max_images: int = 16,
     policy: str = "truncate",
 ) -> tuple[dict, dict]:
-    """Keep the newest N protocol image blocks across the complete request.
-
-    ``field='messages'`` handles Chat/Anthropic history; ``field='input'`` handles
-    Responses history, including function_call_output.output content arrays.
-    Repeated URLs count separately. Zero permits no images. ``error`` raises
-    ImageLimitError before any modification. Invalid limits/policies raise
-    ValueError. Truncation copies only changed containers; untouched subtrees
-    remain shared with the original payload. Strings and arbitrary JSON are not
-    searched, and image data/URLs are never decoded or fetched.
+    """Keep the newest N protocol images or reject overflow without mutating the input.
+    Count repeated blocks separately; never decode images or search arbitrary strings.
     """
     if isinstance(max_images, bool) or not isinstance(max_images, int) or max_images < 0:
         raise ValueError("max_images must be a non-negative integer")

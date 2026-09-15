@@ -87,7 +87,7 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
         self.post_rejected("chat/completions", self.payload(selected_model=created[0]["id"]), (404,))
         bindings = {row["id"]: row["bindings"] for row in self.management.admin_credential_inventory()}
         self.assertEqual(bindings[self.entries["cn-work"]["account_key"]], ["studio-cn"])
-        self.policy(enabled=False)  # 停用目录名称不改变独立自建路由的启停与范围。
+        self.policy(enabled=False)  # Catalog toggles do not alter independent custom routes.
         published = {row["id"] for row in self.client.get("/v1/models").json()["data"]}
         self.assertNotIn("shared-model", published)
         self.assertTrue({"studio-cn", "studio-intl"} <= published)

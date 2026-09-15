@@ -1,4 +1,4 @@
-"""按可信闭合边界提取 CLI 上下文；不确定的文本保留为用户内容。"""
+"""Extract CLI context within trusted closed boundaries and preserve uncertain text as user content."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -83,7 +83,7 @@ def _render_block(text: str, block: _Block) -> str:
 
 
 def parse_harness_text(text: str) -> HarnessText:
-    """只识别行首/相邻结构标签，保留代码围栏、内联引用和未闭合块。"""
+    """Recognize structural tags while preserving code fences, inline references and unclosed blocks."""
     if not text or not any(marker in text for marker in ("<", "#")):
         return _literal(text)
     roots: list[_Block] = []
@@ -151,7 +151,7 @@ def parse_harness_text(text: str) -> HarnessText:
             pending_heading = False
         offset += len(line)
 
-    # 未闭合父块没有进入 roots，其内部即使有闭合子块也不会被单独裁剪。
+    # Unclosed parents prevent nested blocks from being trimmed independently.
     if not roots:
         return _literal(text)
     parts: list[HarnessPart] = []

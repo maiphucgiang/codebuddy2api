@@ -1,12 +1,8 @@
-"""原 /v1 接口自动地域/产品路由回归：合成凭据，httpx 全部由 MockTransport 接管。
-
-运行：.venv/bin/python -B -m unittest -v tests/test_region_routing.py
-不启动维护线程，不读取本机 auth/.env，不依赖在线目录或真实账号。
-"""
+"""Test automatic product/region routing through existing /v1 URLs with synthetic offline credentials."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from copy import deepcopy
 import json
@@ -262,11 +258,11 @@ class RegionRoutingTests(unittest.TestCase):
             for _ in range(6):
                 request, _ = self.post_ok(endpoint, self.payload(endpoint), {free})
                 self.assertEqual(request.headers["x-user-id"], free)
-            # 计费账号只在免费账号不可用时兜底。
+            # Paid accounts are fallback candidates only when free accounts are unavailable.
             self.pool.note_status(self.entries[free]["cm"], 429, model="shared-model")
             request, _ = self.post_ok(endpoint, self.payload(endpoint), set(PROFILES) - {free})
             self.assertNotEqual(request.headers["x-user-id"], free)
-            # 冷却换绑后该会话黏在计费账号上；解除冷却应重绑回免费账号。
+            # Rebind paid sticky sessions when a free account becomes eligible again.
             self.pool.note_status(self.entries[free]["cm"], 429, model="other-model")
             with self.pool._lock:
                 self.pool._model_fail.clear()
@@ -275,7 +271,7 @@ class RegionRoutingTests(unittest.TestCase):
 
     def test_zero_multiplier_model_requires_declared_credits_field(self):
         tables = catalogs()
-        # 只给 intl-cli 声明零倍率，其余账号目录仍是不带 credits 字段的同名模型。
+        # Declare a zero rate only for intl-cli, not the same model on other accounts.
         tables["intl-cli"] = [dict(model("shared-model"), credits="x0.00"), model("intl-cli-exclusive")]
         tables["intl-work"] = [model("shared-model"), model("intl-work-exclusive")]
         self.configure(tables=tables)
@@ -284,7 +280,7 @@ class RegionRoutingTests(unittest.TestCase):
         for _ in range(4):
             request, _ = self.post_ok("chat/completions", self.payload(), {"intl-cli"})
             self.assertEqual(request.headers["x-user-id"], "intl-cli")
-        # 免费账号不可用后，未声明 credits 的账号按普通轮询调度，不会被误判为免费。
+        # Unknown rates use ordinary rotation rather than free-tier priority.
         self.pool.note_status(self.entries["intl-cli"]["cm"], 429, model="shared-model")
         seen = set()
         for _ in range(6):
@@ -302,8 +298,8 @@ class RegionRoutingTests(unittest.TestCase):
         payload = self.payload()
         request, _ = self.post_ok("chat/completions", payload, {free})
         self.assertEqual(request.headers["x-user-id"], free)
-        self.post_ok("chat/completions", payload, {free})  # 黏绑保持
-        # 免费账号改为计费后，旧黏绑必须重绑到仍然免费的账号。
+        self.post_ok("chat/completions", payload, {free})  # Preserve the sticky binding.
+        # Rebind when the sticky account becomes paid and another free account remains.
         tables[free] = [dict(model("shared-model"), credits="x0.03"), model(free + "-exclusive")]
         tables["cn-cli"] = [dict(model("shared-model"), credits="x0.00"), model("cn-cli-exclusive")]
         self.account_catalogs(tables)
@@ -388,7 +384,7 @@ class RegionRoutingTests(unittest.TestCase):
                     self.post_ok("chat/completions", self.payload(), expected)
 
     def test_account_root_models_route_when_the_picker_subset_omits_them(self):
-        """选择器省略的账号根表候选仍可经原模型名进入三协议路由。"""
+        """Route account-root candidates omitted from selectors through all three protocols."""
         tables = catalogs()
         self.configure(tables=tables)
         for profile in PROFILES:
@@ -403,13 +399,13 @@ class RegionRoutingTests(unittest.TestCase):
                         endpoint, self.payload(endpoint, profile + "-root-only"), {profile})
                     self.assertEqual(sent["model"], profile + "-root-only")
                     self.assertEqual(request.url.host, HOSTS[profile])
-        # exclusive 模型仍然只在自家账号上可用：根表按账号取，不会把 A 的能力借给 B。
+        # Account-root capabilities cannot be borrowed by another account.
         self.post_rejected("chat/completions", self.payload("chat/completions", "no-such-model"))
         ids = {item["id"] for item in self.client.get("/v1/models").json()["data"]}
         self.assertIn("cn-cli-root-only", ids, "对外模型表要能报出实际发得出去的模型")
 
     def test_unusable_root_models_are_not_advertised(self):
-        """根表里不支持工具调用的模型（图像档等）不进对外列表，也不参与路由。"""
+        """Exclude root models without tool support from public catalogs and routing."""
         tables = catalogs()
         self.configure(tables=tables)
         self.account_catalogs(tables, serves={
@@ -515,18 +511,18 @@ class RegionRoutingTests(unittest.TestCase):
 
     def test_models_exposes_credits_multiplier_per_profile(self):
         tables = catalogs()
-        # 默认目录的 credits 是 {input, output} 对象（官方新版形态），只有字符串倍率可解析。
+        # Object-shaped credit rates remain unknown; only supported scalar rates are parsed.
         tables["cn-cli"] = [model("shared-model", credits="x0.00"), model("cn-cli-only", credits="x0.03")]
         tables["intl-cli"] = [model("shared-model", credits="x0.34"), model("intl-cli-only", credits="x0.03")]
         self.configure(tables=tables)
         data = {item["id"]: item for item in self.client.get("/v1/models").json()["data"]}
         shared = data["shared-model"]
-        self.assertEqual(shared["credits"], 0.0)  # 取各来源最小值
-        # 只有给出可解析字符串倍率的来源进入分组；cn-work / intl-work 仍是对象形态，故不列出。
+        self.assertEqual(shared["credits"], 0.0)  # Minimum eligible source rate
+        # Group only sources with parseable rates, excluding WorkBuddy's object-shaped rates.
         self.assertEqual(shared["credits_by_profile"], {"cn-cli": 0.0, "intl-cli": 0.34})
         self.assertEqual(data["cn-cli-only"]["credits"], 0.03)
         self.assertEqual(data["cn-cli-only"]["credits_by_profile"], {"cn-cli": 0.03})
-        # 标准 OpenAI 字段必须保留。
+        # Retain standard OpenAI fields.
         for item in data.values():
             self.assertEqual(item["object"], "model")
             self.assertIsInstance(item["created"], int)
@@ -539,7 +535,7 @@ class RegionRoutingTests(unittest.TestCase):
                             dict(model("cn-cli-only-2"), credits="not-a-multiplier")]
         self.configure(tables=tables)
         data = {item["id"]: item for item in self.client.get("/v1/models").json()["data"]}
-        self.assertEqual(data["shared-model"]["credits"], 0.03)  # 只有 cn-cli 给出可解析倍率
+        self.assertEqual(data["shared-model"]["credits"], 0.03)  # Only cn-cli has a parseable rate.
         self.assertEqual(data["shared-model"]["credits_by_profile"], {"cn-cli": 0.03})
         self.assertIsNone(data["cn-cli-only"]["credits"])
         self.assertEqual(data["cn-cli-only"]["credits_by_profile"], {})

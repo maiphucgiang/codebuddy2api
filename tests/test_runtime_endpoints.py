@@ -1,8 +1,8 @@
-"""网关限额、协议集成、网络失败与配置回归；所有上游调用均由 MockTransport 接管。"""
+"""Test gateway limits, protocol integration and transport failures using MockTransport."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import asyncio
 import contextlib
@@ -77,7 +77,7 @@ class EndpointTests(unittest.TestCase):
         return self.respond(request)
 
     def test_stateful_responses_fields_are_rejected(self):
-        """previous_response_id/conversation 依赖服务端历史：本网关无状态，必须显式 400。"""
+        """Reject server-side conversation references in this stateless gateway."""
         for field, value in (("previous_response_id", "resp_abc"), ("conversation", "conv_abc")):
             with self.subTest(field=field):
                 self.requests.clear()
@@ -90,7 +90,7 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(len(self.requests), 0)
 
     def test_multiple_candidates_are_rejected_before_reaching_upstream(self):
-        """聚合路径无法保持多候选独立：n 只能缺省或恰为 1。"""
+        """Accept only one completion in the aggregation path."""
         for n in (2, 0, "2", True, 1.5):
             with self.subTest(n=n):
                 self.requests.clear()
@@ -108,7 +108,7 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
 
     def test_tool_arguments_must_be_objects_of_declared_tools(self):
-        """解析成功不等于正确：非对象参数或未声明的函数名都不健康。"""
+        """Reject non-object tool arguments and unknown declared-tool names."""
         body = {"tools": TOOLS}
         call = lambda name, args: [{"id": "c1", "function": {"name": name, "arguments": args}}]
         healthy = converter._tool_calls_healthy
@@ -120,12 +120,12 @@ class EndpointTests(unittest.TestCase):
                 self.assertFalse(healthy(call("synthetic_tool", bad_args), body))
         self.assertFalse(healthy(call("undeclared", "{}"), body))
         self.assertFalse(healthy(call("", "{}"), body))
-        # 未声明任何工具的请求不做名称核对：合法 JSON 对象的工具调用仍算健康
+        # Without declared tools, valid object arguments do not require a name match.
         self.assertTrue(healthy(call("anything", "{}"), {"tools": []}))
         self.assertTrue(healthy(call("anything", "{}"), None))
 
     def test_count_tokens_estimates_instead_of_constant_zero(self):
-        """计数端点返回随输入增长的估算值，而不是伪装精确的常量 0。"""
+        """Return input-dependent token estimates rather than a fabricated constant."""
         short = self.client.post("/v1/messages/count_tokens", json={
             "model": "auto", "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(short.status_code, 200, short.text)
@@ -138,13 +138,13 @@ class EndpointTests(unittest.TestCase):
         self.assertGreater(big, small)
         cjk = self.client.post("/v1/messages/count_tokens", json={
             "model": "auto", "messages": [{"role": "user", "content": "汉" * 100}]})
-        self.assertGreaterEqual(cjk.json()["input_tokens"], 100)  # 非 ASCII 不按 4 字符折算低估
+        self.assertGreaterEqual(cjk.json()["input_tokens"], 100)  # Do not apply ASCII estimates to CJK text.
         bad = self.client.post("/v1/messages/count_tokens", content=b"{ not json",
                                headers={"Content-Type": "application/json"})
         self.assertEqual(bad.status_code, 400)
 
     def test_inference_errors_follow_the_client_protocol_shape(self):
-        """OpenAI 路由顶层 error；Anthropic 路由 error 对象；/admin 保持 detail 包装。"""
+        """Shape protocol-specific inference errors while retaining admin detail envelopes."""
         converter.CONFIG["api_key"] = "secret"
         try:
             for route in ("/v1/chat/completions", "/v1/responses"):
@@ -160,7 +160,7 @@ class EndpointTests(unittest.TestCase):
             body = response.json()
             self.assertEqual(body["type"], "error")
             self.assertEqual(body["error"]["type"], "authentication_error")
-            # Anthropic 约定 404 → not_found_error，即使内层写的是 invalid_request_error
+            # Anthropic HTTP 404 uses not_found_error despite the upstream error type.
             converter.CONFIG["model_guard"] = True
             try:
                 missing = self.client.post("/v1/messages", json={
@@ -178,7 +178,7 @@ class EndpointTests(unittest.TestCase):
             converter.CONFIG["api_key"] = ""
 
     def test_omitted_stream_defaults_to_nonstream_and_bad_type_rejected(self):
-        """省略 stream 按协议默认非流式返回完整 JSON；非布尔 stream 显式 400。"""
+        """Default to non-streaming JSON and reject non-Boolean stream values."""
         bodies = {
             "/v1/chat/completions": {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
             "/v1/responses": {"model": "auto", "input": [{"role": "user", "content": "hi"}]},
@@ -200,7 +200,7 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(response.headers["content-type"], "application/json")
 
     def test_discarded_tool_generations_are_recorded_with_usage(self):
-        """损坏工具调用触发的额外生成：每次丢弃都带用量记入 attempts；预算可配。"""
+        """Audit every discarded tool-repair generation within the configured retry budget."""
         good = {"tool_calls": [{"index": 0, "id": "ok", "type": "function",
                                 "function": {"name": "synthetic_tool", "arguments": "{}"}}]}
         bad = {"tool_calls": [{"index": 0, "id": "bad", "type": "function",
@@ -222,17 +222,17 @@ class EndpointTests(unittest.TestCase):
             retries = [kw for stage, kw in attempts if stage == "tool_args_retry"]
             self.assertEqual(len(retries), 1)
             self.assertEqual(retries[0]["attempt"], 1)
-            self.assertIn("total_tokens", retries[0])  # 被丢弃的生成用量不再消失
+            self.assertIn("total_tokens", retries[0])  # Audit discarded generation usage.
 
             converter.CONFIG["tool_call_max_retry"] = 0
             try:
                 self.respond = lambda request: httpx.Response(200, content=sse(bad, "tool_calls"))
                 self.requests.clear()
-                nonstream = dict(payload, stream=False)  # 非流式：错误直接体现为 HTTP 状态码
+                nonstream = dict(payload, stream=False)  # Surface failures as HTTP status codes.
                 response = self.client.post(ROUTES[0], json=nonstream)
                 self.assertEqual(response.status_code, 502, response.text)
-                self.assertEqual(len(self.requests), 1)  # 预算 0：不重试
-                # 耗尽预算的末次生成也必须带着用量出现在 attempts 里
+                self.assertEqual(len(self.requests), 1)  # Zero budget disables retries.
+                # Audit usage from the final exhausted attempt as well.
                 exhausted = [kw for stage, kw in attempts if stage == "tool_args_exhausted"]
                 self.assertEqual(len(exhausted), 1)
                 self.assertIn("total_tokens", exhausted[0])
@@ -240,15 +240,14 @@ class EndpointTests(unittest.TestCase):
                 converter.CONFIG["tool_call_max_retry"] = 3
 
     def test_credential_selection_runs_off_the_event_loop(self):
-        """_route_chat 内含线程锁/文件锁/同步刷新：三个端点都必须经线程池调用它。"""
+        """Offload blocking credential routing to the thread pool for all protocols."""
         import inspect
         import re
         src = inspect.getsource(converter)
         direct = re.findall(r"^\s+(?:body|chat_body), cred, headers, url = _route_chat\(", src, re.M)
         pooled = re.findall(r"await run_in_threadpool\(_route_chat", src)
         self.assertEqual(direct, [])
-        # 三个端点各一次，另外换凭证重放（_routed_stream / _routed_fetch）还要再路由一次：
-        # 只要没有任何直调（direct 为空），线程池约束就仍然成立。
+        # All initial and failover routing must run outside the event-loop thread.
         self.assertGreaterEqual(len(pooled), 3)
 
     def test_tool_metadata_policy_reaches_all_protocols(self):
@@ -583,7 +582,7 @@ class TransportBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InboundBodyLimitTests(unittest.TestCase):
-    """入站原始字节限量：解析前 413，chunked 同样受限，/admin 不受影响。"""
+    """Reject oversized inference bodies before parsing without affecting admin routes."""
 
     def _app(self, limit):
         from app.inbound_limits import InboundBodyLimitMiddleware
@@ -611,7 +610,7 @@ class InboundBodyLimitTests(unittest.TestCase):
         self.assertEqual(big.json()["error"]["code"], "request_too_large")
         self.assertNotIn("detail", big.json())
         big_admin = client.post("/admin/x", content=b"x" * 2048)
-        self.assertEqual(big_admin.status_code, 200)  # 管理路由不在此限量范围
+        self.assertEqual(big_admin.status_code, 200)  # Admin routes are outside this limit.
 
     def test_chunked_body_is_counted_and_rejected(self):
         from app.inbound_limits import InboundBodyLimitMiddleware
@@ -633,7 +632,7 @@ class InboundBodyLimitTests(unittest.TestCase):
 
         import asyncio
         asyncio.run(middleware({"type": "http", "method": "POST", "path": "/v1/chat/completions"}, receive, send))
-        self.assertFalse(reached)  # 超限请求不进入下游
+        self.assertFalse(reached)  # Reject over-budget requests before dispatch.
         self.assertEqual(sent[0]["status"], 413)
 
 
@@ -702,7 +701,7 @@ class InboundStreamingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConcurrencyLimitTests(unittest.IsolatedAsyncioTestCase):
-    """并发上限：名额占满立即 503（含 Retry-After），释放后恢复。"""
+    """Reject excess concurrency with Retry-After and recover after slots are released."""
 
     async def test_full_gate_returns_503_and_recovers(self):
         from app.inbound_limits import ConcurrencyLimitMiddleware
@@ -825,11 +824,11 @@ class ConfigurationTests(unittest.TestCase):
                                            "admin_csrf": True, "keep_tool_metadata": False})
 
     def test_open_binding_without_key_requires_explicit_opt_in(self):
-        # 非回环 + 空 key：默认拒启（SystemExit 2）
+        # Reject unauthenticated public binding by default.
         self.configure(flags=("--host", "0.0.0.0"), invalid=True)
-        # 显式放行环境变量后可启动
+        # Explicit configuration allows unauthenticated binding.
         self.configure(env={"CODEBUDDY2API_ALLOW_OPEN_NOAUTH": "true"}, flags=("--host", "0.0.0.0"))
-        # 非回环但设了 key：正常
+        # Configured authentication permits public binding.
         self.configure(env={"CODEBUDDY2API_KEY": "k"}, flags=("--host", "0.0.0.0"))
 
     def test_persisted_host_is_validated_after_configuration_resolution(self):

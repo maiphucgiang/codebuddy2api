@@ -1,4 +1,4 @@
-"""有界连接重试；请求已发送或响应已开始后不重放 POST。"""
+"""Bound upstream retries and prohibit replay after a response has opened."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -10,7 +10,7 @@ from app.content_filter import ContentFilterDetector
 
 
 class UpstreamResponseError(Exception):
-    """保留上游 HTTP 状态与错误体，由端点映射为对应协议。"""
+    """Preserve upstream HTTP status and error bytes for protocol-specific mapping."""
 
     def __init__(self, status, raw):
         self.status = status
@@ -19,15 +19,11 @@ class UpstreamResponseError(Exception):
 
 
 class UpstreamHTTPError(UpstreamResponseError):
-    """上游**用 HTTP 状态码**给出的答复（429 / 401 / 503 …）。
-
-    与聚合器从 200 响应体里合成的 502（空流、坏 SSE、已开流后断连）区分开：只有前者的请求
-    确定没被上游收下处理，换一个账号重放不会重复计费；后者上游已经回了 200，可能已经计费。
-    """
+    """Distinguish actual upstream HTTP errors from failures synthesized while collecting a response."""
 
 
 class ChatSSEAccumulator:
-    """聚合 Chat SSE，拒绝错误事件、空输出和无结束标记的残流。"""
+    """Collect Chat SSE and reject error events, empty output and incomplete streams."""
 
     def __init__(self, *, collect=True, max_collect_bytes: int = 0):
         self.collect = collect
@@ -133,7 +129,7 @@ class ChatSSEAccumulator:
             self.filter_detector.feed(delta, choice.get("finish_reason"))
 
     def _charge(self, size: int):
-        """聚合收集总字节预算：超限即失败，不把无界输出缓存在内存里。"""
+        """Fail when collected bytes exceed the configured memory budget."""
         if not self.collect or not self.max_collect_bytes:
             return
         self.collected_bytes += size
@@ -162,11 +158,11 @@ class ChatSSEAccumulator:
                 "usage": self.usage, "model": self.model}
 
 
-ERROR_BODY_LIMIT = 4 * 1024 * 1024  # 错误响应读取上限：错误页不应撑爆内存
+ERROR_BODY_LIMIT = 4 * 1024 * 1024  # Bound error-body memory usage.
 
 
 async def read_bounded_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
-    """错误体有界读取：超限即截断，不再整段 aread。"""
+    """Read and truncate upstream error bytes within a fixed budget."""
     if limit <= 0:
         return b""
     buf = bytearray()
@@ -177,25 +173,17 @@ async def read_bounded_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
     return bytes(buf)
 
 
-# 写下第一个请求体字节之前就失败：上游手里没有任何正文，重放零风险。
+# Connection failures occur before any request body is sent.
 BODY_NOT_ACCEPTED = (httpx.ConnectError, httpx.ConnectTimeout)
-# 写请求体超时：只证明「声明的正文没写完」，证不了上游没收到或没处理已经收到的那部分。
-# 半截正文会怎样是上游的行为，从这一侧观察不到，因此默认不重放（见 `retry_write_timeout`）。
+# Write-timeout replay is opt-in because partial requests may already have been processed.
 WRITE_TIMEOUT = (httpx.WriteTimeout,)
 
 
 @asynccontextmanager
 async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=None,
                               retry_write_timeout=False):
-    """只重试一次「上游确定没收下请求体」的失败（建连失败 / 建连超时），其余交给调用方按协议返回。
-
-    重试每次新建 `AsyncClient`，即重建 TCP+TLS，通常能换到另一个边缘节点。
-
-    `retry_write_timeout=True` 把 60s 写超时也算进重放集。跨境长会话最容易撞的正是写超时
-    而不是建连失败，实测某部署的传输失败 100% 是它；但写超时能证明的只有「正文没写完」，
-    上游是否已按半截正文动过账，这一侧看不到，所以留给运维显式决定。
-
-    响应已经开始之后（`opened` 置位）绝不重放 POST。
+    """Retry connection failures once on a fresh client; write timeouts require explicit opt-in.
+    Never replay after the upstream response opens.
     """
     retryable = BODY_NOT_ACCEPTED + (WRITE_TIMEOUT if retry_write_timeout else ())
     timeout = httpx.Timeout(read_timeout, connect=15, write=60, pool=15)

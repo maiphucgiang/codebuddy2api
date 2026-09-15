@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { OAuth } from "../OAuth";
 import { Trial } from "../Trial";
+import { TravelSummary } from "../Travel";
 import {
   api,
   credentialResponse,
@@ -224,6 +225,15 @@ export function Credentials() {
                         : "未完成"}
                 </Badge>
                 <span>{text(r.message)}</span>
+                <TravelSummary
+                  trip={
+                    r.travel && typeof r.travel === "object"
+                      ? object(r.travel)
+                      : r.action === "travel" || r.action === "travel-status"
+                        ? r
+                        : null
+                  }
+                />
               </li>
             ))}
           </ul>
@@ -367,6 +377,7 @@ export function Credentials() {
                               : "旅行仅适用于国内账号"}
                           </small>
                           {trip?.stale === true && <small>状态可能已变化，请先查询核验</small>}
+                          {c.travel_supported === true && <TravelSummary trip={trip} />}
                           {c.enabled === false && <small>账号停用期间不执行自动任务</small>}
                           {c.trial_supported === true && c.trial != null && (
                             <small>体验积分：{text(object(c.trial).message)}</small>

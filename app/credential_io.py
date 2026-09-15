@@ -1,4 +1,4 @@
-"""凭据导入目录读取与私有文件原子更新。"""
+"""Read controlled credential imports and atomically update private files."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ MAX_CREDENTIAL_BYTES = 1024 * 1024
 
 
 class CredentialFileError(ValueError):
-    """可安全返回给客户端的文件输入错误。"""
+    """Represent a file-input error safe to return to clients."""
 
 
 def _valid_name(name: str) -> bool:
@@ -22,11 +22,11 @@ def _valid_name(name: str) -> bool:
 
 
 def read_import_file(directory: Path, requested_path: str) -> tuple[str, bytes]:
-    """从服务端导入目录选择普通 .info 文件，限量读取一次。"""
+    """Select a regular .info file from the import directory and read it once within limits."""
     if not isinstance(requested_path, str) or not requested_path or len(requested_path) > 4096:
         raise CredentialFileError("path 必须是导入目录中的 .info 文件名或绝对路径")
     root = directory.resolve(strict=True)
-    # 请求只用于选择服务端枚举的文件，不参与构造文件系统路径。
+    # Requests select enumerated files rather than supplying filesystem paths.
     for entry in root.glob("*.info"):
         if requested_path not in (entry.name, str(entry)):
             continue
@@ -54,7 +54,7 @@ def read_import_file(directory: Path, requested_path: str) -> tuple[str, bytes]:
 
 @contextmanager
 def credential_file_lock(directory: Path, name: str):
-    """序列化同一凭据的跨线程/进程写入；锁文件不含凭据内容。"""
+    """Serialize credential writes across threads and processes using secret-free lock files."""
     if not isinstance(name, str) or not _valid_name(name):
         raise CredentialFileError("凭据文件名无效")
     root = directory.resolve()
@@ -85,7 +85,7 @@ def credential_file_lock(directory: Path, name: str):
 
 
 def atomic_write_credential(directory: Path, name: str, content: bytes) -> Path:
-    """将已校验内容以 0600 临时文件原子写入，保留同名更新语义。"""
+    """Atomically persist validated content through a mode-0600 temporary file."""
     if not isinstance(name, str) or not _valid_name(name):
         raise CredentialFileError("凭据文件名无效")
     if len(content) > MAX_CREDENTIAL_BYTES:
@@ -101,7 +101,7 @@ def atomic_write_credential(directory: Path, name: str, content: bytes) -> Path:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        # 替换目录项而不是打开目标写入，避免跟随校验后被换入的链接。
+        # Replace the directory entry instead of following a newly substituted symlink.
         os.replace(temporary, target)
         return target
     finally:

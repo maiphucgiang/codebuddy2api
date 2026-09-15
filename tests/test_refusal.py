@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""拒绝文本与空终止回归；仅内存 SSE、MockTransport，不读凭据或写日志。
-
-运行：python3 tests/test_refusal.py
-"""
+"""Test refusals and empty stream termination using in-memory SSE and MockTransport."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from copy import deepcopy
 import json
@@ -69,7 +66,7 @@ class AdapterRefusalTests(unittest.TestCase):
                         self.assertEqual(events(raw)[-1]["type"], "message_stop")
                     else:
                         final = events(raw)[-1]
-                        # 拒绝/过滤是 incomplete：文字原文保留，但不得伪装成 completed
+                        # Preserve refusal text while reporting an incomplete response.
                         expected_type = "response.completed" if finish == "stop" else "response.incomplete"
                         self.assertEqual(final["type"], expected_type)
                         self.assertEqual(adapted_text(final["response"], False), REFUSAL)
@@ -233,9 +230,7 @@ class EndpointRefusalTests(unittest.TestCase):
                 for tools in (False, True):
                     with self.subTest(route=route, stream=stream, tools=tools):
                         response = self.request(route, stream, tools)
-                        # 空终止在落第一个字节之前就能判定，所以流式与非流式同一口径：真实 502。
-                        # 过去流式回 200 + 带内 error 帧，下游 SDK 解析不到 choices /
-                        # response.completed，会把失败读成「模型答了个空」并静默结束会话。
+                        # Detect empty termination before committing headers and return HTTP 502.
                         self.assertEqual(response.status_code, 502, response.text)
                         self.assertIn("error", response.json().get("detail", response.json()))
                         self.assertNotIn("data: [DONE]", response.text)
