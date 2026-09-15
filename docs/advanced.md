@@ -33,10 +33,11 @@ Compose explicitly passes some environment variables and CLI flags, so deleting 
 | `--max-inbound-bytes` | `67108864` | Raw body limit for generation and token-count POSTs, before parsing (chunked included); other routes are not buffered; 413 beyond it |
 | `--max-collect-bytes` | `8388608` | Total collection budget for aggregated output (content + reasoning + tool arguments); `response_too_large` beyond it; `0` disables |
 | `--max-concurrent` | `64` | Concurrency limit for the three generation endpoints only; excess requests get 503 with Retry-After; token counting is unaffected; `0` disables |
+| `--failover-max` | `0` | Extra credentials tried when a request fails before the first response byte reaches the client; `0` keeps the upstream behaviour of surfacing the failure directly |
 | `--max-request-bytes` | `33554432` | Positive byte limit for the processed upstream JSON |
 | `--log-body-limit` | `65536` | Text-log body preview bytes; `0` logs summaries only, not the SQLite diagnostic budget |
 
-Environment variables include `CODEBUDDY_AUTH_DIR`, `CODEBUDDY_IMPORT_DIR`, `CODEBUDDY2API_KEY`, `CODEBUDDY2API_ADMIN_CSRF`, `CODEBUDDY2API_KEEP_TOOL_METADATA`, `CODEBUDDY2API_LOG`, `CODEBUDDY2API_MAX_IMAGES`, `CODEBUDDY2API_IMAGE_POLICY`, `CODEBUDDY2API_MAX_REQUEST_BYTES`, `CODEBUDDY2API_LOG_BODY_LIMIT` and `CODEBUDDY2API_AUTO_TRIAL`. See [deployment](deployment.md) for startup examples.
+Environment variables include `CODEBUDDY_AUTH_DIR`, `CODEBUDDY_IMPORT_DIR`, `CODEBUDDY2API_KEY`, `CODEBUDDY2API_ADMIN_CSRF`, `CODEBUDDY2API_KEEP_TOOL_METADATA`, `CODEBUDDY2API_LOG`, `CODEBUDDY2API_MAX_IMAGES`, `CODEBUDDY2API_IMAGE_POLICY`, `CODEBUDDY2API_MAX_REQUEST_BYTES`, `CODEBUDDY2API_LOG_BODY_LIMIT`, `CODEBUDDY2API_AUTO_TRIAL` and `CODEBUDDY2API_FAILOVER_MAX`. See [deployment](deployment.md) for startup examples.
 
 Trial-credit claims are off by default and only apply to upstream-eligible `intl-work` accounts. Successful/already-claimed results persist per account in `auth/trial-ledger.json`. Failures wait at least 24 hours without immediate POST replay; eligibility and amounts are determined upstream. Keep this file when upgrading.
 
@@ -167,10 +168,12 @@ Credential domain / token issuer determine the product identity. Chat and refres
 | Cannot sign in to WebUI | Configure an API key; sign in and restart unfinished OAuth after changing it |
 | Local 401 | Client key differs from the gateway key |
 | Upstream 401 / 403 | Credential-level authentication circuit opens; inspect and log in again in the WebUI |
-| 429 | Cool down that upstream model on the credential; later requests may rebind, but the current request is not replayed. All candidates cooling down still returns 429 |
+| 429 | Cool down that upstream model on the credential; later requests rebind automatically. All candidates cooling down still returns 429; with `--failover-max` the in-flight request is replayed on another credential instead |
 | Upstream `service info not found` (code 11102) | That backend does not serve the model at all: avoid it for the `(backend, model)` pair, route the model to another backend, and return 404 when none has it. Half-open after 6 h, exponential backoff up to 24 h, cleared at once by one successful call; inspect via `GET /admin/model-blocks` |
-| Connection setup failure | Retry only `ConnectError` / `ConnectTimeout` once after backoff |
-| Post-send disconnect, read/write timeout or HTTP error | No network replay, avoiding duplicate billing; logs include exception type and elapsed time |
+| Connection setup failure, write timeout | Retry once on a fresh connection: `ConnectError`, `ConnectTimeout` and `WriteTimeout` all mean the request body was never accepted, so replaying cannot double-bill |
+| Post-send disconnect, read timeout or protocol error | No network replay, avoiding duplicate billing; logs include exception type and elapsed time |
+| Streaming request fails before the first byte | Reported with the real HTTP status, exactly like `stream=false`. A 200 carrying only an in-band `error` event is read by clients as an empty answer, so the session ends silently while the audit log records a success |
+| Credential failover (`--failover-max`) | Off by default. When enabled, a failure that happened before any byte reached the client is retried on another credential, up to N times, and is audited as `success` with a `failover_recovered` attempt marker. Only upstream HTTP rejections (401/403/429/502/503/504) and never-accepted request bodies qualify: content-filter rejections, 502s synthesized from an already-open stream, read timeouts and protocol errors are never replayed, and if no other credential is available the original status is surfaced |
 | Malformed tool calls | Aggregate validation permits up to `--tool-call-max-retry` (default 3) additional generations, each consuming credits and recorded with its usage in the attempt details; exhaustion returns an error |
 | Empty or truncated upstream stream | No valid output, a missing end marker or an error is not reported as success |
 | Content-filter rejection | With desensitization and `--no-compact`, a complete non-streaming filter-only rejection may receive one shorter-template retry on the same account. No streaming filter retry, circuit opening or account rotation |

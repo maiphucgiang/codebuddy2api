@@ -164,6 +164,22 @@ def observe_failure(code):
         observation.fail(code)
 
 
+def observe_recovery():
+    """标记「先前记录的失败已经被就地重放救回」：请求对下游是完整正常响应。
+
+    失败尝试仍留在 `attempts` 里（另加一条 `failover_recovered` 标记），只是不再决定 outcome
+    —— 否则一次成功的换凭证重放会留下 `outcome=error` + `status_code=200` 这种自相矛盾的
+    审计记录，看板和排障都会把它读成失败。
+    """
+    observation = _current.get()
+    if observation is not None and observation.failed:
+        code = observation.record.get("error_code") or "upstream_error"
+        observation.failed = False
+        observation.record["error_code"] = None
+        if len(observation.attempts) < 32:
+            observation.attempts.append(safe_attempt({"stage": "failover_recovered", "code": code}))
+
+
 class _Parser:
     def __init__(self, observation):
         self.observation = observation

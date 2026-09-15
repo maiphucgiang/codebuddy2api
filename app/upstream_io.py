@@ -18,6 +18,14 @@ class UpstreamResponseError(Exception):
         super().__init__(f"upstream HTTP {status}")
 
 
+class UpstreamHTTPError(UpstreamResponseError):
+    """上游**用 HTTP 状态码**给出的答复（429 / 401 / 503 …）。
+
+    与聚合器从 200 响应体里合成的 502（空流、坏 SSE、已开流后断连）区分开：只有前者的请求
+    确定没被上游收下处理，换一个账号重放不会重复计费；后者上游已经回了 200，可能已经计费。
+    """
+
+
 class ChatSSEAccumulator:
     """聚合 Chat SSE，拒绝错误事件、空输出和无结束标记的残流。"""
 
@@ -171,7 +179,14 @@ async def read_bounded_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
 
 @asynccontextmanager
 async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=None):
-    """只重试一次建连失败，其他错误交给调用方按协议返回。"""
+    """只重试一次「上游还没收下请求体」的失败（建连失败 / 写请求体超时），其余交给调用方按协议返回。
+
+    写超时意味着请求体没有被完整接收，上游不会处理也不会计费，因此换一条全新连接重放是安全的：
+    这里每次新建 `AsyncClient`，重试即重建 TCP+TLS，通常能换到另一个边缘节点。跨境链路上大
+    请求体（长会话）最容易撞到的正是 60s 写超时，而不是建连失败。
+
+    响应已经开始之后（`opened` 置位）绝不重放 POST。
+    """
     timeout = httpx.Timeout(read_timeout, connect=15, write=60, pool=15)
     for attempt in range(2):
         opened = False
@@ -181,7 +196,7 @@ async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=
                     opened = True
                     yield response
                     return
-        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout) as error:
             if opened or attempt == 1:
                 raise
             if on_retry is not None:

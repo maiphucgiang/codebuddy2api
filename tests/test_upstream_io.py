@@ -316,6 +316,48 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(requests), 1)
                     self.assertEqual(requests[0].method, "POST")
 
+    async def test_body_not_accepted_is_replayed_on_a_fresh_connection(self):
+        """建连失败 / 写请求体超时：上游没收下请求体，换新连接重放一次不会重复计费。"""
+        real_client = httpx.AsyncClient
+        for error_type in (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout):
+            with self.subTest(error=error_type.__name__):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    if len(attempts) == 1:
+                        raise error_type("synthetic failure before the body was accepted")
+                    return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    async with upstream_io.open_backend_stream("https://synthetic.invalid", {}, {}) as response:
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(await response.aread(), b"data: [DONE]\n\n")
+                self.assertEqual(len(attempts), 2, "只允许重放一次")
+                self.assertEqual([request.method for request in attempts], ["POST", "POST"])
+
+    async def test_ambiguous_transport_failures_never_replay_post(self):
+        """请求体已经发出（甚至响应已经开始）的失败有计费歧义，一律交给调用方按协议返回。"""
+        real_client = httpx.AsyncClient
+        for error_type in (httpx.ReadError, httpx.ReadTimeout, httpx.WriteError,
+                           httpx.RemoteProtocolError):
+            with self.subTest(error=error_type.__name__):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    raise error_type("synthetic failure after the body was sent")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    with self.assertRaises(error_type):
+                        async with upstream_io.open_backend_stream("https://synthetic.invalid", {}, {}) as response:
+                            await response.aread()
+                self.assertEqual(len(attempts), 1, "歧义请求不得重放 POST")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

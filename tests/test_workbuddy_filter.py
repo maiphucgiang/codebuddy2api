@@ -305,7 +305,10 @@ class EndpointFilterTests(unittest.TestCase):
                         self.assert_one_request()
                         self.credential_status.assert_not_called()
                         self.failures.assert_called_once_with("content_filter")
-                        self.assertEqual(response.status_code, 200 if stream else 502 if status == 200 else status)
+                        # 审核拒绝同样落在第一个字节之前，流式必须与 stream=False 吃同一个真实
+                        # 状态码；一律 200 + 带内 error 会让下游把失败当成空回答静默结束会话。
+                        self.assertEqual(response.status_code, 502 if status == 200 else status,
+                                         response.text)
                         self.assertIn("content_filter", response.text)
 
     def test_explicit_empty_filter_can_retry_nonstream_but_never_stream(self):
@@ -370,7 +373,11 @@ class EndpointFilterTests(unittest.TestCase):
                         self.respond = respond
                         response = self.post(route, stream=stream)
                         self.assert_one_request()
-                        self.assertEqual(response.status_code, 200 if stream else 502)
+                        # chat / messages 的真流式此时已经吐过拒绝文本，收不回状态码，只能带内
+                        # 报错；responses 总是先聚合再落字节，失败时一个字节都没发出去 → 真实 502。
+                        already_streamed = stream and route != "/v1/responses"
+                        self.assertEqual(response.status_code, 200 if already_streamed else 502,
+                                         response.text)
                         self.assertNotIn("response.completed", response.text)
                         self.assertNotIn("message_stop", response.text)
 

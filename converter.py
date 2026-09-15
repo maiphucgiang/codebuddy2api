@@ -68,11 +68,12 @@ from app import auth_oauth
 from app import trial_rewards
 from app import model_policy
 from app.model_blocks import ModelBlocks
-from app.observability import (AuditMiddleware, observe_route, observe_usage,
-                               observe_attempt, observe_failure)
+from app.observability import (AuditMiddleware, observe_recovery, observe_route,
+                               observe_usage, observe_attempt, observe_failure)
 from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
                                credential_file_lock)
-from app.upstream_io import ChatSSEAccumulator, UpstreamResponseError, open_backend_stream, read_bounded_error
+from app.upstream_io import (ChatSSEAccumulator, UpstreamHTTPError, UpstreamResponseError,
+                             open_backend_stream, read_bounded_error)
 from app.inference_auth import require_api_key
 from app.content_filter import ContentFilterDetector, is_filter_error
 from app.request_limits import ImageLimitError, apply_image_policy
@@ -798,9 +799,15 @@ class CredentialPool:
             else:
                 break
 
-    def _candidates(self, model: str | None, *, region=None) -> list[dict]:
-        """可用凭证按（零计费优先, 快过期积分优先）排序；同级由调用方轮询。"""
-        healthy = [entry for entry in self._entries if self._healthy(entry)
+    def _candidates(self, model: str | None, *, region=None, tried=()) -> list[dict]:
+        """可用凭证按（零计费优先, 快过期积分优先）排序；同级由调用方轮询。
+
+        `tried` 是本轮已经打过的凭证管理器：换凭证重放时把它们排除在候选外，避免又选回
+        同一个刚失败的站点。
+        """
+        tried = set(tried)
+        healthy = [entry for entry in self._entries if entry["cm"] not in tried
+                   and self._healthy(entry)
                    and self._eligible(entry, model, region=region) and self._model_healthy(entry, model)
                    and self._model_servable(entry, model)]
         if not healthy:
@@ -809,7 +816,8 @@ class CredentialPool:
         healthy.sort(key=lambda entry: (not self._model_free(entry, model), *self._expiry_rank(entry)))
         return healthy
 
-    def pick(self, skey: str | None, model: str | None = None, *, region=None) -> CredentialManager | None:
+    def pick(self, skey: str | None, model: str | None = None, *, region=None,
+             tried=()) -> CredentialManager | None:
         """按黏绑选凭证；未绑定/已失效则轮询取健康凭证并绑定。
 
         model 非空时跳过该模型 429 冷却中的凭证（黏性会话自动换绑）；
@@ -819,7 +827,7 @@ class CredentialPool:
         self._rescan()  # 锁外扫描，reload/prune 各自取锁，避免死锁
         with self._lock:
             self._evict_sticky()
-            candidates = self._candidates(model, region=region)
+            candidates = self._candidates(model, region=region, tried=tried)
             if not candidates:
                 if skey:
                     self._sticky.pop(skey, None)
@@ -841,10 +849,11 @@ class CredentialPool:
                 self._sticky[skey] = (e["id"], time.time())
             return e["cm"]
 
-    def headers_for(self, skey: str | None, model: str | None = None, *, region=None, with_generation=False):
+    def headers_for(self, skey: str | None, model: str | None = None, *, region=None,
+                    with_generation=False, tried=()):
         """在发送前复核凭据代次和站点，避免重载竞态导致跨站调用。"""
         for _ in range(max(1, len(self._entries))):
-            cm = self.pick(skey, model, region=region)
+            cm = self.pick(skey, model, region=region, tried=tried)
             if cm is None:
                 return None
             reason = None
@@ -1417,6 +1426,7 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "max_request_bytes": 32 * 1024 * 1024, "log_body_limit": 65536,
                 "max_inbound_bytes": 64 * 1024 * 1024,
                 "max_collect_bytes": 8 * 1024 * 1024, "max_concurrent": 64,
+                "failover_max": 0,     # 流式失败在第一个字节之前发生时可换凭证重放的最大次数
                 "usage_daily": None,     # 官方用量聚合视图（日期×模型 credit），供 billing/usage 出 daily_costs
                 "usage_daily_accounts": None,  # 按账号的用量快照；单账号失败不丢历史
                 "credit_price_cny": None, "credit_price_usd": None, "usd_rate": None,
@@ -1499,14 +1509,17 @@ def _check_admin_auth(authorization: Optional[str], x_api_key: Optional[str]):
     _check_auth(authorization, x_api_key)
 
 
-def _cred_for(payload: dict, model: str | None = None, *, region=None):
-    """返回 ((凭据管理器, 代次), headers)；无可用凭据返回 503，模型冷却返回 429。"""
+def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=()):
+    """返回 ((凭据管理器, 代次), headers)；无可用凭据返回 503，模型冷却返回 429。
+
+    `tried` 里的凭证不再入选，供换凭证重放使用（见 `_routed_stream`）。
+    """
     raw_key = session_key(payload)
     skey = f"{region}:{raw_key}" if raw_key and region is not None else raw_key
     skey = model_policy.sticky_scope(CONFIG, skey, model)
     pool = CONFIG.get("cred_pool")
     if pool is not None:
-        picked = pool.headers_for(skey, model, region=region, with_generation=True)
+        picked = pool.headers_for(skey, model, region=region, with_generation=True, tried=tried)
         if picked is None:
             until = pool.model_cooldown_until(model, region=region)
             if until:
@@ -1529,7 +1542,7 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None):
         cm, headers = picked
     else:
         cm = CONFIG["cred"]
-        if cm is None:
+        if cm is None or cm in {_cred_manager(item) for item in tried}:
             raise HTTPException(status_code=503, detail={"error": {"message": "未找到登录凭据，请先在桌面端登录 CodeBuddy/WorkBuddy", "type": "auth_error"}})
         with cm._lock:
             headers = cm.get_headers()
@@ -1541,9 +1554,9 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None):
     return cm, headers
 
 
-def _route_chat(payload, body, rid):
+def _route_chat(payload, body, rid, *, tried=()):
     """根据所选账号自动确定后端地域、产品及模型，不改变客户端地址。"""
-    cred, headers = _cred_for(payload, body.get("model"))
+    cred, headers = _cred_for(payload, body.get("model"), tried=tried)
     profile = profile_for_headers(headers)
     routed_model = _upstream_model(body.get("model"), profile)
     if routed_model != body.get("model"):
@@ -2336,18 +2349,17 @@ async def chat_completions(request: Request,
     t0 = time.time()
 
     if client_wants_stream:
-        return StreamingResponse(
-            _stream_upstream(url, headers, body, model_name, t0, rid, cred=cred),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        def attempt(routed, cred, headers, url):
+            return _stream_upstream(url, headers, routed, model_name, t0, rid, cred=cred)
+        return await _routed_stream(payload, body, model_name, rid, t0, attempt,
+                                    body, cred, headers, url)
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
-    try:
-        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=True)
-    except (httpx.HTTPError, UpstreamResponseError) as error:
-        status, raw = _upstream_failure(error, model_name, t0, rid)
-        raise HTTPException(status_code=status, detail=_safe_err_raw(raw, status)) from None
+    async def fetch(routed, cred, headers, url):
+        return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
+                                         filter_retry=True)
+    collected = await _routed_fetch(payload, body, model_name, rid, t0, fetch,
+                                    body, cred, headers, url)
     _log_finish(model_name, t0, collected, rid)
     if CONFIG.get("control_store") is not None:
         collected = {**collected, "model": model_name}
@@ -2552,7 +2564,7 @@ def _check_upstream_status(status, raw, cred, model):
     if status != 200:
         if not is_filter_error(raw):
             _note_cred_status(cred, status, model=model, raw=raw)
-        raise UpstreamResponseError(status, raw)
+        raise UpstreamHTTPError(status, raw)
 
 
 def _upstream_failure(error, model_name, t0, rid):
@@ -2675,10 +2687,14 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
 
 async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = "", cred=None):
+    sent = False
     try:
         async for line in _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, aggregate=bool(body.get("tools"))):
+            sent = True
             yield (_public_sse_line(line, model_name) + "\n").encode("utf-8")
     except (httpx.HTTPError, UpstreamResponseError) as error:
+        if not sent:
+            raise      # 一个字节都没发出去：交给端点还原成真实状态码，别把失败写成 200
         status, raw = _upstream_failure(error, model_name, t0, rid)
         yield _err_event(raw, status)
 
@@ -2689,6 +2705,142 @@ def _err_event(msg: bytes, status: int) -> bytes:
     chunk = {"error": {"message": sanitize_log_text(msg.decode("utf-8", "replace"), 512),
                        "type": "upstream_error", "code": status}}
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _cred_manager(cred):
+    """凭证统一是 (管理器, 代次)；兼容裸管理器（`_cred_for` 的单凭证回退分支）。"""
+    return cred[0] if isinstance(cred, tuple) else cred
+
+
+# 可换凭证重放的上游 HTTP 状态：限流、认证、网关抖动。400/404/413 是确定性拒绝，换账号
+# 也一样，不在其中。
+FAILOVER_CODES = frozenset({401, 403, 429, 502, 503, 504})
+# 请求体确定没被上游收下的传输失败（建连失败 / 写请求体超时），重放不会重复计费。
+REPLAYABLE_TRANSPORT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout)
+
+
+def _failover_safe(error, raw=b"") -> bool:
+    """这次失败能不能换账号重放：只认「上游没收下请求体」和「上游用 HTTP 状态码拒绝」。
+
+    三条硬边界：内容审核拒绝不切号重放（那是模型的真实答复，换账号只会再撞一次同一堵墙，
+    还白烧一次额度）；聚合器从 200 响应体里合成的 502（空流、坏 SSE、已开流后断连）不重放，
+    因为上游可能已经处理并计费；真正的重放窗口由 `open_backend_stream` 的 `opened` 标记与
+    `_preflight_stream` 守住。
+    """
+    if is_filter_error(raw):
+        return False
+    if isinstance(error, UpstreamHTTPError):
+        return error.status in FAILOVER_CODES
+    if isinstance(error, UpstreamResponseError):
+        return False
+    return isinstance(error, REPLAYABLE_TRANSPORT)
+
+
+class _StreamFailure(Exception):
+    """流式预取阶段的失败：状态码、错误体，以及原始异常（重放判定要看它是什么类型）。"""
+
+    def __init__(self, status, raw, error=None):
+        self.status = status
+        self.raw = raw
+        self.error = error
+        super().__init__(f"stream failed before first byte (HTTP {status})")
+
+
+async def _preflight_stream(agen, model_name, t0, rid):
+    """取到第一段输出之后再决定怎么回 200。
+
+    `StreamingResponse` 一旦被迭代就把响应头发出去，而打上游发生在生成器里面 —— 于是上游的
+    429、建连/写超时乃至审核拒绝，在流式下全都只能塞进 SSE 正文：客户端看到的是一个没有
+    `choices`、也等不到 `response.completed` 的 200 流，被读成「模型答了个空」，会话静默
+    结束，既不重试也不报错，审计里还记成一次成功。预取第一段之后，「一个字节都还没发出去」
+    的失败可以还原成真实状态码，流式与非流式同一口径；真的中途断流才继续用带内 error 事件
+    （那时状态码已经收不回来了）。
+    """
+    try:
+        return await agen.__anext__()
+    except StopAsyncIteration:
+        empty = UpstreamResponseError(502, b'{"error":{"message":"upstream returned an empty stream",'
+                                      b'"type":"upstream_error","code":"empty_response"}}')
+        status, raw = _upstream_failure(empty, model_name, t0, rid)
+        raise _StreamFailure(status, raw, empty) from None
+    except (httpx.HTTPError, UpstreamResponseError) as error:
+        status, raw = _upstream_failure(error, model_name, t0, rid)
+        raise _StreamFailure(status, raw, error) from None
+
+
+def _stream_response(agen, first):
+    """把预取到的第一段接回流，之后保持原有生成器语义。"""
+    async def body():
+        yield first
+        async for chunk in agen:
+            yield chunk
+    return StreamingResponse(body(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _failover_limit() -> int:
+    return int(CONFIG.get("failover_max") or 0)
+
+
+async def _routed_stream(payload, body, model_name, rid, t0, make, routed, cred, headers, url):
+    """流式端点：预取失败时按策略换凭证重打，全部失败才把真实状态码回给下游。
+
+    重放只发生在「一个字节都没发给下游」的时候（`_preflight_stream` 保证了这点），所以下游
+    看到的仍然是一次正常请求。`make(routed, cred, headers, url)` 每轮只建一个生成器。
+    """
+    tried = []
+    while True:
+        stream = make(routed, cred, headers, url)
+        try:
+            first = await _preflight_stream(stream, model_name, t0, rid)
+            if tried:
+                observe_recovery()   # 重放救回来的请求对下游是正常响应，不该记成失败
+            return _stream_response(stream, first)
+        except _StreamFailure as failure:
+            tried.append(cred)
+            limit = _failover_limit()
+            surface = HTTPException(status_code=failure.status,
+                                    detail=_safe_err_raw(failure.raw, failure.status))
+            if limit <= 0 or len(tried) > limit or not _failover_safe(failure.error, failure.raw):
+                raise surface from None
+            try:
+                attempt = await run_in_threadpool(_route_chat, payload, body, rid,
+                                                  tried={_cred_manager(item) for item in tried})
+            except HTTPException:
+                raise surface from None      # 换不出别的凭证，就如实回第一次的错
+            if _cred_manager(attempt[1]) in {_cred_manager(item) for item in tried}:
+                raise surface from None
+            routed, cred, headers, url = attempt
+            _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | {model_name} | 上游 HTTP "
+                 f"{failure.status} → {profile_for_headers(headers)}")
+
+
+async def _routed_fetch(payload, body, model_name, rid, t0, fetch, routed, cred, headers, url):
+    """非流式请求：失败时按同一策略换凭证重打（此时一个字节都还没回给下游）。"""
+    tried = []
+    while True:
+        try:
+            collected = await fetch(routed, cred, headers, url)
+            if tried:
+                observe_recovery()   # 同上：换凭证后成功的请求不该记成失败
+            return collected
+        except (httpx.HTTPError, UpstreamResponseError) as error:
+            status, raw = _upstream_failure(error, model_name, t0, rid)
+            tried.append(cred)
+            limit = _failover_limit()
+            surface = HTTPException(status_code=status, detail=_safe_err_raw(raw, status))
+            if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
+                raise surface from None
+            try:
+                attempt = await run_in_threadpool(_route_chat, payload, body, rid,
+                                                  tried={_cred_manager(item) for item in tried})
+            except HTTPException:
+                raise surface from None
+            if _cred_manager(attempt[1]) in {_cred_manager(item) for item in tried}:
+                raise surface from None
+            routed, cred, headers, url = attempt
+            _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | {model_name} | 上游 HTTP "
+                 f"{status} → {profile_for_headers(headers)}")
 
 
 def _note_content_filter(rid, model_name, *, final):
@@ -2772,19 +2924,25 @@ async def create_response(request: Request,
     t0 = time.time()
 
     if client_wants_stream:
-        return StreamingResponse(
-            _stream_responses(url, headers, chat_body, model_name, t0, rid, cred=cred),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        def attempt(routed, cred, headers, url):
+            return _stream_responses(url, headers, routed, model_name, t0, rid, cred=cred)
+        return await _routed_stream(payload, chat_body, model_name, rid, t0, attempt,
+                                    chat_body, cred, headers, url)
 
-    return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred)
+    return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred,
+                                    payload=payload)
 
 
-async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False):
+async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False,
+                             payload=None):
     converter = (AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name, parallel_tool_calls=body.get("parallel_tool_calls", True)))
+
+    async def fetch(routed, cred, headers, url):
+        return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
+                                         filter_retry=True)
     try:
-        collected = await _fetch_checked_chat(url, headers, body, model_name, rid, cred, filter_retry=True)
+        collected = await _routed_fetch(payload, body, model_name, rid, t0, fetch,
+                                        body, cred, headers, url)
         for line in _chat_result_to_sse_lines(_completion_to_merged(collected)):
             converter.feed_line(_public_sse_line(line, model_name))
         converter.finish()
@@ -2799,17 +2957,22 @@ async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, a
 async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *, anthropic=False):
     """协议适配只处理事件映射，连接、聚合与错误边界共用。"""
     converter = (AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name, parallel_tool_calls=body.get("parallel_tool_calls", True)))
+    sent = False
     try:
         async for line in _chat_sse_lines(
                 url, headers, body, model_name, t0, rid, cred,
                 aggregate=not anthropic or bool(body.get("tools"))):
             events = converter.feed_line(_public_sse_line(line, model_name))
             if events:
+                sent = True
                 yield events.encode("utf-8")
         events = converter.finish()
         if events:
+            sent = True
             yield events.encode("utf-8")
     except (httpx.HTTPError, UpstreamResponseError) as error:
+        if not sent:
+            raise      # 一个字节都没发出去：交给端点还原成真实状态码，别把失败写成 200
         status, raw = _upstream_failure(error, model_name, t0, rid)
         event = {"type": "error", "error": {
             "message": sanitize_log_text(raw.decode("utf-8", "replace"), 512),
@@ -2867,13 +3030,13 @@ async def create_message(request: Request,
     t0 = time.time()
 
     if not _client_wants_stream(payload):
-        return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred, anthropic=True)
+        return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred,
+                                        anthropic=True, payload=payload)
 
-    return StreamingResponse(
-        _stream_anthropic(url, headers, chat_body, model_name, t0, rid, cred=cred),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    def attempt(routed, cred, headers, url):
+        return _stream_anthropic(url, headers, routed, model_name, t0, rid, cred=cred)
+    return await _routed_stream(payload, chat_body, model_name, rid, t0, attempt,
+                                chat_body, cred, headers, url)
 
 
 async def _stream_anthropic(url: str, headers: dict, body: dict,
@@ -3083,6 +3246,10 @@ def main():
     ap.add_argument("--tool-call-max-retry", type=_nonnegative_int, metavar="N",
                     default=os.environ.get("CODEBUDDY2API_TOOL_CALL_MAX_RETRY", "3"),
                     help="工具参数损坏时的额外生成上限，默认 3；0 表示不重试（每次额外生成都消耗额度）")
+    ap.add_argument("--failover-max", type=_nonnegative_int, metavar="N",
+                    default=os.environ.get("CODEBUDDY2API_FAILOVER_MAX", "0"),
+                    help="失败发生在向下游落第一个字节之前时，最多换几个凭证就地重放，默认 0（关闭）；"
+                         "只重放上游没收下请求体或用 401/403/429/502/503/504 拒绝的失败")
     ap.add_argument("--auto-trial", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_AUTO_TRIAL", "false"),
                     help="自动领取国际 WorkBuddy 一次性体验积分，默认关闭")
@@ -3093,7 +3260,8 @@ def main():
         return login(site=args.site, open_browser=not args.no_browser)
 
     for key in ("max_images", "image_policy", "max_request_bytes", "log_body_limit", "auto_trial",
-                "tool_call_max_retry", "max_inbound_bytes", "max_collect_bytes", "max_concurrent"):
+                "tool_call_max_retry", "max_inbound_bytes", "max_collect_bytes", "max_concurrent",
+                "failover_max"):
         CONFIG[key] = getattr(args, key)
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize

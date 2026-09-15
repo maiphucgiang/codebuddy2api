@@ -247,7 +247,9 @@ class EndpointTests(unittest.TestCase):
         direct = re.findall(r"^\s+(?:body|chat_body), cred, headers, url = _route_chat\(", src, re.M)
         pooled = re.findall(r"await run_in_threadpool\(_route_chat", src)
         self.assertEqual(direct, [])
-        self.assertEqual(len(pooled), 3)
+        # 三个端点各一次，另外换凭证重放（_routed_stream / _routed_fetch）还要再路由一次：
+        # 只要没有任何直调（direct 为空），线程池约束就仍然成立。
+        self.assertGreaterEqual(len(pooled), 3)
 
     def test_tool_metadata_policy_reaches_all_protocols(self):
         description = "Read sandbox data without destructive changes."

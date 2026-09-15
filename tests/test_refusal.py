@@ -233,18 +233,14 @@ class EndpointRefusalTests(unittest.TestCase):
                 for tools in (False, True):
                     with self.subTest(route=route, stream=stream, tools=tools):
                         response = self.request(route, stream, tools)
-                        if not stream:
-                            self.assertEqual(response.status_code, 502, response.text)
-                            self.assertIn("error", response.json().get("detail", response.json()))
-                            continue
-                        parsed = events(response.text)
-                        self.assertTrue(any("error" in event for event in parsed), response.text)
+                        # 空终止在落第一个字节之前就能判定，所以流式与非流式同一口径：真实 502。
+                        # 过去流式回 200 + 带内 error 帧，下游 SDK 解析不到 choices /
+                        # response.completed，会把失败读成「模型答了个空」并静默结束会话。
+                        self.assertEqual(response.status_code, 502, response.text)
+                        self.assertIn("error", response.json().get("detail", response.json()))
                         self.assertNotIn("data: [DONE]", response.text)
-                        self.assertFalse(any(choice.get("finish_reason") for event in parsed
-                                             for choice in event.get("choices", [])), response.text)
-                        self.assertFalse(any(event.get("type") in (
-                            "response.completed", "response.output_item.done", "response.output_text.done",
-                            "message_stop", "message_delta") for event in parsed), response.text)
+                        self.assertNotIn("response.completed", response.text)
+                        self.assertNotIn("message_stop", response.text)
 
 
 if __name__ == "__main__":
