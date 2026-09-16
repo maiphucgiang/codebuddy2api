@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -57,7 +58,7 @@ from app.observability import (AuditMiddleware, observe_recovery, observe_route,
 from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
                                credential_file_lock)
 from app.upstream_io import (ChatSSEAccumulator, UpstreamHTTPError, UpstreamResponseError,
-                             open_backend_stream, read_bounded_error)
+                             open_backend_stream, parse_retry_after, read_bounded_error)
 from app.inference_auth import require_api_key
 from app.content_filter import ContentFilterDetector, is_filter_error
 from app.request_limits import ImageLimitError, apply_image_policy
@@ -868,7 +869,7 @@ class CredentialPool:
         _log(f"[cred] 凭证熔断 {CRED_COOLDOWN}s: {Path(cm.path).name} {reason}")
 
     def note_status(self, cm: CredentialManager | None, status: int,
-                    model: str | None = None, raw: bytes = b"", *, generation=None):
+                    model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None):
         """Apply credential-wide auth cooldowns, per-model 429 cooldowns and backend/model backoff."""
         if cm is None:
             return
@@ -882,7 +883,11 @@ class CredentialPool:
         if status != 429 or not model:
             return
         now = time.time()
-        until = _parse_reset_time(raw) or now + MODEL_COOLDOWN
+        if retry_after is not None:
+            until = now + retry_after
+        else:
+            reset = _parse_reset_time(raw)
+            until = reset if reset is not None and reset > now else now + MODEL_COOLDOWN
         until = min(until, now + MODEL_COOLDOWN_MAX)
         with self._lock, (cm._lock if generation is not None else nullcontext()):
             if not self._lease_matches(cm, generation):
@@ -891,7 +896,9 @@ class CredentialPool:
             for e in self._entries:
                 if e["cm"] is cm:
                     routed_model = _upstream_model(model, self._entry_profile(e))
-                    self._model_fail[(e["id"], routed_model)] = until
+                    key = (e["id"], routed_model)
+                    until = max(until, self._model_fail.get(key, 0.0))
+                    self._model_fail[key] = until
         _log(f"[cred] 模型冷却 {model} @ {Path(cm.path).name} 至 "
              f"{time.strftime('%m-%d %H:%M:%S', time.localtime(until))} (HTTP 429)")
 
@@ -1539,7 +1546,9 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=())
             until = pool.model_cooldown_until(model, region=region)
             if until:
                 t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-                raise HTTPException(status_code=429, detail={"error": {
+                raise HTTPException(status_code=429,
+                                    headers={"Retry-After": str(max(1, math.ceil(until - time.time())))},
+                                    detail={"error": {
                     "message": f"模型 {model} 额度冷却中（全部凭证），预计 {t} 重置后恢复",
                     "type": "rate_limit_error"}})
             blocked = pool.model_block_until(model, region=region)
@@ -1593,12 +1602,12 @@ def _note_cred_model_ok(cred, model: str | None) -> None:
         pool.note_model_ok(cm, model)
 
 
-def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = b""):
+def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = b"", *, retry_after=None):
     """Record generation-scoped authentication, quota and unsupported-model failures."""
     pool = CONFIG.get("cred_pool")
     if pool is not None and cred is not None:
         cm, generation = cred if isinstance(cred, tuple) else (cred, None)
-        pool.note_status(cm, status, model=model, raw=raw, generation=generation)
+        pool.note_status(cm, status, model=model, raw=raw, generation=generation, retry_after=retry_after)
 
 @app.get("/health")
 def health():
@@ -2362,7 +2371,7 @@ async def chat_completions(request: Request,
     # Forward only supported request fields.
     client_wants_stream = _client_wants_stream(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
-    body = _prepare_chat_body(body)
+    body = await run_in_threadpool(_prepare_chat_body, body)
 
     # Record request metadata.
     model_name = payload.get("model", "auto")
@@ -2600,11 +2609,12 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
 
 
-def _check_upstream_status(status, raw, cred, model):
+def _check_upstream_status(status, raw, cred, model, *, headers=None):
     if status != 200:
+        retry_after = parse_retry_after((headers or {}).get("Retry-After"))
         if not is_filter_error(raw):
-            _note_cred_status(cred, status, model=model, raw=raw)
-        raise UpstreamHTTPError(status, raw)
+            _note_cred_status(cred, status, model=model, raw=raw, retry_after=retry_after)
+        raise UpstreamHTTPError(status, raw, retry_after=retry_after)
 
 
 def _upstream_failure(error, model_name, t0, rid):
@@ -2642,7 +2652,8 @@ async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *,
         rejection = None
         async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
             if response.status_code != 200:
-                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"))
+                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
+                                       headers=response.headers)
             else:
                 _note_cred_model_ok(cred, body.get("model"))
             try:
@@ -2708,7 +2719,8 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
     budget = CONFIG["log_body_limit"] if CONFIG.get("log_path") else 0
     async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
         if response.status_code != 200:
-            _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"))
+            _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
+                                   headers=response.headers)
         else:
             _note_cred_model_ok(cred, body.get("model"))
         async for line in response.aiter_lines():
@@ -2798,6 +2810,7 @@ class _StreamFailure(Exception):
         self.status = status
         self.raw = raw
         self.error = error
+        self.headers = error.headers if isinstance(error, UpstreamHTTPError) else None
         super().__init__(f"stream failed before first byte (HTTP {status})")
 
 
@@ -2918,7 +2931,7 @@ async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cr
             recovered = observe_failure_seq()   # Recover only this failure sequence.
             tried.append(cred)
             limit = _failover_limit()
-            surface = HTTPException(status_code=failure.status,
+            surface = HTTPException(status_code=failure.status, headers=failure.headers,
                                     detail=_safe_err_raw(failure.raw, failure.status))
             if limit <= 0 or len(tried) > limit or not _failover_safe(failure.error, failure.raw):
                 raise surface from None
@@ -2967,7 +2980,8 @@ async def _routed_fetch(payload, canonical, model_name, rid, t0, fetch, routed, 
             recovered = observe_failure_seq()
             tried.append(cred)
             limit = _failover_limit()
-            surface = HTTPException(status_code=status, detail=_safe_err_raw(raw, status))
+            surface = HTTPException(status_code=status, detail=_safe_err_raw(raw, status),
+                                    headers=error.headers if isinstance(error, UpstreamHTTPError) else None)
             if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
                 raise surface from None
             try:
@@ -3036,7 +3050,7 @@ async def create_response(request: Request,
 
     chat_body, projection_stats = project_responses_chat_body(
         chat_body, keep_tool_metadata=CONFIG.get("keep_tool_metadata", False))
-    chat_body = _prepare_chat_body(chat_body)
+    chat_body = await run_in_threadpool(_prepare_chat_body, chat_body)
 
     client_wants_stream = _client_wants_stream(payload)
     model_name = payload.get("model", "auto")
@@ -3085,7 +3099,8 @@ async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, a
         converter.finish()
     except (httpx.HTTPError, UpstreamResponseError) as error:
         status, raw = _upstream_failure(error, model_name, t0, rid)
-        raise HTTPException(status_code=status, detail=_safe_err_raw(raw, status)) from None
+        raise HTTPException(status_code=status, detail=_safe_err_raw(raw, status),
+                            headers=error.headers if isinstance(error, UpstreamHTTPError) else None) from None
     except ClientHungUp:
         return _hungup_response(rid, model_name, t0)
     result = converter.get_nonstream_response()
@@ -3153,7 +3168,7 @@ async def create_message(request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
-    chat_body = _prepare_chat_body(chat_body)
+    chat_body = await run_in_threadpool(_prepare_chat_body, chat_body)
     model_name = payload.get("model", "auto")
     chat_messages = chat_body.get("messages", [])
     rid = os.urandom(4).hex()

@@ -75,7 +75,7 @@ def responses_request_to_chat(body: dict) -> dict:
     # Forward supported parameters.
     for key in ("temperature", "top_p", "stop", "seed",
                 "presence_penalty", "frequency_penalty",
-                "response_format", "reasoning_effort", "parallel_tool_calls"):
+                "response_format", "reasoning_effort", "parallel_tool_calls", "prompt_cache_key"):
         if key in body:
             chat[key] = body[key]
 

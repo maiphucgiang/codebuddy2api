@@ -2,6 +2,10 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import timezone
+from email.utils import parsedate_to_datetime
+import math
+import time
 
 import json
 import httpx
@@ -20,6 +24,34 @@ class UpstreamResponseError(Exception):
 
 class UpstreamHTTPError(UpstreamResponseError):
     """Distinguish actual upstream HTTP errors from failures synthesized while collecting a response."""
+
+    def __init__(self, status, raw, *, retry_after=None):
+        super().__init__(status, raw)
+        self.retry_after = retry_after
+        self.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+
+
+MAX_RETRY_AFTER = 86400
+
+
+def parse_retry_after(value, *, now=None) -> int | None:
+    """Normalize bounded Retry-After seconds or HTTP dates; ignore invalid or expired values."""
+    if not isinstance(value, str) or len(value) > 128 or not value.isascii() or not value.isprintable():
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        if value.isdecimal():
+            delay = int(value)
+        else:
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)  # Obsolete HTTP asctime uses GMT.
+            delay = deadline.timestamp() - (time.time() if now is None else now)
+        return math.ceil(delay) if 0 <= delay <= MAX_RETRY_AFTER else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 class ChatSSEAccumulator:

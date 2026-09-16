@@ -154,7 +154,9 @@ WebUI 可以直接上传文件；以下限制针对 `POST /admin/credentials` �
 - `--image-policy error` 在本地返回 `413 / too_many_images`。处理后仍超过字节上限则返回 `413 / request_too_large`，不为满足预算继续截断文本。
 - 图片数量合规不保证单图大小或模型视觉能力满足上游要求。URL/base64 图片可转换，Responses 图片 `file_id` 不支持。
 - 省略 `stream` 时三个端点都按协议默认返回完整 JSON（非流式）；`stream` 必须是布尔值。Responses 流式以及带工具的 Chat / Messages 流式先聚合校验，再输出 SSE，并非所有路径都实时逐 token 转发。
-- 推理端点的错误体按客户端协议成形：OpenAI 路由为顶层 `error` 对象，Messages 路由为 `{"type": "error", ...}`；状态码与 `Retry-After` 保持不变。
+- 推理错误按客户端协议成形：OpenAI 路由为顶层 `error` 对象，Messages 路由为 `{"type": "error", ...}`；保留状态码，开流后的错误只用 SSE 报告，不重放。
+- 上游有效 `Retry-After`（0–86400 秒或对应 HTTP 日期）规范化为秒并在开流前返回；429 仅冷却对应账号/模型。无效或过期值回落正文重置时间或默认 600 秒；本地全凭据冷却的 429 返回剩余等待秒数。
+- Chat 与 Responses 保留客户端显式 `prompt_cache_key`，不自动生成；缓存命中和节费取决于上游。
 - 不支持的能力显式拒绝而非静默降级：Chat 的 `n≠1`、Responses 的 `previous_response_id`/`conversation`（本网关不保存服务端响应状态）返回 400；长度截断或审核过滤的 Responses 标记为 `incomplete`，不伪装为 `completed`。
 - `/v1/messages/count_tokens` 返回字符启发式估算值，仅作预算参考，不是精确计数。
 - 兼容文本日志和 SQLite 审计使用独立预算；日志仅记录有界、脱敏预览，不是完整原始请求。日志、凭证导出和备份仍须按私有数据保管。
