@@ -223,7 +223,7 @@ async def _attempt_client(url, timeout, clients):
 
 @asynccontextmanager
 async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=None,
-                              retry_write_timeout=False, clients=None):
+                              retry_write_timeout=False, clients=None, headers_for_attempt=None):
     """Retry connection failures once on a fresh client; write timeouts require explicit opt-in.
     Never replay after the upstream response opens.
     """
@@ -233,7 +233,8 @@ async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=
         opened = False
         try:
             async with _attempt_client(url, timeout, clients if attempt == 0 else None) as client:
-                async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as response:
+                attempt_headers = headers_for_attempt() if headers_for_attempt is not None else headers
+                async with client.stream("POST", url, headers=attempt_headers, json=body, timeout=timeout) as response:
                     opened = True
                     yield response
                     return

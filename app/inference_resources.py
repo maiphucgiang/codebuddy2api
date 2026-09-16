@@ -10,6 +10,7 @@ import threading
 import httpx
 
 from app.site_routing import PROFILE_ENDPOINTS
+from app.request_context import with_request_context
 
 
 class _RejectCookies(DefaultCookiePolicy):
@@ -140,10 +141,13 @@ request_resources = ContextVar("inference_resources", default=None)
 
 
 class InferenceResourcesMiddleware:
-    def __init__(self, app):
-        self.app = app
+    def __init__(self, app, config=None):
+        self.app, self.config = app, config
 
     async def __call__(self, scope, receive, send):
+        await with_request_context(self._serve, scope, receive, send, self.config)
+
+    async def _serve(self, scope, receive, send):
         if (scope["type"] != "http" or scope.get("method") != "POST" or
                 scope.get("path") not in ("/v1/chat/completions", "/v1/responses", "/v1/messages")):
             return await self.app(scope, receive, send)

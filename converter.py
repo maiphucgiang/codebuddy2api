@@ -61,6 +61,7 @@ from app.upstream_io import (ChatSSEAccumulator, UpstreamHTTPError, UpstreamResp
                              open_backend_stream, parse_retry_after, read_bounded_error)
 from app.inference_resources import (AccountCapacity, InferenceResourcesMiddleware, inference_lifespan,
                                      request_resources, release_credential)
+from app.request_context import SessionIdentifierError, current_context
 from app.inference_auth import require_api_key
 from app.content_filter import ContentFilterDetector, is_filter_error
 from app.request_limits import ImageLimitError, apply_image_policy
@@ -1435,7 +1436,7 @@ PASSTHROUGH_BODY_KEYS = {
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="codebuddy2api", version=APP_VERSION, lifespan=inference_lifespan)
-app.add_middleware(InferenceResourcesMiddleware)
+app.add_middleware(InferenceResourcesMiddleware, config=lambda: CONFIG)
 
 # Anthropic error types: https://platform.claude.com/docs/en/api/errors
 _ANTHROPIC_ERROR_TYPES = {
@@ -1485,6 +1486,7 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "max_inbound_bytes": 64 * 1024 * 1024,
                 "max_collect_bytes": 8 * 1024 * 1024, "max_concurrent": 64,
                 "upstream_keepalive": False, "max_inflight_per_account": 0,
+                "request_context_mode": "legacy",
                 "failover_max": 0,     # Credential failovers allowed before the first response byte
                 "retry_write_timeout": False,  # Opt-in replay after incomplete writes
                 "usage_daily": None,     # Usage aggregated by date and model
@@ -1571,7 +1573,8 @@ def _check_admin_auth(authorization: Optional[str], x_api_key: Optional[str]):
 
 def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=()):
     """Select a fresh credential lease and headers, excluding tried accounts; report unavailable capacity."""
-    raw_key = session_key(payload)
+    context = current_context()
+    raw_key = context.session_key if context is not None and context.scoped else session_key(payload)
     skey = f"{region}:{raw_key}" if raw_key and region is not None else raw_key
     skey = model_policy.sticky_scope(CONFIG, skey, model)
     pool = CONFIG.get("cred_pool")
@@ -1613,7 +1616,11 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=())
     profile = profile_for_headers(headers)
     if not _in_region(profile, region):
         raise HTTPException(status_code=503, detail={"error": {"message": "未找到指定地域凭据", "type": "auth_error"}})
-    headers.update(_dynamic_request_headers(f"{profile}:{skey}" if skey else None))
+    if context is not None and context.scoped:
+        identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
+        headers["X-Conversation-ID"] = context.conversation_id(profile, identity)
+    else:
+        headers.update(_dynamic_request_headers(f"{profile}:{skey}" if skey else None))
     return cm, headers
 
 
@@ -2302,8 +2309,28 @@ def _normalize_tool_choice(body):
     body["tools"], body["tool_choice"] = matches, "required"
 
 
-def _prepare_chat_body(body: dict, *, region=None) -> dict:
+def _bind_request_session(payload, body):
+    context = current_context()
+    if context is not None and context.scoped:
+        try:
+            context.bind_session(payload, body.get("messages"))
+        except SessionIdentifierError as error:
+            raise HTTPException(status_code=400, detail={"error": {"message": str(error),
+                                "type": "invalid_request_error", "param": "session_id"}}) from None
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            raise HTTPException(status_code=400, detail={"error": {"message": "invalid session input",
+                                "type": "invalid_request_error"}}) from None
+
+
+def _request_id():
+    context = current_context()
+    return context.request_id if context is not None else uuid.uuid4().hex
+
+
+def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict:
     """Normalize models, system messages, streaming, desensitization and payload budgets."""
+    if session_payload is not None:
+        _bind_request_session(session_payload, body)
     body = dict(body)
     body["model"] = model_policy.resolve(CONFIG, body.get("model", "auto"))
     guard_model(body["model"], region=region, resolved=True)
@@ -2410,14 +2437,14 @@ async def chat_completions(request: Request,
     # Forward only supported request fields.
     client_wants_stream = _client_wants_stream(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
-    body = await run_in_threadpool(_prepare_chat_body, body)
+    body = await run_in_threadpool(_prepare_chat_body, body, session_payload=payload)
 
     # Record request metadata.
     model_name = payload.get("model", "auto")
     tool_names = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])
                   if isinstance(t, dict)]
     last_user = _last_user_text(messages)
-    rid = os.urandom(4).hex()
+    rid = _request_id()
     _log(f"[{rid}] ▶ REQUEST {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
          + (f" | tools={tool_names}" if tool_names else "")
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
@@ -2619,6 +2646,22 @@ def _public_sse_line(line, model_name):
 @asynccontextmanager
 async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name="?"):
     started, opened = time.monotonic(), False
+    context = current_context()
+    if context is not None:
+        context.attempt = None
+
+    def attempt_headers():
+        if context is None:
+            return dict(headers)
+        attempt = context.start_attempt()
+        outgoing = context.attempt_headers(headers, attempt)
+        profile = profile_for_headers(headers)
+        observe_attempt("upstream_attempt", profile=profile, upstream_model=body.get("model"),
+                        credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")),
+                        conversation_id=outgoing.get("X-Conversation-ID"),
+                        upstream_request_id=outgoing.get("X-Request-ID"))
+        return outgoing
+
     def retry(error):
         """Record connection retries and flag possible billing after write timeouts."""
         timeout_on_write = isinstance(error, WRITE_TIMEOUT_TRANSPORT)
@@ -2632,7 +2675,7 @@ async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name
         clients = resources.clients if resources is not None and CONFIG.get("upstream_keepalive") else None
         async with open_backend_stream(url, headers, body, read_timeout=timeout, on_retry=retry,
                                        retry_write_timeout=bool(CONFIG.get("retry_write_timeout")),
-                                       clients=clients) as response:
+                                       clients=clients, headers_for_attempt=attempt_headers) as response:
             opened = True
             observe_attempt("upstream_http", status_code=response.status_code,
                             duration_ms=(time.monotonic() - started) * 1000)
@@ -3092,13 +3135,14 @@ async def create_response(request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
+    await run_in_threadpool(_bind_request_session, payload, chat_body)
     chat_body, projection_stats = project_responses_chat_body(
         chat_body, keep_tool_metadata=CONFIG.get("keep_tool_metadata", False))
     chat_body = await run_in_threadpool(_prepare_chat_body, chat_body)
 
     client_wants_stream = _client_wants_stream(payload)
     model_name = payload.get("model", "auto")
-    rid = os.urandom(4).hex()
+    rid = _request_id()
     _log(f"[{rid}] ▶ RESPONSES {model_name} | stream={client_wants_stream} | input_items={len(payload.get('input', []))}")
     _log(
         f"[{rid}] ── RESPONSES PROJECTION ── "
@@ -3212,10 +3256,10 @@ async def create_message(request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
-    chat_body = await run_in_threadpool(_prepare_chat_body, chat_body)
+    chat_body = await run_in_threadpool(_prepare_chat_body, chat_body, session_payload=payload)
     model_name = payload.get("model", "auto")
     chat_messages = chat_body.get("messages", [])
-    rid = os.urandom(4).hex()
+    rid = _request_id()
     _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
     # Keep blocking credential selection and refresh off the event loop.
     prepared = chat_body        # Preserve canonical input for routing policy checks.
@@ -3440,6 +3484,9 @@ def main():
     ap.add_argument("--upstream-keepalive", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_UPSTREAM_KEEPALIVE", "false"),
                     help="按上游入口复用有界连接池，默认 false；重启生效，不改变超时或重放规则")
+    ap.add_argument("--request-context-mode", choices=("legacy", "scoped"),
+                    default=os.environ.get("CODEBUDDY2API_REQUEST_CONTEXT_MODE", "legacy"),
+                    help="请求上下文：legacy 保持旧会话头，scoped 启用显式会话与逐尝试追踪；默认 legacy")
     ap.add_argument("--log-body-limit", type=_nonnegative_int, metavar="BYTES",
                     default=os.environ.get("CODEBUDDY2API_LOG_BODY_LIMIT", "65536"),
                     help="每条正文日志的预览字节上限，默认 64 KiB；0 只记录摘要")
@@ -3469,7 +3516,8 @@ def main():
 
     for key in ("max_images", "image_policy", "max_request_bytes", "log_body_limit",
                 "tool_call_max_retry", "max_inbound_bytes", "max_collect_bytes", "max_concurrent",
-                "failover_max", "retry_write_timeout", "upstream_keepalive", "max_inflight_per_account"):
+                "failover_max", "retry_write_timeout", "upstream_keepalive", "max_inflight_per_account",
+                "request_context_mode"):
         CONFIG[key] = getattr(args, key)
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize

@@ -104,6 +104,8 @@ def install(gateway):
     app.add_middleware(ConcurrencyLimitMiddleware, config=config)
     # Authenticate headers before consuming inference capacity or buffering request bodies.
     app.add_middleware(InferenceAuthMiddleware, config=config)
+    from .request_context import RequestContextMiddleware
+    app.add_middleware(RequestContextMiddleware, config=config)
     install_pages(app, Path(gateway.__file__).resolve().parent / "web" / "dist")
 
 

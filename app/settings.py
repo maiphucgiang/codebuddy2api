@@ -47,6 +47,8 @@ SCHEMA = {
                                 env="CODEBUDDY2API_UPSTREAM_KEEPALIVE"),
     "max_inflight_per_account": _item(0, "integer", "单账号在途上限（0 不限制）",
                                       env="CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT", minimum=0, maximum=10000),
+    "request_context_mode": _item("legacy", "string", "请求上下文模式",
+                                  env="CODEBUDDY2API_REQUEST_CONTEXT_MODE", choices=["legacy", "scoped"]),
     "audit_max_bytes": _item(256 * 1024 * 1024, "integer", "审计明细预算", minimum=1024**2, maximum=1024**4),
     "audit_retention_days": _item(30, "integer", "审计明细保留天数", minimum=1, maximum=36500),
     "audit_diagnostic_bytes": _item(8192, "integer", "失败诊断最大字节", minimum=0, maximum=8192),

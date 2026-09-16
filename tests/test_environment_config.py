@@ -118,6 +118,21 @@ class EnvironmentConfigTests(unittest.TestCase):
                 self.start(env)
 
 
+    def test_request_context_mode_precedence_and_validation(self):
+        _, items, config = self.start(saved={'request_context_mode': 'scoped'})
+        self.assertEqual(config['request_context_mode'], 'scoped')
+        self.assertEqual(items['request_context_mode']['source'], 'management')
+        _, items, config = self.start({'CODEBUDDY2API_REQUEST_CONTEXT_MODE': 'scoped'})
+        self.assertEqual(config['request_context_mode'], 'scoped')
+        self.assertTrue(items['request_context_mode']['locked'])
+        _, items, config = self.start({'CODEBUDDY2API_REQUEST_CONTEXT_MODE': 'invalid'},
+                                      cli=('--request-context-mode=legacy',), saved={'request_context_mode': 'scoped'})
+        self.assertEqual(config['request_context_mode'], 'legacy')
+        self.assertEqual(items['request_context_mode']['source'], 'cli')
+        with self.assertRaises(ValueError):
+            self.start({'CODEBUDDY2API_REQUEST_CONTEXT_MODE': 'invalid'})
+
+
     def test_example_covers_all_active_runtime_environment_names(self):
         example = (ROOT / '.env.example').read_text()
         documented = set(re.findall(r'(?m)^(?:# )?(CODEBUDDY[A-Z0-9_]+)=', example))
@@ -151,6 +166,7 @@ class EnvironmentConfigTests(unittest.TestCase):
                   'CODEBUDDY2API_MAX_CONCURRENT': '2', 'CODEBUDDY2API_TOOL_CALL_MAX_RETRY': '1',
                   'CODEBUDDY2API_FAILOVER_MAX': '1', 'CODEBUDDY2API_RETRY_WRITE_TIMEOUT': 'true',
                   'CODEBUDDY2API_UPSTREAM_KEEPALIVE': 'true', 'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT': '2',
+                  'CODEBUDDY2API_REQUEST_CONTEXT_MODE': 'scoped',
                   'CODEBUDDY2API_KEEP_TOOL_METADATA': 'false', 'CODEBUDDY_IMPORT_DIR': '/data/auth/incoming'}
         service = self.compose(values)
         port = service['ports'][0]
@@ -164,7 +180,8 @@ class EnvironmentConfigTests(unittest.TestCase):
     def test_compose_unset_optional_settings_do_not_override_webui(self):
         service = self.compose({})
         for name in ('CODEBUDDY2API_KEEP_TOOL_METADATA', 'CODEBUDDY2API_FAILOVER_MAX', 'CODEBUDDY2API_RETRY_WRITE_TIMEOUT',
-                     'CODEBUDDY2API_UPSTREAM_KEEPALIVE', 'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT'):
+                     'CODEBUDDY2API_UPSTREAM_KEEPALIVE', 'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT',
+                     'CODEBUDDY2API_REQUEST_CONTEXT_MODE'):
             self.assertIsNone(service['environment'].get(name))
         self.assertEqual(service['ports'][0]['host_ip'], '127.0.0.1')
         self.assertEqual(service['environment']['CODEBUDDY_IMPORT_DIR'], '/data/auth/imports')

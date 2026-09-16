@@ -8,10 +8,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import time
-import uuid
 from typing import Any
 
 from app.audit_store import AuditStore, METRICS, number, safe_attempt, safe_label
+from app.request_context import current_context, ensure_context
 
 _PATHS = {"/v1/chat/completions": "chat", "/v1/responses": "responses", "/v1/messages": "messages"}
 _PARSE_LIMIT = 16384
@@ -148,8 +148,17 @@ def observe_usage(usage):
 
 def observe_attempt(stage, **safe_metadata):
     observation = _current.get()
-    if observation is not None and len(observation.attempts) < 32:
-        observation.attempts.append(safe_attempt({**safe_metadata, "stage": stage}))
+    if observation is not None:
+        context = current_context()
+        metadata = context.attempt_metadata() if context is not None else {}
+        entry = safe_attempt({**metadata, **safe_metadata, "stage": stage})
+        if len(observation.attempts) < 32:
+            observation.attempts.append(entry)
+        else:
+            # Reserve the last slot for a bounded overflow marker, not an unbounded trace.
+            previous = observation.attempts[-1]
+            dropped = previous.get("dropped", 0) + 1 if previous.get("stage") == "attempts_truncated" else 2
+            observation.attempts[-1] = safe_attempt({"stage": "attempts_truncated", "dropped": dropped})
 
 
 def observe_failure(code):
@@ -177,8 +186,7 @@ def observe_recovery(through=None):
     code = observation.record.get("error_code") or "upstream_error"
     observation.failed = False
     observation.record["error_code"] = None
-    if len(observation.attempts) < 32:
-        observation.attempts.append(safe_attempt({"stage": "failover_recovered", "code": code}))
+    observe_attempt("failover_recovered", code=code)
 
 
 class _Parser:
@@ -265,6 +273,7 @@ class _Parser:
 class AuditMiddleware:
     def __init__(self, app, config):
         self.app = app
+        self.config = config
         if isinstance(config, AuditStore) or callable(getattr(config, "record_request", None)):
             self.store = config
         elif isinstance(config, dict):
@@ -301,7 +310,7 @@ class AuditMiddleware:
             await self.app(scope, receive, send)
             return
         started, monotonic_start = time.time(), time.monotonic()
-        observation = _Observation({"id": uuid.uuid4().hex, "epoch": -1,
+        observation = _Observation({"id": ensure_context(scope, self.config).request_id, "epoch": -1,
                                     "detail_generation": -1, "started_at": started,
                                     "protocol": _PATHS[scope["path"]],
                                     **{key: None for key in METRICS}}, monotonic_start)

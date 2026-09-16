@@ -47,11 +47,13 @@ def safe_attempt(value: Any) -> dict:
         return {}
     result = {}
     for key in ("stage", "code", "error_code", "model", "upstream_model", "profile",
-                "credential", "usage_source", "outcome", "consent_source", "agreement_revision", "conversation_id", "request_id"):
+                "credential", "usage_source", "outcome", "consent_source", "agreement_revision", "conversation_id", "request_id",
+                "attempt_id", "upstream_request_id", "session_source"):
         clean = safe_label(value.get(key))
         if clean is not None:
             result[key] = clean
-    for key in ("status_code", "duration_ms", "attempt", "retry_after", "max_attempts", "total_tokens"):
+    for key in ("status_code", "duration_ms", "attempt", "retry_after", "max_attempts", "total_tokens",
+                "attempt_index", "dropped"):
         clean = number(value.get(key))
         if clean is not None:
             result[key] = clean
