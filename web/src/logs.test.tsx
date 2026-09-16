@@ -120,3 +120,26 @@ describe("log detail request lifetime", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 });
+
+it("shows the persisted daily Buddy warning from event details", () => {
+  vi.mocked(useResource).mockReturnValue({
+    data: {
+      items: [
+        {
+          id: "buddy-warning",
+          action: "buddy.attention_required",
+          kind: "runtime",
+          details: { outcome: "warning", stage: "buddy_tasks" },
+        },
+      ],
+      has_more: false,
+      next_cursor: null,
+    },
+    loading: false,
+    error: null,
+    reload: vi.fn(),
+  });
+  render(<Logs />);
+  fireEvent.click(screen.getByRole("tab", { name: "运行事件" }));
+  expect(screen.getByText("警告")).toBeTruthy();
+});

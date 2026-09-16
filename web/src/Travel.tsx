@@ -31,6 +31,18 @@ export function TravelSummary({ trip }: { trip: Record<string, unknown> | null }
       {trip.claimed === true && trip.claimed_credit == null && (
         <small>领取已确认，积分数额未返回</small>
       )}
+      {trip.buddy_consent_accepted === true && <small>首领同意已保存，无需重复确认</small>}
+      {trip.buddy_task_chat_sent === true && <small>新手对话已尝试，不自动重复发送</small>}
+      {trip.buddy_task_completed === true && <small>官方新手任务已确认完成</small>}
+      {trip.buddy_claimed === true && <small>猫猫已领取</small>}
+      {trip.agreement_accepted === true && <small>官方协议已确认</small>}
+      {trip.auto_accept_buddy === true && <small>首次领猫预授权：已开启</small>}
+      {typeof trip.retry_at === "number" && Number.isFinite(trip.retry_at) && (
+        <small>
+          首领退避至：
+          <DataValue name="retry_at" value={trip.retry_at} />
+        </small>
+      )}
       {typeof trip.phase === "string" && (
         <small>
           阶段：

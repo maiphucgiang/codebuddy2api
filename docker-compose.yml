@@ -15,6 +15,8 @@ services:
     environment:
       CODEBUDDY2API_KEY: ${CODEBUDDY2API_KEY:-}
       CODEBUDDY2API_ADMIN_CSRF: ${CODEBUDDY2API_ADMIN_CSRF:-true}
+      # First-Buddy onboarding may send one bounded real WorkBuddy conversation per account.
+      CODEBUDDY2API_AUTO_ACCEPT_BUDDY: ${CODEBUDDY2API_AUTO_ACCEPT_BUDDY:-false}
       # Unset variables remain configurable through the WebUI.
       CODEBUDDY2API_KEEP_TOOL_METADATA:
       CODEBUDDY2API_MAX_IMAGES: ${CODEBUDDY2API_MAX_IMAGES:-16}

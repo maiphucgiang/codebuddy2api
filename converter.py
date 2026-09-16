@@ -48,7 +48,7 @@ from app.adapters.anthropic_adapter import (
 
 from app import auth_oauth
 from app import trial_rewards
-from app import checkin as checkin_service, model_policy, travel
+from app import buddy, checkin as checkin_service, model_policy, travel
 from app.model_blocks import ModelBlocks
 from app.client_hangup import ClientHungUp, await_or_hangup
 from app.observability import (AuditMiddleware, observe_recovery, observe_route,
@@ -1073,6 +1073,38 @@ def _sync_error(pool, ledger, entry, generation, phase, error):
     _log(f"[{phase}] {Path(entry['id']).name} 同步失败（保留旧数据）: {message}")
 
 
+def _buddy_context(entry, headers, consent_revision=None):
+    def select_model(requested=None):
+        from app.audit_store import safe_label
+        pool = CONFIG.get("cred_pool")
+        account = (CONFIG.get("account_catalogs") or {}).get(entry.get("account_key")) or {}
+        if pool is None or entry.get("profile") != "cn-work" or account.get("profile") != "cn-work":
+            return None
+        with pool._lock:
+            current = next((item for item in pool._entries if item["cm"] is entry["cm"]
+                            and item.get("account_key") == entry.get("account_key")), None)
+            if current is None or not pool._healthy(current):
+                return None
+            candidates = []
+            for item in _usable_models(_account_scope(account, "serves")):
+                model = item["id"]
+                rate = _multiplier_value(item.get("credits"))
+                if (not safe_label(model) or model in {".", ".."} or requested and model != requested
+                        or rate is None or not 0 <= rate < float("inf") or "custom" in (item.get("tags") or [])):
+                    continue
+                rule = model_policy.rule_for(CONFIG, model)
+                if (rule["upstream_id"] != model or not pool._eligible(current, model, profile="cn-work", rule=rule)
+                        or not pool._model_healthy(current, model) or not pool._model_servable(current, model)):
+                    continue
+                name = item.get("name")
+                candidates.append((rate, model, name if isinstance(name, str) and len(name) <= 160 else model))
+            if not candidates:
+                return None
+            _, model, name = min(candidates)
+            return {"id": model, "name": name}
+    return buddy.context(CONFIG, entry, consent_revision, headers=headers, task_model=select_model)
+
+
 def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=None):
     if not model_policy.credential_enabled(CONFIG, entry):
         return None
@@ -1120,10 +1152,12 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                 def can_travel():
                     return (model_policy.credential_auto_travel(CONFIG, entry)
                             and pool.apply_if_current(cm, generation, lambda: None))
-                trip = travel.perform(token, profile_for_headers(headers), can_write=can_travel)
+                trip = travel.perform(token, profile_for_headers(headers), can_write=can_travel,
+                                      buddy_context=_buddy_context(entry, headers))
                 if not pool.apply_if_current(cm, generation, lambda: travel.remember(ledger, cid, trip)):
                     failed.add(cid)
                     return None
+                buddy.daily_warning(CONFIG, entry.get("account_key"), entry.get("profile"), trip)
             except Exception as error:
                 _sync_error(pool, ledger, entry, generation, "travel", error)
         if not model_policy.credential_enabled(CONFIG, entry):
@@ -1768,9 +1802,9 @@ def admin_checkin(authorization: Optional[str] = Header(default=None),
     return _admin_credential_action("checkin")
 
 
-def _admin_credential_action(action, identity=None):
+def _admin_credential_action(action, identity=None, *, consent_revision=None):
     from app.credential_actions import run
-    return run(sys.modules[__name__], action, identity)
+    return run(sys.modules[__name__], action, identity, consent_revision=consent_revision)
 
 
 @app.post("/admin/sync")
@@ -1781,11 +1815,20 @@ def admin_sync(authorization: Optional[str] = Header(default=None),
 
 
 @app.post("/admin/credentials/{identity}/{action}")
-def admin_credential_action(identity: str, action: str,
-                            authorization: Optional[str] = Header(default=None),
-                            x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+async def admin_credential_action(identity: str, action: str, request: Request,
+                                 authorization: Optional[str] = Header(default=None),
+                                 x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     _check_admin_auth(authorization, x_api_key)
-    return _admin_credential_action(action, identity)
+    from app.admin_api import _body
+    try:
+        body = await _body(request, 4096, allow_empty=True)
+        if body and (action != "travel" or set(body) != {"confirm_buddy", "agreement_revision"}
+                     or body["confirm_buddy"] is not True or not isinstance(body["agreement_revision"], str)):
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(400, "首领确认参数无效") from None
+    return await run_in_threadpool(_admin_credential_action, action, identity,
+                                  consent_revision=body.get("agreement_revision"))
 
 
 # ---------------------------------------------------------------------------

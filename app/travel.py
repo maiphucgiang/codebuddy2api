@@ -5,15 +5,19 @@ import time
 
 import httpx
 
+from . import buddy
+
 HOST = "https://www.workbuddy.cn"
 PREFIX = "/activity/growth/buddy/travel/"
 TIMEOUT = 12.0
 
 
 class _Failure(ValueError):
-    def __init__(self, kind, http_status=200, code=0):
+    def __init__(self, kind, http_status=200, code=0, reason=None):
         super().__init__("Travel response was not confirmed")
         self.diagnostics = {"error_kind": kind, "http_status": http_status, "code": code}
+        if reason:
+            self.diagnostics["reason"] = reason
 
 
 def supported(profile):
@@ -51,12 +55,17 @@ def _request(client, token, operation, *, body=None):
         raise _Failure("protocol" if status == 200 else "http", status, None) from None
     code = payload.get("code") if isinstance(payload, dict) else None
     code = code if type(code) is int and -(2**31) <= code < 2**31 else None
+    message = payload.get("msg", "") if isinstance(payload, dict) else ""
+    reason = next((value for text, value in {
+        "no active buddy": "no_active_buddy", "daily limit": "daily_limit",
+        "already traveling": "already_traveling", "location not available": "location_unavailable",
+    }.items() if isinstance(message, str) and len(message) <= 512 and text in message.lower()), None)
     if status != 200:
-        raise _Failure("http", status, code)
+        raise _Failure("http", status, code, reason)
     if code is None:
         raise _Failure("protocol", status, None)
     if code != 0:
-        raise _Failure("business", status, code)
+        raise _Failure("business", status, code, reason)
     data = payload.get("data")
     # A successful claim may have no business data; reads still require a valid object.
     if data is None and operation in {"claim", "depart"}:
@@ -96,14 +105,25 @@ def _status(data):
             "server_now": server_now, "remaining_seconds": remaining}
 
 
-def perform(token, profile, *, read_only=False, can_write=lambda: True):
+def perform(token, profile, *, read_only=False, can_write=lambda: True, buddy_context=None):
     if not supported(profile):
         return unavailable()
     result = {"ok": False, "state": "unknown", "claimed": False, "departed": False, "stale": False, "phase": "status"}
     phase = "status"
     if not read_only and not can_write():
         return {**result, "skipped": True, "message": "设置或凭证已变化，未执行旅行操作"}
+    if not read_only and buddy_context and buddy_context.get("consent_revision") is not None:
+        accepted = buddy.accept_consent(buddy_context, can_write)
+        result.update(accepted)
+        if not accepted["buddy_consent_accepted"]:
+            return result
     try:
+        def record_departure(stage, outcome):
+            if not result.get("buddy_claimed"):
+                return True
+            context = buddy_context or {}
+            return buddy.audit_event(context.get("audit"), context.get("identity"), profile, stage, outcome,
+                                     result.get("consent_source"))
         with httpx.Client(follow_redirects=False) as client:
             result.update(_status(_request(client, token, "status")))
             if read_only:
@@ -134,6 +154,22 @@ def perform(token, profile, *, read_only=False, can_write=lambda: True):
             if not can_write():
                 result.update(skipped=True, message=prefix + "设置或凭证已变化，未发送派遣请求")
                 return result
+            prepared = buddy.prepare(client, token, can_write=can_write, context=buddy_context)
+            phase = prepared["phase"]
+            result.update(prepared)
+            if not prepared["buddy_ready"]:
+                result["message"] = prefix + prepared["message"]
+                return result
+            if prepared.get("buddy_claimed"):
+                phase = "buddy_verify"
+                result.update(_status(_request(client, token, "status")))
+                if result["state"] != "idle" or result["daily_limit_reached"] is not False:
+                    result.update(ok=result["state"] != "idle" or result["daily_limit_reached"] is True,
+                                  skipped=True, message="猫猫已领取，旅行状态已变化，请先查询核验")
+                    return result
+            if not can_write():
+                result.update(skipped=True, message=prefix + "设置或凭证已变化，未发送派遣请求")
+                return result
             phase = "config"
             locations = _locations(_request(client, token, "config"))
             location_id = random.choice(tuple(locations))
@@ -141,11 +177,22 @@ def perform(token, profile, *, read_only=False, can_write=lambda: True):
                 result.update(skipped=True, message=prefix + "设置或凭证已变化，未发送派遣请求")
                 return result
             phase = "depart"
+            if not record_departure("departure_requested", "pending"):
+                result.update(buddy_blocked=True, reason="buddy_storage_error",
+                              message="猫猫已领取，但派遣审计无法保存，未发送派遣请求")
+                return result
+            if result.get("buddy_claimed") and not can_write():
+                result.update(skipped=True, message="猫猫已领取，但设置或凭证已变化，未发送派遣请求")
+                return result
             receipt = _request(client, token, "depart", body={"location_id": location_id})
             # The action is confirmed, but its current state requires a fresh read.
             result.update(departed=True, state="unknown", stale=True, daily_limit_reached=None,
                           location_id=location_id, location_name=locations[location_id], reward_credit=None,
                           arrive_at=_number(receipt.get("arrive_at")), server_now=None, remaining_seconds=None)
+            if not record_departure("departure", "success"):
+                result.update(buddy_blocked=True, reason="buddy_storage_error",
+                              message="派遣已确认，但审计无法保存，请查询最新状态，勿重复派遣")
+                return result
             phase = "after_depart"
             result.update(_status(_request(client, token, "status")))
             if result["state"] == "idle":
@@ -157,15 +204,24 @@ def perform(token, profile, *, read_only=False, can_write=lambda: True):
                 "Buddy 已到达，待领取" if result["state"] == "arrived" else "Buddy 已派出，余额可另行同步"))
             return result
     except (httpx.HTTPError, ValueError, TypeError) as error:
+        if result.get("buddy_claimed") and phase in {"depart", "after_depart"}:
+            record_departure("departure_failed", "error")
         messages = {"status": "旅行状态查询失败，未执行写操作", "claim": "领取结果未确认，未派出；下次先查询状态",
                     "after_claim": "领取已确认，后续状态查询失败，未派出",
+                    "buddy_verify": "猫猫已领取，后续旅行状态查询失败，未派遣",
                     "config": ("旅行积分已领取；" if result["claimed"] else "") + "地点配置查询失败，未派出",
                     "depart": ("旅行积分已领取；" if result["claimed"] else "") + "派遣结果未确认；下次先查询状态",
                     "after_depart": ("旅行积分已领取；" if result["claimed"] else "") + "派遣已确认，后续状态查询失败；勿重复派出"}
         diagnostics = error.diagnostics if isinstance(error, _Failure) else {
             "error_kind": "timeout" if isinstance(error, httpx.TimeoutException) else "network"
             if isinstance(error, httpx.HTTPError) else "protocol", "http_status": None, "code": None}
-        result.update(ok=False, stale=True, message=messages[phase], **diagnostics)
+        result.update(ok=False, stale=True, message=messages.get(phase, "猫猫准备状态未确认，未派遣"), **diagnostics)
+        refusal = {"no_active_buddy": "官方拒绝派遣：没有当前可用猫猫，请先领取或选择 Buddy",
+                   "daily_limit": "官方拒绝派遣：今日派遣已达上限",
+                   "already_traveling": "官方拒绝派遣：猫猫已在旅行，请查询最新状态",
+                   "location_unavailable": "官方拒绝派遣：该地点暂时不可用"}.get(result.get("reason"))
+        if phase == "depart" and refusal:
+            result["message"] = ("旅行积分已领取；" if result["claimed"] else "") + refusal
         return result
     finally:
         result["phase"] = phase

@@ -219,50 +219,58 @@ export function Logs() {
                   </tr>
                 </thead>
                 <tbody>
-                  {resource.data.items.map((item, i) => (
-                    <tr key={text(item.id) + i}>
-                      <td>
-                        {typeof item.started_at === "number"
-                          ? new Date(item.started_at * 1000).toLocaleString("zh-CN")
-                          : text(item.started_at)}
-                        <small className={s.mono}>{text(item.id)}</small>
-                      </td>
-                      <td>
-                        <strong>{text(kind === "request" ? item.model : item.action)}</strong>
-                        <small>{text(kind === "request" ? item.profile : item.kind)}</small>
-                      </td>
-                      <td>
-                        <Badge
-                          tone={
-                            item.outcome === "success"
-                              ? "good"
-                              : item.outcome === "error"
-                                ? "bad"
-                                : "neutral"
-                          }
-                        >
-                          {text(item.outcome ?? item.level ?? item.status)}
-                        </Badge>
-                        {item.status_code !== undefined && (
-                          <small>HTTP {text(item.status_code)}</small>
+                  {resource.data.items.map((item, i) => {
+                    const outcome =
+                      kind === "request" ? item.outcome : object(item.details ?? {}).outcome;
+                    return (
+                      <tr key={text(item.id) + i}>
+                        <td>
+                          {typeof item.started_at === "number"
+                            ? new Date(item.started_at * 1000).toLocaleString("zh-CN")
+                            : text(item.started_at)}
+                          <small className={s.mono}>{text(item.id)}</small>
+                        </td>
+                        <td>
+                          <strong>{text(kind === "request" ? item.model : item.action)}</strong>
+                          <small>{text(kind === "request" ? item.profile : item.kind)}</small>
+                        </td>
+                        <td>
+                          <Badge
+                            tone={
+                              outcome === "success"
+                                ? "good"
+                                : outcome === "error"
+                                  ? "bad"
+                                  : outcome === "warning"
+                                    ? "warn"
+                                    : "neutral"
+                            }
+                          >
+                            {outcome === "warning"
+                              ? "警告"
+                              : text(outcome ?? item.level ?? item.status)}
+                          </Badge>
+                          {item.status_code !== undefined && (
+                            <small>HTTP {text(item.status_code)}</small>
+                          )}
+                        </td>
+                        {kind === "request" && (
+                          <>
+                            <td>{metric(item.duration_ms)} ms</td>
+                            <td>
+                              {metric(item.total_tokens)}
+                              <small>{metric(item.credit)} Credit</small>
+                            </td>
+                          </>
                         )}
-                      </td>
-                      {kind === "request" && (
-                        <>
-                          <td>{metric(item.duration_ms)} ms</td>
-                          <td>
-                            {metric(item.total_tokens)}
-                            <small>{metric(item.credit)} Credit</small>
-                          </td>
-                        </>
-                      )}
-                      <td>
-                        <button disabled={detailLoading} onClick={() => openDetail(item)}>
-                          查看详情
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                        <td>
+                          <button disabled={detailLoading} onClick={() => openDetail(item)}>
+                            查看详情
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

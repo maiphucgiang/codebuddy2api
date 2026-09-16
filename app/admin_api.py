@@ -25,12 +25,14 @@ MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 CLEAR_CONFIRMATION = "清空全部日志与统计"
 
 
-async def _body(request, maximum=65536):
+async def _body(request, maximum=65536, *, allow_empty=False):
     data = bytearray()
     async for chunk in request.stream():
         data.extend(chunk)
         if len(data) > maximum:
             raise ValueError("请求体超过大小限制")
+    if allow_empty and not data:
+        return {}
     try:
         value = json.loads(data)
     except (ValueError, UnicodeError, RecursionError):
@@ -97,6 +99,9 @@ def install_admin(app, config, gateway):
             if type(value) in (int, float):
                 items.append({"key": name.lower(), "value": value, "stored": None, "source": "internal",
                               "mode": "readonly", "type": "number", "label": label, "locked": True})
+        items.append({"key": "auto_accept_buddy", "value": config.get("auto_accept_buddy") is True,
+                      "stored": None, "source": config.get("auto_accept_buddy_source", "default"),
+                      "mode": "startup", "type": "boolean", "label": "全部国内账号首次领猫预授权", "locked": True})
         return {"revision": control.snapshot()["revision"], "items": items, "audit": audit.storage()}
 
     def audit_settings(values):

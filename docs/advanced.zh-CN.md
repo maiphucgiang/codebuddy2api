@@ -39,6 +39,12 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 
 环境变量包括 `CODEBUDDY_AUTH_DIR`、`CODEBUDDY_IMPORT_DIR`、`CODEBUDDY2API_KEY`、`CODEBUDDY2API_ADMIN_CSRF`、`CODEBUDDY2API_KEEP_TOOL_METADATA`、`CODEBUDDY2API_LOG`，以及 `CODEBUDDY2API_MAX_IMAGES`、`CODEBUDDY2API_IMAGE_POLICY`、`CODEBUDDY2API_MAX_REQUEST_BYTES`、`CODEBUDDY2API_LOG_BODY_LIMIT`、`CODEBUDDY2API_FAILOVER_MAX`、`CODEBUDDY2API_RETRY_WRITE_TIMEOUT`。启动示例见 [部署指南](deployment.zh-CN.md)。
 
+`CODEBUDDY2API_AUTO_ACCEPT_BUDDY` 仅启动读取，默认 `false`；预授权已启用国内账号完成首次领猫任务、协议及旅行，自动旅行仍受账号开关控制。`first_buddy` 无需单独接取，包含 `not_accepted` 在内的待完成状态可直接发起一次本账号的真实国内 WorkBuddy 对话；优先可用零倍率模型，否则取最低已知倍率，最多请求 32 个输出 token，可能消耗少量积分。不执行其他奖励任务、不付费开盒、不切猫、不领取国际试用积分。
+
+手动 `POST /admin/credentials/{id}/travel` 返回 `buddy_confirmation`，包含官方条款与独立的 `authorization` 自动化范围。勾选后提交 `{"confirm_buddy":true,"agreement_revision":"<返回的版本>"}`；旧版仅领猫授权失效。`can_claim` 仅表示资格，不禁用同意。
+
+`control.sqlite3` 保留同意及每账号最多一次新手对话尝试，重启不重复；旧接取记录不阻塞尚未发送的对话。仅官方任务 `completed` 才继续领猫；不确定时自动维护只回查，不重发可能扣费的对话。缺少可用模型或存储异常时停止写入；升级保留该数据库，旅行状态与余额同步不触发任务。
+
 体验积分仅供符合官方资格的 `intl-work` 账号手动领取：使用凭证行的领取抽屉或 `POST /admin/credentials/{id}/trial`。启动、定时维护、余额同步均不领取。结果显示安全错误类别、HTTP 状态／业务码及重试时间，响应正文限制为 64 KiB 且不返回浏览器。成功或已领取记录保存在 `auth/trial-ledger.json`，失败至少等待 24 小时才能再次手动申请；升级时保留该文件。
 
 `CODEBUDDY2API_AUTO_TRIAL` 和 `--auto-trial` 已停用：旧启动选项仅提示、不触发任务；控制库中的旧布尔 `auto_trial` 设置在加载时忽略。请从部署配置中移除；回滚旧代码前也须核对这些旧设置，避免重新启用自动领取。

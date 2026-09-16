@@ -32,6 +32,7 @@ class TravelTests(unittest.TestCase):
             return httpx.Response(status, json=body)
         client = httpx.Client(transport=httpx.MockTransport(handle), follow_redirects=False)
         with patch('app.travel.httpx.Client', return_value=client), \
+             patch('app.travel.buddy.prepare', return_value={'buddy_ready': True, 'phase': 'buddy_info'}), \
              patch('app.travel.random.choice', side_effect=lambda choices: choices[0]):
             result = travel.perform('synthetic-token', profile, **kwargs)
         return result, requests
@@ -280,7 +281,7 @@ class TravelTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
     def test_setting_or_lease_change_during_config_stops_dispatch(self):
-        decisions = iter([True, True, False])
+        decisions = iter([True, True, True, False])
         result, calls = self.run_trip([IDLE, CONFIG], can_write=lambda: next(decisions))
         self.assertFalse(result['departed'])
         self.assertTrue(result['skipped'])

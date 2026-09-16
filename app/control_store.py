@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sqlite3
 import threading
+import time
+import uuid
 
 from .settings import validate_settings
 from .audit_store import _secure_path, safe_label
@@ -84,6 +86,18 @@ class ControlStore:
             elif version != self.SCHEMA_VERSION:
                 raise ValueError("管理数据库 schema 不受支持或已有库为空，未执行初始化")
             self._snapshot = self._load()
+            self._db.execute("CREATE TABLE IF NOT EXISTS buddy_bootstrap ("
+                             "account_key TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, attempted_at REAL NOT NULL, "
+                             "retry_at REAL NOT NULL, stage TEXT NOT NULL, outcome TEXT NOT NULL, "
+                             "consent_source TEXT NOT NULL, agreement_revision TEXT NOT NULL, "
+                             "agreed INTEGER NOT NULL DEFAULT 0, claimed INTEGER NOT NULL DEFAULT 0)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS buddy_consents ("
+                             "account_key TEXT PRIMARY KEY, agreement_revision TEXT NOT NULL, accepted_at REAL NOT NULL)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS buddy_tasks ("
+                             "account_key TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, request_id TEXT NOT NULL, "
+                             "accept_started INTEGER NOT NULL DEFAULT 0, chat_started INTEGER NOT NULL DEFAULT 0, "
+                             "completed INTEGER NOT NULL DEFAULT 0, model TEXT, chat_state TEXT NOT NULL DEFAULT 'pending', "
+                             "total_tokens INTEGER, updated_at REAL NOT NULL)")
             self._db.execute("COMMIT")
         except Exception:
             if self._db.in_transaction:
@@ -177,6 +191,120 @@ class ControlStore:
             raise ValueError("auto_travel 必须为布尔值")
         return self._update(None, lambda state: state["credentials"].setdefault(
             account_key, {"enabled": True}).update(auto_travel=enabled))
+
+    def has_buddy_consent(self, identity, revision):
+        _identifier(identity, "账号指纹")
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM buddy_consents WHERE account_key=? AND agreement_revision=?",
+                                    (identity, revision)).fetchone() is not None
+
+    def save_buddy_consent(self, identity, revision):
+        _identifier(identity, "账号指纹")
+        _identifier(revision, "协议版本")
+        with self._lock:
+            self._db.execute("INSERT INTO buddy_consents VALUES(?,?,?) ON CONFLICT(account_key) DO UPDATE SET "
+                             "agreement_revision=excluded.agreement_revision, accepted_at=excluded.accepted_at",
+                             (identity, revision, time.time()))
+
+
+    def buddy_record(self, identity):
+        _identifier(identity, "账号指纹")
+        with self._lock:
+            cursor = self._db.execute("SELECT * FROM buddy_bootstrap WHERE account_key=?", (identity,))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def reserve_buddy(self, identity, source, revision, *, retry_seconds, now=None):
+        """Reserve first-claim writes across processes without changing configuration revisions."""
+        _identifier(identity, "账号指纹")
+        _identifier(revision, "协议版本")
+        if source not in {"manual", "environment"}:
+            raise ValueError("确认来源无效")
+        now = time.time() if now is None else now
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                previous = self.buddy_record(identity)
+                if previous and (previous["claimed"] or previous["retry_at"] > now):
+                    self._db.execute("COMMIT")
+                    return None
+                attempt = uuid.uuid4().hex
+                self._db.execute(
+                    "INSERT INTO buddy_bootstrap VALUES(?,?,?,?,?,?,?,?,0,0) "
+                    "ON CONFLICT(account_key) DO UPDATE SET attempt_id=excluded.attempt_id, "
+                    "attempted_at=excluded.attempted_at, retry_at=excluded.retry_at, stage=excluded.stage, "
+                    "outcome=excluded.outcome, consent_source=excluded.consent_source, "
+                    "agreement_revision=excluded.agreement_revision, agreed=0, claimed=0",
+                    (identity, attempt, now, now + retry_seconds, "reserved", "pending", source, revision))
+                self._db.execute("COMMIT")
+                return attempt
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def buddy_checkpoint(self, identity, attempt, stage, outcome, *, agreed=False, claimed=False):
+        _identifier(stage, "首领阶段")
+        if outcome not in {"pending", "uncertain", "success"}:
+            raise ValueError("首领结果无效")
+        with self._lock:
+            updated = self._db.execute(
+                "UPDATE buddy_bootstrap SET stage=?, outcome=?, agreed=MAX(agreed,?), claimed=MAX(claimed,?) "
+                "WHERE account_key=? AND attempt_id=?",
+                (stage, outcome, int(agreed), int(claimed), identity, attempt))
+            if updated.rowcount != 1:
+                raise ValueError("首领预留已变化")
+
+    def buddy_task_record(self, identity):
+        _identifier(identity, "账号指纹")
+        with self._lock:
+            cursor = self._db.execute("SELECT * FROM buddy_tasks WHERE account_key=?", (identity,))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def reserve_buddy_task(self, identity, operation, *, model=None):
+        """Reserve at most one acceptance and one billable conversation per account across restarts."""
+        _identifier(identity, "账号指纹")
+        if operation not in {"accept", "chat"}:
+            raise ValueError("新手任务操作无效")
+        if operation == "chat":
+            _identifier(model, "模型")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._db.execute("INSERT OR IGNORE INTO buddy_tasks "
+                                 "(account_key,conversation_id,request_id,updated_at) VALUES(?,?,?,?)",
+                                 (identity, str(uuid.uuid4()), uuid.uuid4().hex, time.time()))
+                previous = self.buddy_task_record(identity)
+                if previous[operation + "_started"] or previous["completed"] or (operation == "accept" and previous["chat_started"]):
+                    self._db.execute("COMMIT")
+                    return None
+                if operation == "accept":
+                    self._db.execute("UPDATE buddy_tasks SET accept_started=1,updated_at=? WHERE account_key=?",
+                                     (time.time(), identity))
+                else:
+                    self._db.execute("UPDATE buddy_tasks SET chat_started=1,model=?,updated_at=? WHERE account_key=?",
+                                     (model, time.time(), identity))
+                record = self.buddy_task_record(identity)
+                self._db.execute("COMMIT")
+                return record
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def buddy_task_checkpoint(self, identity, *, completed=False, chat_state=None, total_tokens=None):
+        _identifier(identity, "账号指纹")
+        if chat_state not in {None, "success", "uncertain"}:
+            raise ValueError("新手对话结果无效")
+        if total_tokens is not None and (type(total_tokens) is not int or not 0 <= total_tokens <= 10**9):
+            raise ValueError("新手对话用量无效")
+        with self._lock:
+            self._db.execute("UPDATE buddy_tasks SET completed=MAX(completed,?), "
+                             "chat_state=COALESCE(?,chat_state),total_tokens=COALESCE(?,total_tokens),updated_at=? "
+                             "WHERE account_key=?",
+                             (int(completed), chat_state, total_tokens, time.time(), identity))
+
 
     def close(self):
         with self._lock:

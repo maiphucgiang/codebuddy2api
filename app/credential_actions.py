@@ -4,13 +4,15 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from . import checkin, model_policy, travel, trial_management
+from . import buddy, checkin, model_policy, travel, trial_management
 from .credential_io import credential_file_lock
 
 
-def run(gateway, action, identity=None):
+def run(gateway, action, identity=None, *, consent_revision=None):
     if action not in {"refresh", "checkin", "sync", "travel", "travel-status", "trial"} or (action in {"refresh", "travel", "travel-status", "trial"} and identity is None):
         raise HTTPException(404, "凭证操作不存在")
+    if consent_revision is not None and (action != "travel" or identity is None or consent_revision != buddy.AGREEMENT_REVISION):
+        raise HTTPException(400, "首领确认无效或协议版本已变化")
     config = gateway.CONFIG
     pool, ledger = config.get("cred_pool"), config.get("ledger")
     if pool is None or (action not in {"refresh", "trial"} and (ledger is None or gateway.credits_mod is None)):
@@ -23,8 +25,8 @@ def run(gateway, action, identity=None):
         entries = [dict(e) for e in pool.entries() if identity is None or e.get("account_key") == identity]
         if identity is not None and not entries:
             raise HTTPException(404, "凭证不存在或身份已变化")
-        if action == "trial":
-            entries = entries[:1]  # Duplicate files for one identity still represent one manual action.
+        if action in {"trial", "travel", "travel-status"}:
+            entries = entries[:1]  # One account identity represents one manual action.
         results = []
         for entry in entries:
             started = time.monotonic()
@@ -34,11 +36,12 @@ def run(gateway, action, identity=None):
                               else {"skipped": True, "message": "账号已人工停用"})
             else:
                 try:
-                    result.update(_one(gateway, pool, ledger, entry, action))
+                    result.update(_one(gateway, pool, ledger, entry, action, consent_revision=consent_revision))
                     if (action == "checkin" and result.get("state") not in {"changed", "cancelled"}
                             and model_policy.credential_auto_travel(config, entry)):
                         followup = _one(gateway, pool, ledger, entry, "travel", automatic=True)
-                        result.update(travel=followup, checkin_ok=result["ok"], ok=result["ok"] and followup["ok"],
+                        result.update(travel=followup, checkin_ok=result["ok"],
+                                      ok=result["ok"] if followup.get("buddy_blocked") else result["ok"] and followup["ok"],
                                       message=result["message"] + "；" + followup["message"])
                 except Exception:
                     # Upstream exception text may contain headers or credential file paths.
@@ -55,6 +58,12 @@ def run(gateway, action, identity=None):
                                        status_code=result.get("status"),
                                        code=str(result["code"]) if result.get("code") is not None else None,
                                        duration_ms=(time.monotonic() - started) * 1000)
+                    trip = result.get("travel") if action == "checkin" else result if action in {"travel", "travel-status"} else None
+                    if isinstance(trip, dict):
+                        details.update(outcome="success" if trip.get("ok") else "warning" if trip.get("buddy_blocked") else "error",
+                                       stage=trip.get("phase"), status_code=trip.get("http_status"),
+                                       code=trip.get("reason") or (str(trip["code"]) if trip.get("code") is not None else None),
+                                       consent_source=trip.get("consent_source"))
                     audit.event("admin", "credential." + action, details)
                 except Exception:
                     pass
@@ -66,7 +75,7 @@ def run(gateway, action, identity=None):
         gateway._HOUSEKEEP_LOCK.release()
 
 
-def _one(gateway, pool, ledger, entry, action, *, automatic=False):
+def _one(gateway, pool, ledger, entry, action, *, automatic=False, consent_revision=None):
     if action == "trial":
         return trial_management.perform(gateway, pool, entry)
     cm, cid = entry["cm"], entry["id"]
@@ -95,9 +104,12 @@ def _one(gateway, pool, ledger, entry, action, *, automatic=False):
             return ((not automatic or model_policy.credential_auto_travel(gateway.CONFIG, entry))
                     and pool.apply_if_current(cm, generation, lambda: None))
         result = travel.perform(gateway._bearer_token(headers), gateway.profile_for_headers(headers),
-                                read_only=action == "travel-status", can_write=can_write)
+                                read_only=action == "travel-status", can_write=can_write,
+                                buddy_context=gateway._buddy_context(entry, headers, consent_revision))
         if not pool.apply_if_current(cm, generation, lambda: travel.remember(ledger, cid, result)):
-            return {"ok": False, "message": "凭证已变化，旅行结果未写入，请刷新核验"}
+            return {**result, "ok": False, "stale": True, "message": "凭证已变化，旅行结果未写入，请刷新核验"}
+        if automatic:
+            buddy.daily_warning(gateway.CONFIG, entry.get("account_key"), entry.get("profile"), result)
         return result
     if action == "checkin":
         day = time.strftime("%Y-%m-%d")

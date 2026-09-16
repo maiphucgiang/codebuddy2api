@@ -27,6 +27,16 @@ const labels: Record<string, string> = {
   trial: "一次性体验积分",
   can_claim: "可手动申请",
   retry_at: "最早重试时间",
+  buddy_consent_accepted: "首领同意已保存",
+  buddy_task_chat_sent: "新手对话已尝试",
+  buddy_task_completed: "官方新手任务已完成",
+  conversation_id: "新手会话 ID",
+  buddy_claimed: "猫猫已领取",
+  agreement_accepted: "协议已确认",
+  consent_source: "授权来源",
+  agreement_revision: "协议版本",
+  auto_accept_buddy: "首次领猫预授权",
+  buddy_blocked: "领猫前置条件阻塞",
   travel: "旅行状态",
   checkin: "签到状态",
   last_success: "上次成功状态",
@@ -151,6 +161,7 @@ const statuses: Record<string, string> = {
   error: "失败",
   success: "成功",
   cancelled: "已取消",
+  warning: "警告",
   circuit_open: "认证熔断",
   expired: "已过期",
   completed: "已完成",
@@ -175,6 +186,21 @@ const travelPhases: Record<string, string> = {
   config: "地点配置",
   depart: "派遣",
   after_depart: "派遣后核验",
+  buddy_consent: "保存首领同意",
+  task_accept: "接取官方新手任务",
+  task_chat: "执行新手对话",
+  task_completed: "官方任务已完成",
+  task_failed: "新手任务结果未确认",
+  buddy_task_accept: "接取官方新手任务",
+  buddy_task_chat: "执行新手对话",
+  buddy_task_verify: "核验官方任务完成状态",
+  buddy_info: "猫猫状态",
+  buddy_list: "已领取猫猫",
+  buddy_tasks: "首领资格",
+  buddy_agreement: "协议状态",
+  buddy_agree: "协议确认",
+  buddy_first: "首次领猫",
+  buddy_verify: "领猫后核验",
 };
 const travelErrors: Record<string, string> = {
   http: "上游 HTTP 错误",
@@ -188,6 +214,7 @@ const times = new Set([
   "arrive_at",
   "server_now",
   "started_at",
+  "retry_at",
   "finished_at",
   "fetched_at",
   "updated_at",
@@ -266,13 +293,15 @@ export function DataValue({
             name,
           )
         ? ownLabel(statuses, value)
-        : name === "phase"
+        : name === "phase" || name === "stage"
           ? ownLabel(travelPhases, value)
           : name === "error_kind"
             ? ownLabel(travelErrors, value)
             : name === "state"
               ? ownLabel(travelStates, value)
-              : undefined;
+              : name === "consent_source"
+                ? ownLabel({ manual: "手动确认", environment: "环境变量预授权" }, value)
+                : undefined;
     return <span className={s.valueText}>{label ?? (value || "—")}</span>;
   }
   if (typeof value !== "object") return <span className={s.valueMuted}>未知</span>;

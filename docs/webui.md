@@ -18,6 +18,9 @@ Management is locked without a key. After changing it, sign in again and restart
   - International WorkBuddy trial credits require manual confirmation; the drawer displays the result. “Refresh claim status” only reads the local ledger and never claims. On network or persistence failure, verify status before another attempt; environment-driven automatic claims are retired.
   - Automatic check-in and travel are persisted per account and apply live: on by default for domestic accounts, off internationally. International check-in can be enabled without a code update; inactive or unconfirmed activities never authorize claims. Disabled accounts run no automatic tasks.
   - Domestic travel follows its own switch, including when check-in is already complete or disabled. “Travel status” only queries; “Claim / dispatch” claims arrivals, rechecks idle state and the daily limit, then chooses a current upstream location. Invalid location configuration stops dispatch.
+  - One agreement checkbox authorizes completing `first_buddy` through one real WorkBuddy conversation if needed, adoption and dispatch. No separate task acceptance is required. The conversation requests at most 32 output tokens and may use credits; an eligible zero-rate model is preferred. Official completion is checked before adoption, and uncertain conversations are not repeated.
+  - `CODEBUDDY2API_AUTO_ACCEPT_BUDDY=true` preauthorizes enabled domestic accounts, including future imports, after restart; default is false. Automatic follow-up respects the travel switch; no other reward tasks, paid boxes or trial claims run.
+  - Adoption consent and outcomes are audited. Blocked automatic travel adds at most one warning per account per local day, without failing check-in or balance sync; uncertain adoption waits at least 24 hours and only reconciles through reads.
   - Writes are followed by a status check and are never blindly retried. The console retains confirmed claims/dispatches when that check fails, shows the failure stage and snapshot travel time, and leaves unreturned reward amounts unknown.
   - Saving a preference does not claim immediately; it affects subsequent maintenance and cannot retract sent requests. The console shows last results, partial completion and uncertainty, retaining history on failure.
 - **Models:** add independent mappings with public/upstream IDs and local enablement. Choose either specific accounts or a region with an optional product filter; switching modes clears the opposite binding. Unavailable candidates never cause out-of-scope fallback.
@@ -46,7 +49,7 @@ Data defaults to `auth/`, or `/data/auth` inside Docker. Local installs can set 
 | File | Contents |
 |------|----------|
 | `*.info` | Official plaintext credentials; never migrated into SQLite |
-| `control.sqlite3` | Gateway settings, model rules and credential metadata |
+| `control.sqlite3` | Gateway settings, model rules, credential metadata and first-Buddy reservations |
 | `logs.sqlite3` | Request details and independent aggregate statistics |
 
 Auditing defaults to 30-day detail retention and a 256 MiB logical detail budget, **not a hard limit on database or directory disk usage**. Detail cleanup and eviction preserve aggregates. SQLite failure diagnostics have a separate budget, defaulting to 8192 bytes. Existing text logs are retained, not backfilled as precise statistics.

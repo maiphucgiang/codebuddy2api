@@ -1,9 +1,11 @@
 """Initialize management only for an explicitly started server, never at import."""
 
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
+from . import buddy
 from .admin_api import install_admin
 from .audit_store import AuditStore
 from .control_store import ControlStore
@@ -59,6 +61,8 @@ class UnavailableAudit:
 
 def initialize(gateway, args, argv=None):
     config = gateway.CONFIG
+    config["auto_accept_buddy"] = buddy.auto_accept_from_env(os.environ)
+    config["auto_accept_buddy_source"] = "environment" if "CODEBUDDY2API_AUTO_ACCEPT_BUDDY" in os.environ else "default"
     root = gateway.managed_auth_dir()
     control = ControlStore(root / "control.sqlite3")
     config["control_store"] = control

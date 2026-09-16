@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { OAuth } from "../OAuth";
 import { Trial } from "../Trial";
 import { TravelSummary } from "../Travel";
+import { Buddy, buddyConfirmation } from "../Buddy";
 import {
   api,
   credentialResponse,
@@ -105,6 +106,11 @@ export function Credentials() {
   const [detail, setDetail] = useState<Credential | null>(null);
   const [deleting, setDeleting] = useState<Credential | null>(null);
   const [trialTarget, setTrialTarget] = useState<Credential | null>(null);
+  const [buddyTarget, setBuddyTarget] = useState<{
+    credential: Credential;
+    result: Record<string, unknown>;
+    confirmation: ReturnType<typeof buddyConfirmation>;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -131,6 +137,16 @@ export function Credentials() {
           throw new Error("未收到完整操作结果，请刷新列表核验，勿直接重复执行");
         for (const r of results) if (r.travel !== undefined) object(r.travel, "旅行操作结果");
         setMaintenance(results);
+        if (action === "travel" && credential) {
+          if (results.length !== 1 || results[0].id !== credential.id)
+            throw new Error("旅行账号或结果未确认，请刷新列表核验");
+          if (results[0].buddy_confirmation !== undefined)
+            setBuddyTarget({
+              credential,
+              result: results[0],
+              confirmation: buddyConfirmation(results[0].buddy_confirmation),
+            });
+        }
       })
       .catch((err: unknown) =>
         setError(`${errorMessage(err)}；请求失败不代表后台已停止，请刷新列表核验。`),
@@ -207,35 +223,43 @@ export function Credentials() {
       {maintenance.length > 0 && (
         <Panel title="凭证操作结果">
           <ul className={s.operationResults} aria-live="polite">
-            {maintenance.map((r, i) => (
-              <li key={i}>
-                <strong>{text(r.name)}</strong>
-                <Badge tone={r.ok ? "good" : "warn"}>
-                  {r.ok
-                    ? "已完成"
-                    : r.checkin_ok === true ||
-                        r.claimed === true ||
-                        r.departed === true ||
-                        (r.travel &&
-                          typeof r.travel === "object" &&
-                          (object(r.travel).claimed === true || object(r.travel).departed === true))
-                      ? "部分完成"
-                      : r.skipped
-                        ? "已跳过"
-                        : "未完成"}
-                </Badge>
-                <span>{text(r.message)}</span>
-                <TravelSummary
-                  trip={
-                    r.travel && typeof r.travel === "object"
-                      ? object(r.travel)
-                      : r.action === "travel" || r.action === "travel-status"
-                        ? r
-                        : null
-                  }
-                />
-              </li>
-            ))}
+            {maintenance.map((r, i) => {
+              const complete =
+                r.ok === true &&
+                !(r.travel && typeof r.travel === "object" && object(r.travel).ok === false);
+              return (
+                <li key={i}>
+                  <strong>{text(r.name)}</strong>
+                  <Badge tone={complete ? "good" : "warn"}>
+                    {complete
+                      ? "已完成"
+                      : r.checkin_ok === true ||
+                          r.claimed === true ||
+                          r.departed === true ||
+                          r.buddy_claimed === true ||
+                          r.agreement_accepted === true ||
+                          (r.travel &&
+                            typeof r.travel === "object" &&
+                            (object(r.travel).claimed === true ||
+                              object(r.travel).departed === true))
+                        ? "部分完成"
+                        : r.skipped
+                          ? "已跳过"
+                          : "未完成"}
+                  </Badge>
+                  <span>{text(r.message)}</span>
+                  <TravelSummary
+                    trip={
+                      r.travel && typeof r.travel === "object"
+                        ? object(r.travel)
+                        : r.action === "travel" || r.action === "travel-status"
+                          ? r
+                          : null
+                    }
+                  />
+                </li>
+              );
+            })}
           </ul>
         </Panel>
       )}
@@ -513,6 +537,21 @@ export function Credentials() {
             <Empty title="还没有凭证">添加账号或导入 .info 文件。</Empty>
           ))}
       </Panel>
+      <DrawerPresence>
+        {buddyTarget && (
+          <Buddy
+            key={buddyTarget.credential.id}
+            credential={buddyTarget.credential}
+            initial={buddyTarget.result}
+            confirmation={buddyTarget.confirmation}
+            onClose={() => setBuddyTarget(null)}
+            onDone={(result) => {
+              setMaintenance([result]);
+              resource.reload();
+            }}
+          />
+        )}
+      </DrawerPresence>
       <DrawerPresence>
         {trialTarget && (
           <Trial

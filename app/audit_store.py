@@ -47,7 +47,7 @@ def safe_attempt(value: Any) -> dict:
         return {}
     result = {}
     for key in ("stage", "code", "error_code", "model", "upstream_model", "profile",
-                "credential", "usage_source", "outcome"):
+                "credential", "usage_source", "outcome", "consent_source", "agreement_revision", "conversation_id", "request_id"):
         clean = safe_label(value.get(key))
         if clean is not None:
             result[key] = clean
