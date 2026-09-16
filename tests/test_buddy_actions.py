@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import converter
-from app import buddy, credits
+from app import buddy, credential_actions, credits
 from tests import test_credential_actions as fixtures
 
 
@@ -47,6 +47,23 @@ class BuddyActionTests(unittest.TestCase):
         self.assertFalse(self.client.post('/admin/credentials/' + self.entries['intl-work']['account_key'] + '/travel',
                                          json=payload).json()['ok'])
         self.travel_mock.assert_not_called()
+
+    def test_travel_write_gate_rechecks_live_enablement_for_manual_and_automatic_actions(self):
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic):
+                self.control.set_credential(self.entry['account_key'], True)
+                observed = []
+                def in_flight(*args, **kwargs):
+                    observed.append(kwargs['can_write']())
+                    self.control.set_credential(self.entry['account_key'], False)
+                    observed.append(kwargs['can_write']())
+                    return {'ok': False, 'message': '账号已停用，未执行后续写操作'}
+                self.travel_mock.side_effect = in_flight
+                result = credential_actions._one(converter, self.pool, self.ledger, self.entry, 'travel', automatic=automatic)
+                self.assertEqual(observed, [True, False])
+                self.assertFalse(result['ok'])
+                self.assertNotIn('travel', self.ledger.entry(self.entry['id']))
+
 
     def test_environment_authorization_is_visible_but_not_writable_in_webui(self):
         converter.CONFIG.update(auto_accept_buddy=True, auto_accept_buddy_source='environment')

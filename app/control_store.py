@@ -96,6 +96,9 @@ class ControlStore:
                              "retry_at REAL NOT NULL, stage TEXT NOT NULL, outcome TEXT NOT NULL, "
                              "consent_source TEXT NOT NULL, agreement_revision TEXT NOT NULL, "
                              "agreed INTEGER NOT NULL DEFAULT 0, claimed INTEGER NOT NULL DEFAULT 0)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS travel_writes ("
+                             "account_key TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, operation TEXT NOT NULL, "
+                             "phase TEXT NOT NULL, location_id INTEGER, reserved_at REAL NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0)")
             self._db.execute("CREATE TABLE IF NOT EXISTS buddy_consents ("
                              "account_key TEXT PRIMARY KEY, agreement_revision TEXT NOT NULL, accepted_at REAL NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS buddy_tasks ("
@@ -259,6 +262,59 @@ class ControlStore:
                 (stage, outcome, int(agreed), int(claimed), identity, attempt))
             if updated.rowcount != 1:
                 raise ValueError("首领预留已变化")
+
+    def travel_write_record(self, identity):
+        _identifier(identity, "账号指纹")
+        with self._lock:
+            cursor = self._db.execute("SELECT * FROM travel_writes WHERE account_key=?", (identity,))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def reserve_travel_write(self, identity, operation, location_id=None, *, expected_attempt=None):
+        """Reserve one unresolved travel write per account without expiry-based replay."""
+        _identifier(identity, "账号指纹")
+        if operation not in {"claim", "depart"}:
+            raise ValueError("旅行操作无效")
+        if operation == "depart" and (type(location_id) is not int or not 0 < location_id <= 2**31 - 1):
+            raise ValueError("派遣地点无效")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                previous = self.travel_write_record(identity)
+                current_attempt = previous["attempt_id"] if previous else None
+                if current_attempt != expected_attempt or previous and previous["phase"] not in {"cancelled", "reconciled"}:
+                    self._db.execute("COMMIT")
+                    return None
+                attempt = uuid.uuid4().hex
+                self._db.execute(
+                    "INSERT INTO travel_writes VALUES(?,?,?,'reserved',?,?,0) "
+                    "ON CONFLICT(account_key) DO UPDATE SET attempt_id=excluded.attempt_id,operation=excluded.operation, "
+                    "phase='reserved',location_id=excluded.location_id,reserved_at=excluded.reserved_at,confirmed=0",
+                    (identity, attempt, operation, location_id, time.time()))
+                self._db.execute("COMMIT")
+                return attempt
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def transition_travel_write(self, identity, attempt, phase):
+        """Late receipts cannot reopen or replace an already reconciled reservation."""
+        _identifier(identity, "账号指纹")
+        expected = {"sent": ("reserved",), "confirmed": ("sent", "confirmed", "reconciled"),
+                    "cancelled": ("reserved", "sent", "cancelled"),
+                    "reconciled": ("reserved", "sent", "confirmed", "reconciled")}.get(phase)
+        if expected is None:
+            raise ValueError("旅行写入阶段无效")
+        with self._lock:
+            updated = self._db.execute(
+                "UPDATE travel_writes SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                "confirmed=MAX(confirmed,?) WHERE account_key=? AND attempt_id=? AND phase IN ("
+                + ",".join("?" for _ in expected) + ")",
+                (phase, phase, int(phase in {"confirmed", "reconciled"}), identity, attempt, *expected))
+            if updated.rowcount != 1:
+                raise ValueError("旅行写入预留已变化")
+
 
     def buddy_task_record(self, identity):
         _identifier(identity, "账号指纹")

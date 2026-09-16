@@ -589,7 +589,7 @@ class CredentialPool:
         return max(0, min(periodic_delay, retry_delay))
 
     def apply_if_current(self, cm, generation, update):
-        """Prevent stale requests from replacing a newer credential's cached state."""
+        """Run updates only for enabled accounts with the current credential lease."""
         with self._lock, cm._lock:
             entry = next((entry for entry in self._entries if entry["cm"] is cm), None)
             if entry is None or not model_policy.credential_enabled(CONFIG, entry):

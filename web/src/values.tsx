@@ -48,6 +48,8 @@ const labels: Record<string, string> = {
   at: "记录时间",
   claimed: "本次已领取",
   departed: "本次已派出",
+  departure_pending: "派遣记录待核验",
+  claim_pending: "奖励领取待核验",
   claimed_credit: "本次领取积分",
   reward_credit: "旅行奖励积分",
   location_id: "地点编号",
@@ -208,6 +210,7 @@ const travelErrors: Record<string, string> = {
   protocol: "响应格式异常",
   timeout: "请求超时",
   network: "网络失败",
+  storage: "状态记录不可用",
 };
 const times = new Set([
   "at",

@@ -45,6 +45,8 @@ Manual `POST /admin/credentials/{id}/travel` returns `buddy_confirmation` with o
 
 `control.sqlite3` preserves consent and one actual onboarding conversation per account across restarts. A live preflight cancellation releases only its own unsent reservation; unknown or sent attempts are never released automatically. Historical acceptance records do not block an unsent conversation. Only official task completion permits adoption. Unconfirmed first-claim sends remain reserved beyond 24 hours and only reconcile through reads; pre-claim failures may resume after backoff. Keep this database when upgrading; travel-status and balance sync remain read-only.
 
+Travel claims and departures share an account-scoped write reservation. Uncertain results do not expire or replay; fresh status reads reconcile them without issuing upstream writes. Store failures stop claims and departures, and local readback updates preserve receipt ownership across processes.
+
 Trial credits are manual-only for eligible `intl-work` accounts: use the credential row's claim drawer or `POST /admin/credentials/{id}/trial`. Startup, periodic maintenance and balance sync never claim. Results expose safe error categories, HTTP/business codes and retry time; response bodies are capped at 64 KiB and never returned to the browser. Success/already-claimed records persist in `auth/trial-ledger.json`; failures wait at least 24 hours before another manual attempt. Keep this file when upgrading.
 
 `CODEBUDDY2API_AUTO_TRIAL` and `--auto-trial` are retired: old startup options warn and do nothing; saved Boolean `auto_trial` settings are ignored on load. Remove them from deployment configuration. Before reverting to older code, check these old settings to avoid re-enabling automatic claims.

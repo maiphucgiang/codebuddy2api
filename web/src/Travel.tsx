@@ -31,6 +31,8 @@ export function TravelSummary({ trip }: { trip: Record<string, unknown> | null }
       {trip.claimed === true && trip.claimed_credit == null && (
         <small>领取已确认，积分数额未返回</small>
       )}
+      {trip.departure_pending === true && <small>派遣记录待核验，不重复派出</small>}
+      {trip.claim_pending === true && <small>奖励领取待核验，不重复领取</small>}
       {trip.buddy_consent_accepted === true && <small>首领同意已保存，无需重复确认</small>}
       {trip.buddy_task_chat_sent === true && <small>新手对话已尝试，不自动重复发送</small>}
       {trip.buddy_task_completed === true && <small>官方新手任务已确认完成</small>}

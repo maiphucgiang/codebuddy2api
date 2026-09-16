@@ -182,6 +182,24 @@ it("shows server-provided travel locations and snapshot durations without trigge
   expect(post).not.toHaveBeenCalled();
 });
 
+it("shows durable travel write holds and storage failures without making requests", () => {
+  const post = vi.spyOn(api, "post");
+  render(
+    <TravelSummary
+      trip={{
+        departure_pending: true,
+        claim_pending: true,
+        phase: "after_depart",
+        error_kind: "storage",
+      }}
+    />,
+  );
+  expect(screen.getByText("派遣记录待核验，不重复派出")).toBeTruthy();
+  expect(screen.getByText("奖励领取待核验，不重复领取")).toBeTruthy();
+  expect(screen.getByText("状态记录不可用")).toBeTruthy();
+  expect(post).not.toHaveBeenCalled();
+});
+
 it("keeps confirmed departure visible when its status read fails", async () => {
   fixture();
   vi.spyOn(api, "post").mockResolvedValue({

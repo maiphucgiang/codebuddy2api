@@ -10,6 +10,8 @@ from unittest.mock import patch
 import httpx
 from app import travel
 from app.credits import CreditLedger
+from app.control_store import ControlStore
+from concurrent.futures import ThreadPoolExecutor
 
 CONFIG = {'locations': [{'id': 21, 'name': '海边书店'}, {'id': 37, 'name': '山间茶馆'}]}
 IDLE = {'state': 'idle', 'daily_limit_reached': False}
@@ -18,11 +20,21 @@ TRAVELING = {'state': 'traveling', 'location': {'id': 21, 'name': '海边书店'
 
 
 class TravelTests(unittest.TestCase):
-    def run_trip(self, responses, profile='cn-work', **kwargs):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.store = ControlStore(self.root / 'control.sqlite3')
+        self.addCleanup(self.store.close)
+        self.trip_counter = 0
+
+    def run_trip(self, responses, profile='cn-work', *, on_request=None, **kwargs):
+        self.trip_counter += 1
+        kwargs.setdefault('buddy_context', {'store': self.store, 'identity': 'trip-' + str(self.trip_counter)})
         requests = []
         pending = iter(responses)
         def handle(request):
             requests.append(request)
+            if on_request:
+                on_request(request)
             value = next(pending)
             if isinstance(value, Exception):
                 raise value
@@ -253,6 +265,136 @@ class TravelTests(unittest.TestCase):
         self.assertEqual(result['state'], 'idle')
         self.assertEqual(len(calls), 4)
 
+    def test_confirmed_departure_blocks_stale_idle_across_restart_until_observed(self):
+        context = {'store': self.store, 'identity': 'account'}
+        first, calls = self.run_trip([IDLE, CONFIG, {}, IDLE], buddy_context=context)
+        self.assertTrue(first['departed'])
+        saved = self.store.travel_write_record('account')
+        self.assertEqual(saved['phase'], 'confirmed')
+        reopened = ControlStore(self.root / 'control.sqlite3')
+        self.addCleanup(reopened.close)
+        context['store'] = reopened
+        for read_only in (False, True):
+            for days in (1, 7):
+                with self.subTest(read_only=read_only, days=days), patch.object(travel.time, 'time', return_value=saved['reserved_at'] + days * 86400):
+                    result, retry = self.run_trip([IDLE], buddy_context=context, read_only=read_only)
+                    self.assertTrue(result['departure_pending'])
+                    self.assertTrue(result['departed'])
+                    self.assertFalse(result['ok'])
+                    self.assertEqual([r.method for r in retry], ['GET'])
+                    self.assertEqual(reopened.travel_write_record('account'), saved)
+        result, query = self.run_trip([TRAVELING], buddy_context=context, read_only=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(reopened.travel_write_record('account')['phase'], 'reconciled')
+        result, next_trip = self.run_trip([{'state': 'arrived'}, {}, IDLE, CONFIG, {}, TRAVELING], buddy_context=context)
+        self.assertTrue(result['ok'])
+        self.assertEqual([r.url.path.rsplit('/', 1)[-1] for r in next_trip if r.method == 'POST'], ['claim', 'depart'])
+        self.assertNotEqual(reopened.travel_write_record('account')['attempt_id'], saved['attempt_id'])
+
+    def test_ambiguous_departure_and_crash_remain_reserved_without_replay(self):
+        for index, error in enumerate((httpx.ReadTimeout('secret'), httpx.WriteTimeout('secret'), (200, {'code': False}))):
+            context = {'store': self.store, 'identity': 'ambiguous-' + str(index)}
+            result, calls = self.run_trip([IDLE, CONFIG, error], buddy_context=context)
+            self.assertFalse(result['ok'])
+            self.assertEqual(self.store.travel_write_record(context['identity'])['phase'], 'sent')
+            result, retry = self.run_trip([IDLE], buddy_context=context)
+            self.assertTrue(result['departure_pending'])
+            self.assertFalse(result['departed'])
+            self.assertEqual([r.method for r in retry], ['GET'])
+        context = {'store': self.store, 'identity': 'crashed'}
+        def crash(request):
+            if request.url.path.endswith('/depart'):
+                raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_trip([IDLE, CONFIG], buddy_context=context, on_request=crash)
+        result, retry = self.run_trip([IDLE], buddy_context=context)
+        self.assertTrue(result['departure_pending'])
+        self.assertEqual([r.method for r in retry], ['GET'])
+
+    def test_known_unsent_or_rejected_departures_can_resume(self):
+        for index, response in enumerate((httpx.ConnectError('secret'), httpx.ConnectTimeout('secret'),
+                                          (401, {}), (403, {}), (429, {}),
+                                          (400, {'code': 400, 'msg': 'no active buddy'}))):
+            context = {'store': self.store, 'identity': 'rejected-' + str(index)}
+            result, calls = self.run_trip([IDLE, CONFIG, response], buddy_context=context)
+            self.assertFalse(result['ok'])
+            self.assertEqual(self.store.travel_write_record(context['identity'])['phase'], 'cancelled')
+            result, retry = self.run_trip([IDLE, CONFIG, {}, TRAVELING], buddy_context=context)
+            self.assertTrue(result['ok'])
+            self.assertEqual(sum(r.method == 'POST' for r in retry), 1)
+
+    def test_final_cancellation_releases_only_its_own_departure(self):
+        context = {'store': self.store, 'identity': 'cancelled'}
+        result, calls = self.run_trip([IDLE, CONFIG], buddy_context=context,
+                                     can_write=lambda: self.store.travel_write_record('cancelled') is None)
+        self.assertTrue(result['skipped'])
+        self.assertEqual([r.method for r in calls], ['GET', 'GET'])
+        old = self.store.travel_write_record('cancelled')
+        self.assertEqual(old['phase'], 'cancelled')
+        result, retry = self.run_trip([IDLE, CONFIG, {}, TRAVELING], buddy_context=context)
+        self.assertTrue(result['ok'])
+        latest = self.store.travel_write_record('cancelled')
+        with self.assertRaises(ValueError):
+            self.store.transition_travel_write('cancelled', old['attempt_id'], 'cancelled')
+        self.assertEqual(self.store.travel_write_record('cancelled'), latest)
+
+    def test_departure_storage_failures_never_allow_duplicate_writes(self):
+        result, calls = self.run_trip([IDLE, CONFIG], buddy_context={})
+        self.assertEqual(result['error_kind'], 'storage')
+        self.assertFalse(any(r.method == 'POST' for r in calls))
+        context = {'store': self.store, 'identity': 'storage'}
+        transition = self.store.transition_travel_write
+        def fail_receipt(identity, attempt, phase):
+            if phase == 'confirmed':
+                raise OSError('synthetic-secret')
+            return transition(identity, attempt, phase)
+        with patch.object(self.store, 'transition_travel_write', side_effect=fail_receipt):
+            result, calls = self.run_trip([IDLE, CONFIG, {}], buddy_context=context)
+        self.assertTrue(result['departed'])
+        self.assertEqual(result['error_kind'], 'storage')
+        self.assertNotIn('synthetic-secret', str(result))
+        result, retry = self.run_trip([IDLE], buddy_context=context)
+        self.assertTrue(result['departure_pending'])
+        self.assertEqual([r.method for r in retry], ['GET'])
+        saved = self.store.travel_write_record('storage')
+        result, failed_query = self.run_trip([httpx.ReadTimeout('secret')], buddy_context=context)
+        self.assertFalse(result['ok'])
+        self.assertEqual(self.store.travel_write_record('storage'), saved)
+
+    def test_stale_status_cannot_authorize_a_second_process_departure(self):
+        context = {'store': self.store, 'identity': 'race'}
+        def other_process(request):
+            if request.url.path.endswith('/status'):
+                attempt = self.store.reserve_travel_write('race', 'depart', 21)
+                self.store.transition_travel_write('race', attempt, 'sent')
+                self.store.transition_travel_write('race', attempt, 'reconciled')
+        result, calls = self.run_trip([IDLE, CONFIG], buddy_context=context, on_request=other_process)
+        self.assertTrue(result['departure_pending'])
+        self.assertFalse(any(r.method == 'POST' for r in calls))
+        attempt = self.store.reserve_travel_write('reserved', 'depart', 21)
+        result, calls = self.run_trip([TRAVELING], buddy_context={'store': self.store, 'identity': 'reserved'}, read_only=True)
+        self.assertTrue(result['departure_pending'])
+        self.assertEqual(self.store.travel_write_record('reserved')['phase'], 'reserved')
+
+
+    def test_departure_reservation_is_atomic_and_late_receipt_cannot_reopen_it(self):
+        other = ControlStore(self.root / 'control.sqlite3')
+        self.addCleanup(other.close)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            attempts = list(executor.map(lambda store: store.reserve_travel_write('account', 'depart', 21), [self.store, other]))
+        self.assertEqual(sum(a is not None for a in attempts), 1)
+        attempt = next(a for a in attempts if a is not None)
+        self.store.transition_travel_write('account', attempt, 'sent')
+        other.transition_travel_write('account', attempt, 'reconciled')
+        self.store.transition_travel_write('account', attempt, 'confirmed')
+        self.assertEqual(self.store.travel_write_record('account')['phase'], 'reconciled')
+        next_attempt = other.reserve_travel_write('account', 'depart', 37, expected_attempt=attempt)
+        self.assertIsNotNone(next_attempt)
+        with self.assertRaises(ValueError):
+            self.store.transition_travel_write('account', attempt, 'reconciled')
+        self.assertEqual(other.travel_write_record('account')['attempt_id'], next_attempt)
+
+
     def test_arrival_after_depart_does_not_start_another_claim_loop(self):
         result, calls = self.run_trip([IDLE, CONFIG, {}, {'state': 'arrived'}])
         self.assertTrue(result['ok'])
@@ -266,6 +408,45 @@ class TravelTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertTrue(result['claimed'])
         self.assertEqual(len(calls), 3)
+
+    def test_confirmed_claim_survives_restart_and_blocks_repeat_until_idle(self):
+        arrived = {'state': 'arrived', 'daily_limit_reached': False}
+        context = {'store': self.store, 'identity': 'claim-account'}
+        result, calls = self.run_trip([arrived, {'reward_credit': 8}, arrived], buddy_context=context)
+        self.assertTrue(result['claimed'])
+        self.assertFalse(result['ok'])
+        saved = self.store.travel_write_record('claim-account')
+        self.assertEqual((saved['operation'], saved['phase']), ('claim', 'confirmed'))
+        reopened = ControlStore(self.root / 'control.sqlite3')
+        self.addCleanup(reopened.close)
+        context['store'] = reopened
+        for read_only in (False, True):
+            with patch.object(travel.time, 'time', return_value=saved['reserved_at'] + 7 * 86400):
+                pending, retry = self.run_trip([arrived], buddy_context=context, read_only=read_only)
+            self.assertTrue(pending['claim_pending'])
+            self.assertTrue(pending['claimed'])
+            self.assertIsNone(pending.get('claimed_credit'))
+            self.assertEqual([r.method for r in retry], ['GET'])
+            self.assertEqual(reopened.travel_write_record('claim-account'), saved)
+        result, query = self.run_trip([IDLE], buddy_context=context, read_only=True)
+        self.assertTrue(result['ok'])
+        self.assertEqual(reopened.travel_write_record('claim-account')['phase'], 'reconciled')
+        result, next_trip = self.run_trip([IDLE, CONFIG, {}, TRAVELING], buddy_context=context)
+        self.assertTrue(result['ok'])
+        self.assertEqual([r.url.path.rsplit('/', 1)[-1] for r in next_trip if r.method == 'POST'], ['depart'])
+
+    def test_uncertain_claim_and_post_claim_query_failure_are_not_replayed(self):
+        for index, responses in enumerate(([{'state': 'arrived'}, httpx.ReadTimeout('secret')],
+                                            [{'state': 'arrived'}, {}, httpx.ReadTimeout('secret')])):
+            context = {'store': self.store, 'identity': 'claim-uncertain-' + str(index)}
+            result, calls = self.run_trip(responses, buddy_context=context)
+            self.assertFalse(result['ok'])
+            saved = self.store.travel_write_record(context['identity'])
+            result, retry = self.run_trip([{'state': 'arrived'}], buddy_context=context)
+            self.assertTrue(result['claim_pending'])
+            self.assertEqual([r.method for r in retry], ['GET'])
+            self.assertEqual(self.store.travel_write_record(context['identity']), saved)
+
 
     def test_setting_change_during_query_stops_claim_or_depart(self):
         for state in ('arrived', 'idle'):
