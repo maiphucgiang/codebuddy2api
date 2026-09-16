@@ -94,11 +94,29 @@ class EnvironmentConfigTests(unittest.TestCase):
 
     def test_existing_runtime_limit_and_retry_variables_reach_effective_config(self):
         values = {'MAX_INBOUND_BYTES': '4096', 'MAX_COLLECT_BYTES': '0', 'MAX_CONCURRENT': '2',
-                  'TOOL_CALL_MAX_RETRY': '1', 'FAILOVER_MAX': '1', 'RETRY_WRITE_TIMEOUT': 'true'}
+                  'TOOL_CALL_MAX_RETRY': '1', 'FAILOVER_MAX': '1', 'RETRY_WRITE_TIMEOUT': 'true',
+                  'UPSTREAM_KEEPALIVE': 'true', 'MAX_INFLIGHT_PER_ACCOUNT': '2'}
         _, _, config = self.start({'CODEBUDDY2API_' + name: value for name, value in values.items()})
         for name, value in values.items():
             expected = value == 'true' if value in ('true', 'false') else int(value)
             self.assertEqual(config[name.lower()], expected)
+
+    def test_pooling_cli_wins_over_environment_and_saved_settings(self):
+        _, items, config = self.start(
+            {'CODEBUDDY2API_UPSTREAM_KEEPALIVE': 'true', 'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT': '3'},
+            cli=('--upstream-keepalive=false', '--max-inflight-per-account', '1'),
+            saved={'upstream_keepalive': True, 'max_inflight_per_account': 2})
+        self.assertFalse(config['upstream_keepalive'])
+        self.assertEqual(config['max_inflight_per_account'], 1)
+        self.assertTrue(all(items[key]['source'] == 'cli' and items[key]['locked']
+                            for key in ('upstream_keepalive', 'max_inflight_per_account')))
+
+    def test_invalid_pooling_environment_fails_before_startup(self):
+        for env in ({'CODEBUDDY2API_UPSTREAM_KEEPALIVE': 'invalid'},
+                    {'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT': '-1'}):
+            with self.subTest(env=env), self.assertRaises(SystemExit):
+                self.start(env)
+
 
     def test_example_covers_all_active_runtime_environment_names(self):
         example = (ROOT / '.env.example').read_text()
@@ -132,6 +150,7 @@ class EnvironmentConfigTests(unittest.TestCase):
                   'CODEBUDDY2API_MAX_INBOUND_BYTES': '4096', 'CODEBUDDY2API_MAX_COLLECT_BYTES': '0',
                   'CODEBUDDY2API_MAX_CONCURRENT': '2', 'CODEBUDDY2API_TOOL_CALL_MAX_RETRY': '1',
                   'CODEBUDDY2API_FAILOVER_MAX': '1', 'CODEBUDDY2API_RETRY_WRITE_TIMEOUT': 'true',
+                  'CODEBUDDY2API_UPSTREAM_KEEPALIVE': 'true', 'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT': '2',
                   'CODEBUDDY2API_KEEP_TOOL_METADATA': 'false', 'CODEBUDDY_IMPORT_DIR': '/data/auth/incoming'}
         service = self.compose(values)
         port = service['ports'][0]
@@ -144,7 +163,8 @@ class EnvironmentConfigTests(unittest.TestCase):
 
     def test_compose_unset_optional_settings_do_not_override_webui(self):
         service = self.compose({})
-        for name in ('CODEBUDDY2API_KEEP_TOOL_METADATA', 'CODEBUDDY2API_FAILOVER_MAX', 'CODEBUDDY2API_RETRY_WRITE_TIMEOUT'):
+        for name in ('CODEBUDDY2API_KEEP_TOOL_METADATA', 'CODEBUDDY2API_FAILOVER_MAX', 'CODEBUDDY2API_RETRY_WRITE_TIMEOUT',
+                     'CODEBUDDY2API_UPSTREAM_KEEPALIVE', 'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT'):
             self.assertIsNone(service['environment'].get(name))
         self.assertEqual(service['ports'][0]['host_ip'], '127.0.0.1')
         self.assertEqual(service['environment']['CODEBUDDY_IMPORT_DIR'], '/data/auth/imports')

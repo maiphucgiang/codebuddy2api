@@ -32,6 +32,8 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `--max-inbound-bytes` | `67108864` | 生成及 token 估算 POST 的解析前原始字节上限（含 chunked），超限 413；其他路由不缓冲请求体 |
 | `--max-collect-bytes` | `8388608` | 聚合路径输出收集总字节上限（正文+思考+工具参数），超限返回 `response_too_large`；`0` 不限制 |
 | `--max-concurrent` | `64` | 仅限制三个生成端点；占满立即 503（含 Retry-After），不限制 token 估算；`0` 不限制 |
+| `--max-inflight-per-account` | `0` | 每进程、每账号的客户端推理在途上限；`0` 不限制，满载立即 503 |
+| `--upstream-keepalive [true/false]` | `false` | 启用按官方入口隔离的有界连接复用；重启生效 |
 | `--failover-max` | `0` | 请求在「一个字节都还没发给下游」之前失败时，最多再换几个凭证就地重放；`0` 表示如实把失败回给下游 |
 | `--retry-write-timeout` | `false` | 让「写请求体超时」也参与重放（换新连接与 `--failover-max` 换凭证），代价是已发出的那半截正文可能已被上游处理 |
 | `--max-request-bytes` | `33554432` | 处理后的上游 JSON 字节上限，须为正整数 |
@@ -60,6 +62,15 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 - **环境变量**：设置 `CODEBUDDY2API_KEEP_TOOL_METADATA=true`；Compose 会传入已设置的值，未设置时不锁定 WebUI。删除或注释变量可解除环境锁定，不要设为空串。
 
 需使用包含此功能的源码/镜像和 Compose 配置；修改容器环境后重新创建容器。保留描述可能增加输入 token 和审核拦截风险，不保证所有账号/模型都同样兼容；设为 `false` 可恢复旧策略。此开关不恢复 Responses 原有投影裁掉的其他 schema 字段或深层节点，也不放宽请求体预算。
+
+### 连接复用与账号容量
+
+WebUI 系统设置可配置这两项；环境变量为 `CODEBUDDY2API_UPSTREAM_KEEPALIVE` 和 `CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT`，未设置时 Compose 不锁定 WebUI。连接复用默认关闭，启用后每个官方入口最多 64 条连接、保留 16 条空闲连接，空闲复用期限 30 秒；认证头逐请求设置，不保存上游 Cookie，关闭服务时释放连接池。原有代理环境、超时和重放规则不变；关闭并重启恢复逐请求连接。
+
+账号上限默认 `0`；设为正数后，仅在原路由及免费优先范围内避开满载账号，不因免费账号满载而转向收费账号。没有名额时返回 `503 / credential_concurrency_limit` 和 `Retry-After: 3`，不排队、不熔断；结束、断连和失败换号均释放名额。管理凭据 API 提供 `in_flight`、`max_in_flight`；限制只涵盖三个客户端生成接口，每进程独立，多个实例不共享计数。设回 `0` 即恢复原容量策略，不中断已开始的请求。
+
+源码降级前还需移除新增启动参数，并恢复不含这两个配置键的控制库备份；仅关闭开关不会删除持久化配置。
+
 
 ## API 与鉴权
 

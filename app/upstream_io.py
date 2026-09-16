@@ -212,8 +212,18 @@ WRITE_TIMEOUT = (httpx.WriteTimeout,)
 
 
 @asynccontextmanager
+async def _attempt_client(url, timeout, clients):
+    client = clients.get(url) if clients is not None else None
+    if client is not None:
+        yield client
+    else:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            yield client
+
+
+@asynccontextmanager
 async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=None,
-                              retry_write_timeout=False):
+                              retry_write_timeout=False, clients=None):
     """Retry connection failures once on a fresh client; write timeouts require explicit opt-in.
     Never replay after the upstream response opens.
     """
@@ -222,8 +232,8 @@ async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=
     for attempt in range(2):
         opened = False
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("POST", url, headers=headers, json=body) as response:
+            async with _attempt_client(url, timeout, clients if attempt == 0 else None) as client:
+                async with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as response:
                     opened = True
                     yield response
                     return
