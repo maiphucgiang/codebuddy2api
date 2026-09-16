@@ -23,6 +23,11 @@ def _identifier(value, label):
     return value
 
 
+def buddy_claim_reserved(record):
+    """Only pre-claim reservations may expire; a pending send can outlive its process."""
+    return bool(record and (record["claimed"] or record["stage"] not in {"reserved", "agree", "buddy_agree"}))
+
+
 def validate_model(source, rule, models=None, known_models=(), *, legacy_scopes=False):
     _identifier(source, "模型规则 ID")
     if not isinstance(rule, dict) or set(rule) - {"public_id", "upstream_id", "custom", "enabled", "keep_original", "region", "profile", "credential_ids"}:
@@ -225,7 +230,7 @@ class ControlStore:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 previous = self.buddy_record(identity)
-                if previous and (previous["claimed"] or previous["retry_at"] > now):
+                if previous and (buddy_claim_reserved(previous) or previous["retry_at"] > now):
                     self._db.execute("COMMIT")
                     return None
                 attempt = uuid.uuid4().hex

@@ -192,11 +192,96 @@ class BuddyTests(unittest.TestCase):
         self.assertGreater(saved["retry_at"], time.time())
         self.assertNotIn("synthetic-secret", str(result))
         again = self.prepare([EMPTY, LIST], automatic=True)
-        self.assertEqual(again["reason"], "buddy_retry_later")
+        self.assertEqual(again["reason"], "buddy_write_unconfirmed")
+        self.assertNotIn("retry_at", again)
         self.assertEqual(len(self.posts()), 2)
         reconciled = self.prepare([ACTIVE])
         self.assertTrue(reconciled["buddy_ready"])
         self.assertEqual(self.store.buddy_record("account")["outcome"], "success")
+
+    def test_uncertain_claim_remains_reserved_after_expiry_and_restart(self):
+        self.store.save_buddy_consent("account", buddy.AGREEMENT_REVISION)
+        result = self.prepare([EMPTY, LIST, TASKS, {"agreed": True}, httpx.ReadTimeout("secret"), EMPTY], automatic=True)
+        self.assertEqual(result["reason"], "buddy_write_unconfirmed")
+        saved = self.store.buddy_record("account")
+        reopened = ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(reopened.close)
+        self.context["store"] = reopened
+        for automatic in (False, True):
+            for delay in (1, 7 * 86400):
+                with self.subTest(automatic=automatic, delay=delay), patch.object(buddy.time, "time", return_value=saved["retry_at"] + delay):
+                    result = self.prepare([EMPTY, LIST], automatic=automatic)
+                    self.assertEqual(result["reason"], "buddy_write_unconfirmed")
+                    self.assertNotIn("retry_at", result)
+                    self.assertEqual(reopened.buddy_record("account"), saved)
+                    self.assertIsNone(reopened.reserve_buddy("account", "manual", buddy.AGREEMENT_REVISION, retry_seconds=86400))
+        self.assertEqual(len(self.posts()), 1)
+        reconciled = self.prepare([ACTIVE])
+        self.assertTrue(reconciled["buddy_ready"])
+        receipt = reopened.buddy_record("account")
+        self.assertEqual(receipt["attempt_id"], saved["attempt_id"])
+        self.assertEqual((receipt["outcome"], receipt["claimed"]), ("success", 1))
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_crash_during_first_claim_keeps_pending_send_terminal(self):
+        def crash(request):
+            if request.url.path.endswith("/buddy/first"):
+                raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.prepare([EMPTY, LIST, TASKS, {"agreed": True}], automatic=True, on_request=crash)
+        saved = self.store.buddy_record("account")
+        self.assertEqual((saved["stage"], saved["outcome"], saved["claimed"]), ("first", "pending", 0))
+        reopened = ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(reopened.close)
+        self.context["store"] = reopened
+        with patch.object(buddy.time, "time", return_value=saved["retry_at"] + 1):
+            result = self.prepare([EMPTY, LIST], automatic=True)
+        self.assertEqual(result["reason"], "buddy_write_unconfirmed")
+        self.assertEqual(reopened.buddy_record("account"), saved)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_failed_readback_after_expiry_preserves_uncertain_claim(self):
+        self.prepare([EMPTY, LIST, TASKS, {"agreed": True}, httpx.ReadTimeout("secret"), EMPTY], automatic=True)
+        saved = self.store.buddy_record("account")
+        for responses in ([httpx.ReadTimeout("secret")], [EMPTY, httpx.ReadTimeout("secret")]):
+            with self.subTest(responses=len(responses)), patch.object(buddy.time, "time", return_value=saved["retry_at"] + 1):
+                result = self.prepare(responses, automatic=True)
+                self.assertEqual(result["reason"], "buddy_unknown")
+                self.assertEqual(self.store.buddy_record("account"), saved)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_claim_stage_reservations_cannot_be_replaced_by_other_connections(self):
+        reopened = ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(reopened.close)
+        for stage in ("first", "buddy_first", "verify", "buddy_verify", "future_claim"):
+            for outcome in ("pending", "uncertain"):
+                with self.subTest(stage=stage, outcome=outcome):
+                    identity = stage + "-" + outcome
+                    attempt = self.store.reserve_buddy(identity, "manual", buddy.AGREEMENT_REVISION, retry_seconds=86400, now=100)
+                    self.store.buddy_checkpoint(identity, attempt, stage, outcome, agreed=True)
+                    saved = self.store.buddy_record(identity)
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        reservations = list(executor.map(
+                            lambda store: store.reserve_buddy(identity, "environment", buddy.AGREEMENT_REVISION, retry_seconds=86400, now=86501),
+                            [self.store, reopened]))
+                    self.assertEqual(reservations, [None, None])
+                    self.assertEqual(reopened.buddy_record(identity), saved)
+
+    def test_presend_failures_can_resume_after_backoff(self):
+        for stage, outcome in (("reserved", "pending"), ("agree", "pending"), ("buddy_agree", "uncertain")):
+            with self.subTest(stage=stage):
+                attempt = self.store.reserve_buddy(stage, "manual", buddy.AGREEMENT_REVISION, retry_seconds=86400, now=100)
+                self.store.buddy_checkpoint(stage, attempt, stage, outcome)
+                self.assertIsNone(self.store.reserve_buddy(stage, "manual", buddy.AGREEMENT_REVISION, retry_seconds=86400, now=101))
+                renewed = self.store.reserve_buddy(stage, "manual", buddy.AGREEMENT_REVISION, retry_seconds=86400, now=86501)
+                self.assertIsNotNone(renewed)
+                self.assertNotEqual(renewed, attempt)
+        self.context["identity"] = "buddy_agree"
+        with patch.object(buddy.time, "time", return_value=172902):
+            result = self.prepare([EMPTY, LIST, TASKS, {"agreed": True}, None, ACTIVE], automatic=True)
+        self.assertTrue(result["buddy_ready"])
+        self.assertEqual([request.url.path for request in self.posts()], ["/activity/growth/buddy/first"])
+
 
     def test_timeout_can_be_reconciled_without_replaying_or_dispatching(self):
         result = self.prepare([EMPTY, LIST, TASKS, {"agreed": True}, httpx.ReadTimeout("secret"), ACTIVE], automatic=True)
@@ -217,6 +302,11 @@ class BuddyTests(unittest.TestCase):
         self.assertTrue(result["buddy_claimed"])
         self.assertEqual(result["reason"], "buddy_storage_error")
         self.assertEqual(len(self.posts()), 1)
+        saved = self.store.buddy_record("account")
+        with patch.object(buddy.time, "time", return_value=saved["retry_at"] + 1):
+            result = self.prepare([EMPTY, LIST], automatic=True)
+        self.assertEqual(result["reason"], "buddy_write_unconfirmed")
+        self.assertEqual(self.store.buddy_record("account"), saved)
         result = self.prepare([ACTIVE])
         self.assertTrue(result["buddy_ready"])
         self.assertEqual(len(self.posts()), 1)

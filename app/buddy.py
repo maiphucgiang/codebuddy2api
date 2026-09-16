@@ -6,6 +6,7 @@ import time
 import httpx
 
 from . import buddy_task
+from .control_store import buddy_claim_reserved
 
 HOST = "https://www.workbuddy.cn"
 RETRY_SECONDS = 86400
@@ -39,7 +40,7 @@ _MESSAGES = {
     "buddy_retry_later": "上次首领结果尚未确认或正在退避，请先核验猫猫状态，勿重复领取",
     "buddy_changed": "设置或凭证已变化，未继续领猫或派遣",
     "buddy_storage_error": "首领记录或审计无法保存，已停止后续操作，请检查存储状态",
-    "buddy_write_unconfirmed": "首领操作结果未确认，未派遣；请先查询核验，勿重复领取",
+    "buddy_write_unconfirmed": "首领操作结果未确认，未派遣；仅查询核验，不会自动重新领取",
     "buddy_reconciled": "猫猫已确认领取，本次未派遣，请查询旅行状态后继续",
 }
 
@@ -214,6 +215,8 @@ def prepare(client, token, *, can_write, context=None):
             raise Failure("protocol", 200, 0)
         if rows or count or previous and previous["claimed"]:
             return stop("buddy_selection_required")
+        if buddy_claim_reserved(previous):
+            return stop("buddy_write_unconfirmed", stale=True)
         if previous and previous["retry_at"] > time.time():
             return stop("buddy_retry_later", retry_at=previous["retry_at"])
         result["phase"] = "buddy_tasks"
