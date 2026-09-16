@@ -108,8 +108,37 @@ class BuddyTests(unittest.TestCase):
     def test_environment_authorization_skips_previously_accepted_agreement(self):
         result = self.prepare([EMPTY, LIST, TASKS, {"agreed": True}, None, ACTIVE], automatic=True)
         self.assertTrue(result["buddy_ready"], result)
+        self.assertTrue(result["agreement_accepted"])
+        self.assertEqual(self.store.buddy_record("account")["agreed"], 1)
+        self.assertTrue(self.prepare([ACTIVE])["agreement_accepted"])
         self.assertEqual(result["consent_source"], "environment")
         self.assertEqual([r.url.path for r in self.posts()], ["/activity/growth/buddy/first"])
+
+    def test_preaccepted_agreement_survives_uncertain_claim_and_read_reconciliation(self):
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic):
+                identity = "agreed-" + str(automatic)
+                self.context["identity"] = identity
+                result = self.prepare([EMPTY, LIST, TASKS, {"agreed": True}, httpx.ReadTimeout("secret"), EMPTY],
+                                      automatic=automatic, consent=None if automatic else buddy.AGREEMENT_REVISION)
+                self.assertTrue(result["agreement_accepted"])
+                self.assertEqual(self.store.buddy_record(identity)["agreed"], 1)
+                reopened = ControlStore(self.root / "control.sqlite3")
+                self.addCleanup(reopened.close)
+                self.context["store"] = reopened
+                pending = self.prepare([EMPTY, LIST], automatic=automatic)
+                self.assertTrue(pending["agreement_accepted"])
+                reconciled = self.prepare([ACTIVE])
+                self.assertTrue(reconciled["agreement_accepted"])
+                self.assertTrue(reconciled["buddy_ready"])
+        self.assertTrue(all(r.url.path.endswith("/buddy/first") for r in self.posts()))
+
+    def test_official_agreement_alone_does_not_authorize_first_claim(self):
+        result = self.prepare([EMPTY, LIST, TASKS, {"agreed": True}])
+        self.assertTrue(result["agreement_accepted"])
+        self.assertEqual(result["reason"], "buddy_confirmation_required")
+        self.assertEqual(self.posts(), [])
+
 
     def test_stale_revision_is_not_consent(self):
         result = self.prepare([EMPTY, LIST, TASKS, AGREEMENT], consent="old-version")

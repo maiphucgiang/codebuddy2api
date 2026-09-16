@@ -193,6 +193,8 @@ def prepare(client, token, *, can_write, context=None):
             result["consent_source"] = source
         active = _active(_request(client, token, "info"))
         previous = store.buddy_record(identity) if store is not None and identity else None
+        if previous:
+            result["agreement_accepted"] = bool(previous["agreed"])
         if active:
             if previous and previous["outcome"] != "success":
                 attempt = previous["attempt_id"]
@@ -239,6 +241,7 @@ def prepare(client, token, *, can_write, context=None):
         agreed = _request(client, token, "agreement").get("agreed")
         if type(agreed) is not bool:
             raise Failure("protocol", 200, 0)
+        result["agreement_accepted"] = agreed
         if source is None:
             result["buddy_confirmation"] = confirmation(True)
             return stop("buddy_confirmation_required")
