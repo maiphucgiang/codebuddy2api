@@ -3326,8 +3326,8 @@ def main():
                     help="login 站点：cn 国内站（默认）；intl 国际 WorkBuddy；intl-codebuddy 国际 CodeBuddy")
     ap.add_argument("--no-browser", action="store_true",
                     help="login 仅显示授权链接，不自动打开浏览器（服务器/容器环境）")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--host", default="127.0.0.1", help="监听地址；覆盖 CODEBUDDY2API_BIND")
+    ap.add_argument("--port", type=int, default=8787, help="监听端口；覆盖 CODEBUDDY2API_PORT")
     ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2API_KEY", ""),
                     help="可选：要求客户端携带的 API key（默认不校验）")
     ap.add_argument("--admin-csrf", type=_boolean_arg, nargs="?", const=True,
@@ -3416,7 +3416,7 @@ def main():
     # File logging is enabled only when a path is configured.
     CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2API_LOG")
     from app import runtime_management
-    runtime_management.initialize(sys.modules[__name__], args)
+    runtime_management.initialize(sys.modules[__name__], args, parser=ap)
     # Validate effective binding and authentication before credential scans or background work.
     if (args.host not in ("127.0.0.1", "::1", "localhost") and not CONFIG.get("api_key")
             and os.environ.get("CODEBUDDY2API_ALLOW_OPEN_NOAUTH", "").lower() not in ("1", "true", "yes")):

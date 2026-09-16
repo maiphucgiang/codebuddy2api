@@ -11,11 +11,14 @@ On first setup, run `cp .env.example .env` and set `CODEBUDDY2API_KEY` to your o
 | Setting | Purpose |
 |---------|---------|
 | `CODEBUDDY2API_IMAGE` | Compose image; the template uses `codebuddy2api:local` |
-| `CODEBUDDY2API_BIND` / `CODEBUDDY2API_PORT` | Compose host binding / port; the template uses `127.0.0.1:8787` |
+| `CODEBUDDY2API_BIND` / `CODEBUDDY2API_PORT` | Native listener and Compose host mapping; default `127.0.0.1:8787` |
 | `CODEBUDDY2API_AUTH_PATH` | Compose host data directory; defaults to `./auth`, mounted at `/data/auth` |
 | `CODEBUDDY_AUTH_DIR` | Local Python data directory; defaults to the repository's `auth/`. Compose sets it to `/data/auth` inside the container |
+| `CODEBUDDY_IMPORT_DIR` | Optional import directory; defaults to `imports/` under the data directory. Use container paths with Compose |
 
-Compose reads declared variables from `.env`; shell variables take precedence. Do not skip the template: without `.env`, compatibility defaults may expose all host interfaces. Set a random key, HTTPS and access restrictions before allowing remote connections.
+The example lists all active runtime variables, including inbound/aggregate byte limits, concurrency, tool retries and failover. Compose forwards these limits; unset optional tool-metadata/failover settings remain configurable in the WebUI. Zero disables the aggregate/concurrency limit or extra retries, not the required positive inbound limit.
+
+Compose reads declared variables from `.env`; shell variables take precedence. The default host mapping is loopback. Set a random key, HTTPS and access restrictions before allowing remote connections. Container binding remains `0.0.0.0:8787`; change host exposure using `BIND/PORT`, not container listener arguments.
 
 Mount the entire data directory on writable local storage, not just one SQLite file, and do not share it between instances. Stop the gateway and back up the whole directory before upgrading; see [data and backups](webui.md).
 
@@ -57,7 +60,7 @@ Configure `.env` as above before starting, then open `/dashboard` to add account
 
 Without uv, run `python3 -m venv .venv`, activate it, install dependencies with `pip install --require-hashes --only-binary=:all: -r requirements.txt`, and start with `python3 converter.py --desensitize`. **Plain Python does not load `.env`**; export environment variables or pass CLI flags explicitly.
 
-Local Python binding uses `--host` and `--port`. Compose-only `CODEBUDDY2API_BIND`, `CODEBUDDY2API_PORT` and `CODEBUDDY2API_AUTH_PATH` do not change the local listener or data directory.
+Native binding follows explicit `--host/--port` > `CODEBUDDY2API_BIND/PORT` > saved WebUI values > defaults. Remove explicit flags if `.env` should control the listener; changes require restart. `CODEBUDDY2API_IMAGE/AUTH_PATH` remain Compose-only; use `CODEBUDDY_AUTH_DIR` for native data.
 
 ## Dependency locks
 

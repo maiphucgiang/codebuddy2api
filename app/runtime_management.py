@@ -59,7 +59,7 @@ class UnavailableAudit:
         pass
 
 
-def initialize(gateway, args, argv=None):
+def initialize(gateway, args, argv=None, *, parser=None):
     config = gateway.CONFIG
     config["auto_accept_buddy"] = buddy.auto_accept_from_env(os.environ)
     config["auto_accept_buddy_source"] = "environment" if "CODEBUDDY2API_AUTO_ACCEPT_BUDDY" in os.environ else "default"
@@ -70,9 +70,13 @@ def initialize(gateway, args, argv=None):
     config["model_guard"] = not args.no_model_guard
     aliases = {"log": "log_path", "no_model_guard": "model_guard"}
     explicit = set()
+    options = parser._option_string_actions if parser is not None else {}
     for argument in (sys.argv[1:] if argv is None else argv):
         if argument.startswith("--"):
-            key = argument[2:].split("=", 1)[0].replace("-", "_")
+            flag = argument.split("=", 1)[0]
+            matches = [flag] if flag in options else [name for name in options if name.startswith(flag)]
+            # Resolve argparse's accepted abbreviations before assigning precedence.
+            key = options[matches[0]].dest if len(matches) == 1 else flag[2:].replace("-", "_")
             explicit.add(aliases.get(key, key))
     apply_persisted_settings(config, explicit=explicit)
     for key in SCHEMA:

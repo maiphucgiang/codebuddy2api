@@ -19,8 +19,8 @@ def _item(default, type_, label, *, mode="hot", env=None, minimum=None, maximum=
 
 
 SCHEMA = {
-    "host": _item("127.0.0.1", "string", "监听地址", mode="restart"),
-    "port": _item(8787, "integer", "监听端口", mode="restart", minimum=1, maximum=65535),
+    "host": _item("127.0.0.1", "string", "监听地址", mode="restart", env="CODEBUDDY2API_BIND"),
+    "port": _item(8787, "integer", "监听端口", mode="restart", env="CODEBUDDY2API_PORT", minimum=1, maximum=65535),
     "api_key": _item(None, "secret", "管理与推理密钥", mode="startup", env="CODEBUDDY2API_KEY", sensitive=True),
     "auth_file": _item(None, "paths", "显式凭证文件", mode="startup", sensitive=True),
     "auth_dir": _item(None, "path", "凭证目录", mode="startup", env="CODEBUDDY_AUTH_DIR", sensitive=True),

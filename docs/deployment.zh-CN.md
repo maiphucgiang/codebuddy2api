@@ -11,11 +11,14 @@
 | 设置 | 用途 |
 |------|------|
 | `CODEBUDDY2API_IMAGE` | Compose 镜像；模板为 `codebuddy2api:local` |
-| `CODEBUDDY2API_BIND` / `CODEBUDDY2API_PORT` | Compose 的宿主机监听地址 / 端口；模板为 `127.0.0.1:8787` |
+| `CODEBUDDY2API_BIND` / `CODEBUDDY2API_PORT` | 本地监听及 Compose 宿主机映射；默认 `127.0.0.1:8787` |
 | `CODEBUDDY2API_AUTH_PATH` | Compose 宿主机数据目录，默认 `./auth`，挂载至容器 `/data/auth` |
 | `CODEBUDDY_AUTH_DIR` | 本地 Python 的数据目录，默认仓库下 `auth/`；Compose 容器内固定为 `/data/auth` |
+| `CODEBUDDY_IMPORT_DIR` | 可选导入目录，默认数据目录下 `imports/`；Compose 中使用容器路径 |
 
-Compose 自动读取 `.env` 中已声明的变量，Shell 环境优先。不要省略模板配置：Compose 在缺少 `.env` 时为兼容旧部署可能监听全部网卡。对外访问前设置随机 key、HTTPS 和访问限制。
+示例列出当前运行变量，包括入站／聚合字节限制、并发数、工具重试及换号重放。Compose 转发这些限制；未设置的可选工具描述／重放项仍由 WebUI 配置。聚合、并发及额外重试可设为 0 关闭，入站限制必须为正整数。
+
+Compose 读取已声明的 `.env` 变量，Shell 环境优先；默认仅映射回环地址。对外访问前设置随机 key、HTTPS 和访问限制。容器内始终监听 `0.0.0.0:8787`，通过 `BIND/PORT` 改宿主机入口，不改容器监听参数。
 
 整个数据目录必须可写，且应位于本地文件系统；不要只挂载一个 SQLite 文件，也不要让多个实例共用目录。升级前停止服务并备份整个目录，详见 [数据与备份](webui.zh-CN.md)。
 
@@ -57,7 +60,7 @@ uv run --locked --no-build --env-file .env converter.py --desensitize
 
 不使用 uv 时，可执行 `python3 -m venv .venv`，激活环境后用 `pip install --require-hashes --only-binary=:all: -r requirements.txt` 安装依赖，将运行命令换为 `python3 converter.py --desensitize`。**普通 Python 不自动读取 `.env`**，须显式导出环境变量或传入 CLI 参数。
 
-本地 Python 的监听地址和端口由 `--host`、`--port` 控制；Compose 专用的 `CODEBUDDY2API_BIND`、`CODEBUDDY2API_PORT`、`CODEBUDDY2API_AUTH_PATH` 不改变本地监听和数据目录。
+本地监听优先级为显式 `--host/--port` > `CODEBUDDY2API_BIND/PORT` > WebUI 保存值 > 默认值。希望由 `.env` 控制时应移除显式监听参数，修改后重启。`CODEBUDDY2API_IMAGE/AUTH_PATH` 仍仅用于 Compose，本地数据目录使用 `CODEBUDDY_AUTH_DIR`。
 
 ## 依赖锁定
 
