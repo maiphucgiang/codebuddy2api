@@ -92,6 +92,14 @@ def perform(client, token, task, *, context, can_write, request, event):
         return {**result, "ok": False, "skipped": True, "buddy_blocked": True,
                 "reason": reason, "message": _MESSAGES[reason], **fields}
 
+    def cancel_unsent(reason, reserved):
+        if not store.release_buddy_task(identity, reserved["request_id"]):
+            return stop("buddy_task_storage_error")
+        if not event("task_chat", "skipped", code=reason, model=reserved["model"],
+                     conversation_id=reserved["conversation_id"], request_id=reserved["request_id"]):
+            return stop("buddy_task_storage_error")
+        return stop(reason)
+
     def complete():
         if not event("task_completed", "success"):
             return stop("buddy_task_storage_error")
@@ -139,10 +147,16 @@ def perform(client, token, task, *, context, can_write, request, event):
         reserved = store.reserve_buddy_task(identity, "chat", model=model["id"])
         if reserved is None:
             return stop("buddy_task_unconfirmed")
-        if not can_write():
-            return stop("buddy_task_changed")
-        if not selector(model["id"]):
-            return stop("buddy_task_no_model")
+        reason = None
+        try:
+            if not can_write():
+                reason = "buddy_task_changed"
+            elif not selector(model["id"]):
+                reason = "buddy_task_no_model"
+        except Exception:
+            reason = "buddy_task_storage_error"
+        if reason:
+            return cancel_unsent(reason, reserved)
         result["buddy_task_chat_sent"] = True
         failure, usage = None, None
         try:

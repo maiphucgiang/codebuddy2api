@@ -268,7 +268,7 @@ class ControlStore:
             return dict(zip((column[0] for column in cursor.description), row)) if row else None
 
     def reserve_buddy_task(self, identity, operation, *, model=None):
-        """Reserve at most one acceptance and one billable conversation per account across restarts."""
+        """Reserve one conversation with a fresh owner token for each unsent attempt."""
         _identifier(identity, "账号指纹")
         if operation not in {"accept", "chat"}:
             raise ValueError("新手任务操作无效")
@@ -288,8 +288,9 @@ class ControlStore:
                     self._db.execute("UPDATE buddy_tasks SET accept_started=1,updated_at=? WHERE account_key=?",
                                      (time.time(), identity))
                 else:
-                    self._db.execute("UPDATE buddy_tasks SET chat_started=1,model=?,updated_at=? WHERE account_key=?",
-                                     (model, time.time(), identity))
+                    self._db.execute("UPDATE buddy_tasks SET chat_started=1,request_id=?,model=?,"
+                                     "chat_state='pending',total_tokens=NULL,updated_at=? WHERE account_key=?",
+                                     (uuid.uuid4().hex, model, time.time(), identity))
                 record = self.buddy_task_record(identity)
                 self._db.execute("COMMIT")
                 return record
@@ -297,6 +298,19 @@ class ControlStore:
                 if self._db.in_transaction:
                     self._db.execute("ROLLBACK")
                 raise
+
+    def release_buddy_task(self, identity, request_id):
+        """Release only the caller's known-unsent reservation, never a recorded outcome."""
+        _identifier(identity, "账号指纹")
+        _identifier(request_id, "请求 ID")
+        with self._lock:
+            updated = self._db.execute(
+                "UPDATE buddy_tasks SET chat_started=0,model=NULL,updated_at=? "
+                "WHERE account_key=? AND request_id=? AND chat_started=1 AND completed=0 "
+                "AND chat_state='pending' AND total_tokens IS NULL",
+                (time.time(), identity, request_id))
+            return updated.rowcount == 1
+
 
     def buddy_task_checkpoint(self, identity, *, completed=False, chat_state=None, total_tokens=None):
         _identifier(identity, "账号指纹")

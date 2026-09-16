@@ -172,6 +172,82 @@ class BuddyTaskTests(unittest.TestCase):
         self.assertTrue(result["buddy_ready"], result)
         self.assertNotIn("/v2/chat/completions", [r.url.path for r in self.writes()])
 
+    def test_final_preflight_rejection_releases_unsent_chat_and_allows_resume(self):
+        for gate in ("setting", "model", "exception"):
+            with self.subTest(gate=gate):
+                identity = "resume-" + gate
+                self.context["identity"] = identity
+                before = len(self.writes())
+                def can_write():
+                    if self.store.buddy_task_record(identity) is not None:
+                        if gate == "exception":
+                            raise OSError("synthetic-secret")
+                        return False
+                    return True
+                context = self.context
+                if gate == "model":
+                    context = {**context, "task_model": lambda requested=None: self.model if self.store.buddy_task_record(identity) is None else None}
+                result = self.run_flow([EMPTY, LIST, tasks("not_accepted")], context=context,
+                                       can_write=(lambda: True) if gate == "model" else can_write)
+                reason = {"setting": "buddy_task_changed", "model": "buddy_task_no_model", "exception": "buddy_task_storage_error"}[gate]
+                self.assertEqual(result["reason"], reason)
+                self.assertFalse(result["buddy_task_chat_sent"])
+                self.assertEqual(len(self.writes()), before)
+                self.assertNotIn("synthetic-secret", json.dumps(result))
+                unsent = self.store.buddy_task_record(identity)
+                self.assertEqual(unsent["chat_started"], 0)
+                reopened = ControlStore(self.root / "control.sqlite3")
+                self.addCleanup(reopened.close)
+                result = self.run_flow([EMPTY, LIST, tasks("not_accepted"), sse(), tasks("completed"),
+                                        {"agreed": True}, None, ACTIVE], context={**self.context, "store": reopened})
+                self.assertTrue(result["buddy_ready"], result)
+                self.assertEqual([r.url.path for r in self.writes()[before:]], ["/v2/chat/completions", "/activity/growth/buddy/first"])
+                saved = self.store.buddy_task_record(identity)
+                self.assertNotEqual(saved["request_id"], unsent["request_id"])
+                self.assertEqual((saved["chat_started"], saved["completed"]), (1, 1))
+                events = self.audit.list_records("admin")["items"]
+                skipped = [row for row in events if row["action"] == "buddy.task_chat"
+                           and row["details"].get("credential") == identity and row["details"].get("outcome") == "skipped"]
+                self.assertEqual(len(skipped), 1)
+                self.assertEqual(skipped[0]["details"]["request_id"], unsent["request_id"])
+
+    def test_stale_release_cannot_clear_a_new_owner_reservation(self):
+        first = self.store.reserve_buddy_task("account", "chat", model="fast-model")
+        other = ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(other.close)
+        self.assertTrue(other.release_buddy_task("account", first["request_id"]))
+        second = other.reserve_buddy_task("account", "chat", model="fast-model")
+        self.assertNotEqual(first["request_id"], second["request_id"])
+        self.assertFalse(self.store.release_buddy_task("account", first["request_id"]))
+        self.assertFalse(self.store.release_buddy_task("another-account", second["request_id"]))
+        self.assertEqual(other.buddy_task_record("account"), second)
+
+    def test_recorded_chat_outcomes_cannot_be_released(self):
+        for state in ("success", "uncertain", "completed", "usage"):
+            with self.subTest(state=state):
+                row = self.store.reserve_buddy_task(state, "chat", model="fast-model")
+                if state == "completed":
+                    self.store.buddy_task_checkpoint(state, completed=True)
+                elif state == "usage":
+                    self.store.buddy_task_checkpoint(state, total_tokens=0)
+                else:
+                    self.store.buddy_task_checkpoint(state, chat_state=state)
+                saved = self.store.buddy_task_record(state)
+                self.assertFalse(self.store.release_buddy_task(state, row["request_id"]))
+                self.assertEqual(self.store.buddy_task_record(state), saved)
+
+    def test_release_failure_retains_reservation_and_never_sends_chat(self):
+        with patch.object(self.store, "release_buddy_task", side_effect=OSError("secret")):
+            result = self.run_flow([EMPTY, LIST, tasks("not_accepted")],
+                                   can_write=lambda: self.store.buddy_task_record("account") is None)
+        self.assertEqual(result["reason"], "buddy_task_storage_error")
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.store.buddy_task_record("account")["chat_started"], 1)
+        result = self.run_flow([EMPTY, LIST, tasks("not_accepted")])
+        self.assertEqual(result["reason"], "buddy_task_unconfirmed")
+        self.assertEqual(self.writes(), [])
+
+
     def test_reserved_chat_survives_crash_without_any_replay(self):
         self.store.reserve_buddy_task("account", "chat", model="fast-model")
         result = self.run_flow([EMPTY, LIST, tasks("accepted")])
