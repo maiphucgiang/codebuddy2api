@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from app.admin_auth import AdminAuth, COOKIE_NAME
+from app.admin_auth import AdminAuth, COOKIE_NAME, MAX_PERSISTED_SESSIONS, SESSION_FILE_VERSION, SESSION_TTL
 from app.gateway_management import install_pages
 
 
@@ -77,6 +77,227 @@ class IdentityEpochTests(unittest.TestCase):
             self.assertTrue(self.auth.check_key(self.config["api_key"]))
             self.assertFalse(self.auth.check_key("wrong-key"))
             checked.assert_any_call(b"wrong-key", self.config["api_key"].encode())
+
+
+class PersistedSessionTests(unittest.TestCase):
+    """A restart must not force another login, while revocation must stay durable."""
+
+    def setUp(self):
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.directory / "admin-sessions.json"
+        self.key = "synthetic-management-key"
+        self.config = {"api_key": self.key, "session_path": self.path}
+
+    def login(self, auth, key=None):
+        (sid, session), status = auth.login(request(), self.key if key is None else key)
+        self.assertEqual(status, 200)
+        return sid, session
+
+    def revive(self, sid, config=None):
+        """Model a full process restart against the same session file."""
+        return AdminAuth(dict(config or self.config)).session(request(cookie=sid))
+
+    def assert_revoked(self, sid):
+        """Assert that a restart cannot revive the session."""
+        self.assertIsNone(self.revive(sid)[0])
+
+    def write_document(self, **document):
+        import json
+        self.path.write_text(json.dumps(document), encoding="utf-8")
+
+    def write_document_at(self, path, **document):
+        import json
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    def read_document(self):
+        import json
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def fingerprint(self, key=None):
+        return AdminAuth._fingerprint(self.key if key is None else key)
+
+    def test_session_survives_a_restart(self):
+        sid, session = self.login(AdminAuth(self.config))
+        self.assertTrue(self.path.exists())
+        self.assertEqual(self.revive(sid), (sid, session))
+
+    def test_restored_session_keeps_its_csrf_token_and_deadline(self):
+        first = AdminAuth(self.config)
+        sid, session = self.login(first)
+        restored = self.revive(sid)[1]
+        self.assertEqual(restored["csrf_token"], session["csrf_token"])
+        self.assertEqual(restored["expires"], session["expires"])
+
+    def test_expiry_uses_the_injected_wall_clock_across_instances(self):
+        now = [1_000_000.0]
+        config = dict(self.config)
+        sid, _ = self.login(AdminAuth(config, wall_clock=lambda: now[0]))
+        alive = AdminAuth(dict(config), wall_clock=lambda: now[0] + SESSION_TTL - 1)
+        self.assertEqual(alive.session(request(cookie=sid))[0], sid)
+        # A restart past the deadline drops the session, on disk as well as in memory, so
+        # only the injected wall clock — not a monotonic one — decides expiry.
+        expired = AdminAuth(dict(config), wall_clock=lambda: now[0] + SESSION_TTL + 1)
+        self.assertIsNone(expired.session(request(cookie=sid))[0])
+        self.assertNotIn(sid, self.read_document()["sessions"])
+
+    def test_rotated_key_discards_persisted_sessions(self):
+        sid, _ = self.login(AdminAuth(self.config))
+        rotated = {"api_key": "rotated-synthetic-key", "session_path": self.path}
+        self.assertIsNone(AdminAuth(rotated).session(request(cookie=sid))[0])
+        # Switching back to the original key must never resurrect the old epoch.
+        self.assert_revoked(sid)
+
+    def test_starting_with_a_disabled_key_revokes_persisted_sessions(self):
+        sid, _ = self.login(AdminAuth(self.config))
+        AdminAuth({"api_key": "", "session_path": self.path}).enabled()
+        self.assert_revoked(sid)
+
+    def test_logout_revokes_the_persisted_session(self):
+        first = AdminAuth(self.config)
+        sid, _ = self.login(first)
+        first.logout(request(cookie=sid))
+        self.assert_revoked(sid)
+
+    def test_in_process_revocation_clears_the_snapshot(self):
+        for disabled in ("", None, 1, []):
+            with self.subTest(disabled=disabled):
+                config = dict(self.config)
+                auth = AdminAuth(config)
+                sid, _ = self.login(auth)
+                config["api_key"] = disabled
+                self.assertFalse(auth.enabled())
+                self.assertEqual(auth.session(request(cookie=sid)), (None, None))
+                self.assertFalse(self.path.exists())        # Revoked on disk, not only in memory.
+                self.assert_revoked(sid)
+
+    def test_expired_sessions_are_not_restored(self):
+        sid, _ = self.login(AdminAuth(self.config))
+        self.write_document(version=SESSION_FILE_VERSION, fingerprint=self.fingerprint(),
+                            sessions={sid: {"csrf_token": "a" * 32, "expires": 1}})
+        self.assert_revoked(sid)
+
+    def test_symlinked_snapshot_is_never_followed(self):
+        import json
+        # A valid snapshot sits at the target, so following the link would be observable
+        # even on platforms that do not provide O_NOFOLLOW.
+        target = self.directory / "real.json"
+        self.write_document_at(target, version=SESSION_FILE_VERSION, fingerprint=self.fingerprint(),
+                               sessions={"a" * 32: {"csrf_token": "b" * 32, "expires": 9_999_999_999}})
+        link = self.directory / "link.json"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable on this platform")
+        auth = AdminAuth({"api_key": self.key, "session_path": link})
+        self.assertTrue(auth.enabled())                       # Rejected, not a startup crash.
+        self.assertEqual(auth.session(request(cookie="a" * 32)), (None, None))
+        self.assertTrue(target.exists())                      # The target is untouched.
+        self.assertIn("a" * 32, json.loads(target.read_text(encoding="utf-8"))["sessions"])
+
+    def test_expired_records_are_dropped_from_the_snapshot(self):
+        sid, _ = self.login(AdminAuth(self.config))
+        self.write_document(version=SESSION_FILE_VERSION, fingerprint=self.fingerprint(),
+                            sessions={sid: {"csrf_token": "a" * 32, "expires": 1_000.0}})
+        later = AdminAuth(dict(self.config), wall_clock=lambda: 5_000.0)
+        self.assertTrue(later.enabled())
+        self.assertEqual(dict(later.sessions), {})
+        # The record is gone from disk, so a wall clock that moves backward cannot revive it.
+        self.assertNotIn(sid, self.read_document()["sessions"])
+        rolled_back = AdminAuth(dict(self.config), wall_clock=lambda: 500.0)
+        self.assertTrue(rolled_back.enabled())
+        self.assertIsNone(rolled_back.session(request(cookie=sid))[0])
+
+    def test_untrusted_snapshots_are_revoked_rather_than_adopted(self):
+        import json
+        sid, _ = self.login(AdminAuth(self.config))
+        live = {"csrf_token": "a" * 32, "expires": 9_999_999_999}
+        huge = "9" * 400
+        documents = {
+            "not-json": b"not json",
+            "empty object": b"{}",
+            "unsupported version": json.dumps({"version": 99, "fingerprint": self.fingerprint(), "sessions": {}}).encode(),
+            "boolean version": json.dumps({"version": True, "fingerprint": self.fingerprint(), "sessions": {}}).encode(),
+            "foreign fingerprint": json.dumps({"version": SESSION_FILE_VERSION, "fingerprint": "0" * 64,
+                                               "sessions": {sid: live}}).encode(),
+            "non-ascii fingerprint": json.dumps({"version": SESSION_FILE_VERSION, "fingerprint": "\u4e2d\u6587",
+                                                 "sessions": {}}).encode(),
+            "unbounded expiry": json.dumps({"version": SESSION_FILE_VERSION, "fingerprint": self.fingerprint(),
+                                            "sessions": {sid: {"csrf_token": "a" * 32, "expires": 1e12}}}).encode(),
+            "non-finite expiry": b'{"version": 1, "fingerprint": "' + self.fingerprint().encode()
+                                 + b'", "sessions": {"' + sid.encode() + b'": {"csrf_token": "'
+                                 + b'a' * 32 + b'", "expires": Infinity}}}',
+            "oversized sid": json.dumps({"version": SESSION_FILE_VERSION, "fingerprint": self.fingerprint(),
+                                          "sessions": {"a" * 500: live}}).encode(),
+            "oversized csrf": json.dumps({"version": SESSION_FILE_VERSION, "fingerprint": self.fingerprint(),
+                                           "sessions": {sid: {"csrf_token": "a" * 500, "expires": 9e9}}}).encode(),
+            "duplicate field": ('{"version": 1, "fingerprint": "' + self.fingerprint()
+                                + '", "fingerprint": "' + self.fingerprint() + '", "sessions": {}}').encode(),
+            "extra field": json.dumps({"version": SESSION_FILE_VERSION, "fingerprint": self.fingerprint(),
+                                        "sessions": {}, "extra": 1}).encode(),
+            "oversized file": b"x" * (300 * 1024),
+            # An integer too large for float() must not raise OverflowError out of enabled().
+            "expiry beyond float": ('{"version": 1, "fingerprint": "' + self.fingerprint()
+                                    + '", "sessions": {"' + sid + '": {"csrf_token": "' + "a" * 32
+                                    + '", "expires": ' + huge + '}}}').encode(),
+            "negative expiry beyond float": ('{"version": 1, "fingerprint": "' + self.fingerprint()
+                                             + '", "sessions": {"' + sid + '": {"csrf_token": "' + "a" * 32
+                                             + '", "expires": -' + huge + '}}}').encode(),
+            # Deeply nested JSON inside the size bound must not raise RecursionError either.
+            "deeply nested": b"[" * 50_000 + b"]" * 50_000,
+        }
+        for name, content in documents.items():
+            with self.subTest(name=name):
+                self.path.write_bytes(content)
+                auth = AdminAuth(dict(self.config))
+                self.assertTrue(auth.enabled())             # Malformed input never breaks startup.
+                self.assertEqual(auth.session(request(cookie=sid)), (None, None))
+                self.assertFalse(self.path.exists())        # It is revoked, not left for a later start.
+                self.assert_revoked(sid)
+
+    def test_write_failure_revokes_instead_of_leaving_a_stale_snapshot(self):
+        first = AdminAuth(self.config)
+        sid, _ = self.login(first)
+        with patch("app.admin_auth.tempfile.mkstemp", side_effect=OSError("disk full")):
+            first.logout(request(cookie=sid))
+        self.assert_revoked(sid)
+
+    def test_key_rotation_survives_a_write_failure(self):
+        sid, _ = self.login(AdminAuth(self.config))
+        with patch("app.admin_auth.tempfile.mkstemp", side_effect=OSError("disk full")):
+            AdminAuth({"api_key": "rotated-synthetic-key", "session_path": self.path}).enabled()
+        self.assert_revoked(sid)
+
+    def test_symlinked_snapshot_is_never_followed(self):
+        target = self.directory / "real.json"
+        target.write_text("outside-sentinel", encoding="utf-8")
+        link = self.directory / "link.json"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable on this platform")
+        auth = AdminAuth({"api_key": self.key, "session_path": link})
+        self.assertTrue(auth.enabled())
+        self.assertEqual(auth.session(request(cookie="sid")), (None, None))
+        self.assertTrue(target.exists())                     # The target is untouched.
+
+    def test_missing_path_keeps_sessions_in_memory_only(self):
+        auth = AdminAuth({"api_key": self.key})
+        sid, _ = self.login(auth)
+        self.assertEqual(list(self.directory.iterdir()), [])
+        self.assertIsNone(AdminAuth({"api_key": self.key}).session(request(cookie=sid))[0])
+
+    def test_snapshot_bounds_the_session_table(self):
+        auth = AdminAuth(self.config)
+        for _ in range(MAX_PERSISTED_SESSIONS + 20):
+            self.login(auth)
+        self.assertLessEqual(len(auth.sessions), MAX_PERSISTED_SESSIONS)
+        self.assertLessEqual(len(self.revive(next(iter(auth.sessions)))[1]), 2)
+
+    def test_snapshot_is_owner_only_where_the_platform_supports_it(self):
+        import stat as stat_module
+        self.login(AdminAuth(self.config))
+        if sys.platform != "win32":
+            self.assertEqual(stat_module.S_IMODE(self.path.stat().st_mode), 0o600)
 
 
 class StaticBoundaryTests(unittest.TestCase):
