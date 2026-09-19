@@ -2,8 +2,16 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import hashlib
 import hmac
+import json
+import math
+import os
+from pathlib import Path
+import re
 import secrets
+import stat
+import tempfile
 import threading
 import time
 from urllib.parse import urlsplit
@@ -14,10 +22,52 @@ from starlette.responses import JSONResponse
 COOKIE_NAME = "cb_admin_session"
 SESSION_TTL = 12 * 3600
 
+# Optional persisted session table so a restart does not force another login.
+# Revocation is enforced by clearing this file: the stored fingerprint only tells us
+# which key epoch the snapshot belongs to, it is not an integrity MAC over the sessions.
+SESSION_FILE_VERSION = 1
+MAX_PERSISTED_SESSIONS = 256
+_SESSION_FILE_BYTES = 256 * 1024
+_SESSION_KEY_LABEL = b"codebuddy2api-admin-session-key-v1"
+# SIDs and CSRF tokens are token_urlsafe(32); bound them so a crafted file cannot
+# install arbitrarily large values into memory.
+_MAX_TOKEN_CHARS = 128
+_TOKEN = re.compile(r"\A[A-Za-z0-9_-]{16,%d}\Z" % _MAX_TOKEN_CHARS)
+_FINGERPRINT = re.compile(r"\A[0-9a-f]{64}\Z")
+
 
 def error_response(status, message):
     return JSONResponse({"error": {"message": message, "type": "conflict_error" if status == 409 else "admin_error"}}, status_code=status,
                         headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
+def _session_path(value):
+    """Resolve the optional session file; a missing or unusable path keeps sessions in memory."""
+    if not value:
+        return None
+    try:
+        path = Path(os.path.abspath(os.fspath(value)))
+    except (TypeError, ValueError):
+        return None
+    if not path.name or path.name in (".", ".."):
+        return None
+    return path
+
+
+def _strict_json(content):
+    """Parse JSON rejecting duplicate keys and non-finite constants."""
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise ValueError("Duplicate JSON field")
+            value[key] = item
+        return value
+
+    def invalid_constant(_):
+        raise ValueError("Invalid JSON constant")
+
+    return json.loads(content, object_pairs_hook=pairs, parse_constant=invalid_constant)
 
 
 def origin_allowlist(value):
@@ -64,24 +114,161 @@ def same_origin(request, allowed=()):
 
 
 class AdminAuth:
-    def __init__(self, config, *, clock=time.monotonic):
+    def __init__(self, config, *, clock=time.monotonic, wall_clock=time.time):
         self.config = config
-        self.clock = clock
+        self.clock = clock          # Monotonic: login throttling only.
+        self.wall_clock = wall_clock  # Wall clock: session expiry, so it survives a restart.
         self.lock = threading.RLock()
         self.sessions = OrderedDict()
         self.failures = OrderedDict()
         self._configured_key = None
         self._identity = None
+        self._path = _session_path(config.get("session_path"))
+
+    @staticmethod
+    def _fingerprint(key):
+        """Keyed fingerprint naming the key epoch a snapshot belongs to.
+
+        It identifies the epoch; revocation itself is performed by clearing the file.
+        """
+        return hmac.new(key.encode(), _SESSION_KEY_LABEL, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _token(value):
+        """Accept only bounded url-safe tokens, rejecting bools and non-strings."""
+        return value if isinstance(value, str) and _TOKEN.match(value) else None
+
+    @staticmethod
+    def _deadline(value):
+        """Accept only finite, in-range numeric deadlines; bool is not a deadline."""
+        if type(value) not in (int, float):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) and 0 < number < 1e11 else None
+
+    def _revoke(self):
+        """Revoke the persisted snapshot; returns False when it could not be cleared."""
+        if self._path is None:
+            return True
+        try:
+            os.unlink(self._path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _restore(self, key):
+        """Load persisted sessions for the current key epoch.
+
+        Returns False when a snapshot exists that cannot be trusted or validated,
+        so the caller revokes it instead of leaving it available to a later start.
+        """
+        if self._path is None:
+            return True
+        try:
+            fd = os.open(self._path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            # Unreadable or not a plain readable file: treat as an unusable snapshot.
+            return False
+        try:
+            with os.fdopen(fd, "rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _SESSION_FILE_BYTES:
+                    return False
+                raw = stream.read(_SESSION_FILE_BYTES + 1)
+        except OSError:
+            return False
+        if len(raw) > _SESSION_FILE_BYTES:
+            return False
+        try:
+            document = _strict_json(raw)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        if (not isinstance(document, dict) or set(document) != {"version", "fingerprint", "sessions"}
+                or type(document["version"]) is not int or document["version"] != SESSION_FILE_VERSION):
+            return False
+        stored = document["fingerprint"]
+        if not isinstance(stored, str) or not _FINGERPRINT.match(stored):
+            return False
+        # A snapshot for another key epoch (including a disabled key) is never adopted.
+        if not key or not hmac.compare_digest(stored, self._fingerprint(key)):
+            return False
+        entries = document["sessions"]
+        if not isinstance(entries, dict) or len(entries) > MAX_PERSISTED_SESSIONS:
+            return False
+        now = self.wall_clock()
+        restored = OrderedDict()
+        for sid, item in entries.items():
+            if not isinstance(item, dict) or set(item) != {"csrf_token", "expires"}:
+                return False
+            token = self._token(sid)
+            csrf_token = self._token(item["csrf_token"])
+            expires = self._deadline(item["expires"])
+            if token is None or csrf_token is None or expires is None:
+                return False
+            if expires > now:
+                restored[token] = {"csrf_token": csrf_token, "expires": expires}
+        self.sessions.update(restored)
+        return True
+
+    def _persist(self):
+        """Atomically rewrite the session table; returns False when it was not durable."""
+        if self._path is None:
+            return True
+        if not self._configured_key:
+            # A disabled key revokes everywhere; drop the snapshot instead of writing one.
+            return self._revoke()
+        document = {"version": SESSION_FILE_VERSION, "fingerprint": self._fingerprint(self._configured_key),
+                    "sessions": {sid: {"csrf_token": item["csrf_token"], "expires": item["expires"]}
+                                 for sid, item in self.sessions.items()}}
+        try:
+            content = json.dumps(document, ensure_ascii=False, separators=(",", ":"),
+                                 allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError):
+            return False
+        temporary = None
+        try:
+            self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".admin-sessions-", suffix=".tmp", dir=self._path.parent)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, self._path)
+            temporary = None
+        except (OSError, ValueError):
+            # Fall back to removing the stale snapshot so revoked sessions cannot return.
+            return self._revoke()
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+        return True
 
     def _key(self):
         key = self.config.get("api_key") or ""
         if not isinstance(key, str):
             key = ""
         if self._configured_key is None or not hmac.compare_digest(key.encode(), self._configured_key.encode()):
-            self.sessions.clear()
+            restoring = self._configured_key is None
             self._configured_key = key
+            self.sessions.clear()
             # Restoring a previous key must not restore that epoch's OAuth owner.
             self._identity = secrets.token_urlsafe(32)
+            if restoring:
+                # Adopt only a snapshot that matches the current epoch; anything else is
+                # revoked, so switching back to an old key cannot resurrect its sessions.
+                if not self._restore(key):
+                    self._revoke()
+            else:
+                # A rotated or cleared key revokes every session, on disk as well.
+                self._persist()
         return key
 
     def csrf_enabled(self):
@@ -114,9 +301,10 @@ class AdminAuth:
         with self.lock:
             self._key()
             item = self.sessions.get(sid)
-            if item and item["expires"] > self.clock():
+            if item and item["expires"] > self.wall_clock():
                 return sid, dict(item)
-            self.sessions.pop(sid, None)
+            if self.sessions.pop(sid, None) is not None:
+                self._persist()
         return None, None
 
     def login(self, request, key):
@@ -140,15 +328,17 @@ class AdminAuth:
             old = request.cookies.get(COOKIE_NAME)
             self.sessions.pop(old, None)
             sid = secrets.token_urlsafe(32)
-            item = {"csrf_token": secrets.token_urlsafe(32), "expires": now + SESSION_TTL}
+            item = {"csrf_token": secrets.token_urlsafe(32), "expires": self.wall_clock() + SESSION_TTL}
             self.sessions[sid] = item
-            while len(self.sessions) > 256:
+            while len(self.sessions) > MAX_PERSISTED_SESSIONS:
                 self.sessions.popitem(last=False)
+            self._persist()
             return (sid, dict(item)), 200
 
     def logout(self, request):
         with self.lock:
-            self.sessions.pop(request.cookies.get(COOKIE_NAME), None)
+            if self.sessions.pop(request.cookies.get(COOKIE_NAME), None) is not None:
+                self._persist()
 
 
 class AdminMiddleware:

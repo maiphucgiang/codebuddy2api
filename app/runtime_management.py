@@ -66,6 +66,9 @@ def initialize(gateway, args, argv=None, *, parser=None):
     root = gateway.managed_auth_dir()
     control = ControlStore(root / "control.sqlite3")
     config["control_store"] = control
+    # Persist management sessions so a restart does not force another API-key login.
+    # The file stores an HMAC fingerprint of the key epoch, so key rotation still revokes them.
+    config["session_path"] = root / "admin-sessions.json"
     config.update(vars(args))
     config["model_guard"] = not args.no_model_guard
     aliases = {"log": "log_path", "no_model_guard": "model_guard"}
