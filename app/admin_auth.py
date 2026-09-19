@@ -143,7 +143,11 @@ class AdminAuth:
         """Accept only finite, in-range numeric deadlines; bool is not a deadline."""
         if type(value) not in (int, float):
             return None
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            # An integer too large for float() is not a deadline.
+            return None
         return number if math.isfinite(number) and 0 < number < 1e11 else None
 
     def _revoke(self):
@@ -157,6 +161,18 @@ class AdminAuth:
         except OSError:
             return False
         return True
+
+    def _is_direct_file(self, metadata):
+        """True when the opened file is the path itself rather than a symlink target."""
+        try:
+            link = os.lstat(self._path)
+        except OSError:
+            return False
+        if stat.S_ISLNK(link.st_mode):
+            return False
+        # Identity is the fallback where lstat cannot report a link; both values are
+        # zero on filesystems that do not expose inodes, which leaves the check above.
+        return (link.st_dev, link.st_ino) == (metadata.st_dev, metadata.st_ino)
 
     def _restore(self, key):
         """Load persisted sessions for the current key epoch.
@@ -178,6 +194,10 @@ class AdminAuth:
                 metadata = os.fstat(stream.fileno())
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _SESSION_FILE_BYTES:
                     return False
+                # O_NOFOLLOW is absent on Windows, where os.open follows a symlink. Compare
+                # the opened file with the path itself, so a link is rejected, not followed.
+                if not self._is_direct_file(metadata):
+                    return False
                 raw = stream.read(_SESSION_FILE_BYTES + 1)
         except OSError:
             return False
@@ -185,7 +205,8 @@ class AdminAuth:
             return False
         try:
             document = _strict_json(raw)
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            # RecursionError: size-bounded but deeply nested JSON still exhausts the parser.
             return False
         if (not isinstance(document, dict) or set(document) != {"version", "fingerprint", "sessions"}
                 or type(document["version"]) is not int or document["version"] != SESSION_FILE_VERSION):
@@ -212,6 +233,10 @@ class AdminAuth:
             if expires > now:
                 restored[token] = {"csrf_token": csrf_token, "expires": expires}
         self.sessions.update(restored)
+        if len(restored) != len(entries):
+            # Expired records were dropped: rewrite the snapshot, so a wall clock that
+            # later moves backward cannot restore them from the file we just read.
+            self._persist()
         return True
 
     def _persist(self):

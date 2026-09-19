@@ -105,6 +105,14 @@ class PersistedSessionTests(unittest.TestCase):
         import json
         self.path.write_text(json.dumps(document), encoding="utf-8")
 
+    def write_document_at(self, path, **document):
+        import json
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    def read_document(self):
+        import json
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
     def fingerprint(self, key=None):
         return AdminAuth._fingerprint(self.key if key is None else key)
 
@@ -123,12 +131,14 @@ class PersistedSessionTests(unittest.TestCase):
     def test_expiry_uses_the_injected_wall_clock_across_instances(self):
         now = [1_000_000.0]
         config = dict(self.config)
-        first = AdminAuth(config, wall_clock=lambda: now[0])
-        sid, _ = self.login(first)
-        expired = AdminAuth(dict(config), wall_clock=lambda: now[0] + SESSION_TTL + 1)
-        self.assertIsNone(expired.session(request(cookie=sid))[0])
+        sid, _ = self.login(AdminAuth(config, wall_clock=lambda: now[0]))
         alive = AdminAuth(dict(config), wall_clock=lambda: now[0] + SESSION_TTL - 1)
         self.assertEqual(alive.session(request(cookie=sid))[0], sid)
+        # A restart past the deadline drops the session, on disk as well as in memory, so
+        # only the injected wall clock — not a monotonic one — decides expiry.
+        expired = AdminAuth(dict(config), wall_clock=lambda: now[0] + SESSION_TTL + 1)
+        self.assertIsNone(expired.session(request(cookie=sid))[0])
+        self.assertNotIn(sid, self.read_document()["sessions"])
 
     def test_rotated_key_discards_persisted_sessions(self):
         sid, _ = self.login(AdminAuth(self.config))
@@ -166,10 +176,42 @@ class PersistedSessionTests(unittest.TestCase):
                             sessions={sid: {"csrf_token": "a" * 32, "expires": 1}})
         self.assert_revoked(sid)
 
+    def test_symlinked_snapshot_is_never_followed(self):
+        import json
+        # A valid snapshot sits at the target, so following the link would be observable
+        # even on platforms that do not provide O_NOFOLLOW.
+        target = self.directory / "real.json"
+        self.write_document_at(target, version=SESSION_FILE_VERSION, fingerprint=self.fingerprint(),
+                               sessions={"a" * 32: {"csrf_token": "b" * 32, "expires": 9_999_999_999}})
+        link = self.directory / "link.json"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable on this platform")
+        auth = AdminAuth({"api_key": self.key, "session_path": link})
+        self.assertTrue(auth.enabled())                       # Rejected, not a startup crash.
+        self.assertEqual(auth.session(request(cookie="a" * 32)), (None, None))
+        self.assertTrue(target.exists())                      # The target is untouched.
+        self.assertIn("a" * 32, json.loads(target.read_text(encoding="utf-8"))["sessions"])
+
+    def test_expired_records_are_dropped_from_the_snapshot(self):
+        sid, _ = self.login(AdminAuth(self.config))
+        self.write_document(version=SESSION_FILE_VERSION, fingerprint=self.fingerprint(),
+                            sessions={sid: {"csrf_token": "a" * 32, "expires": 1_000.0}})
+        later = AdminAuth(dict(self.config), wall_clock=lambda: 5_000.0)
+        self.assertTrue(later.enabled())
+        self.assertEqual(dict(later.sessions), {})
+        # The record is gone from disk, so a wall clock that moves backward cannot revive it.
+        self.assertNotIn(sid, self.read_document()["sessions"])
+        rolled_back = AdminAuth(dict(self.config), wall_clock=lambda: 500.0)
+        self.assertTrue(rolled_back.enabled())
+        self.assertIsNone(rolled_back.session(request(cookie=sid))[0])
+
     def test_untrusted_snapshots_are_revoked_rather_than_adopted(self):
         import json
         sid, _ = self.login(AdminAuth(self.config))
         live = {"csrf_token": "a" * 32, "expires": 9_999_999_999}
+        huge = "9" * 400
         documents = {
             "not-json": b"not json",
             "empty object": b"{}",
@@ -193,6 +235,15 @@ class PersistedSessionTests(unittest.TestCase):
             "extra field": json.dumps({"version": SESSION_FILE_VERSION, "fingerprint": self.fingerprint(),
                                         "sessions": {}, "extra": 1}).encode(),
             "oversized file": b"x" * (300 * 1024),
+            # An integer too large for float() must not raise OverflowError out of enabled().
+            "expiry beyond float": ('{"version": 1, "fingerprint": "' + self.fingerprint()
+                                    + '", "sessions": {"' + sid + '": {"csrf_token": "' + "a" * 32
+                                    + '", "expires": ' + huge + '}}}').encode(),
+            "negative expiry beyond float": ('{"version": 1, "fingerprint": "' + self.fingerprint()
+                                             + '", "sessions": {"' + sid + '": {"csrf_token": "' + "a" * 32
+                                             + '", "expires": -' + huge + '}}}').encode(),
+            # Deeply nested JSON inside the size bound must not raise RecursionError either.
+            "deeply nested": b"[" * 50_000 + b"]" * 50_000,
         }
         for name, content in documents.items():
             with self.subTest(name=name):
