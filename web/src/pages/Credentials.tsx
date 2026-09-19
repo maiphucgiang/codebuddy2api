@@ -116,7 +116,7 @@ export function Credentials() {
   const [notice, setNotice] = useState<string | null>(null);
   const [maintenance, setMaintenance] = useState<Record<string, unknown>[]>([]);
   const maintain = (
-    action: "refresh" | "checkin" | "sync" | "travel" | "travel-status",
+    action: "refresh" | "checkin" | "sync" | "travel" | "travel-status" | "reset-cooldown",
     credential?: Credential,
   ) => {
     if (busy) return;
@@ -478,6 +478,16 @@ export function Credentials() {
                               onClick={() => maintain("sync", c)}
                             >
                               同步余额
+                            </button>
+                            {/* Not gated on displayed cooldowns or on enablement: a reset that failed
+                                to persist must stay retryable, and a disabled account can still hold
+                                a stale cooldown worth clearing. */}
+                            <button
+                              disabled={busy}
+                              aria-label={`清除冷却 ${c.name ?? c.id}`}
+                              onClick={() => maintain("reset-cooldown", c)}
+                            >
+                              清除冷却
                             </button>
                             {c.trial_supported === true && (
                               <button
