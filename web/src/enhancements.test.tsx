@@ -169,6 +169,7 @@ describe("scoped credential buttons", () => {
       ["刷新凭证 one.info", "/credentials/one/refresh"],
       ["签到 one.info", "/credentials/one/checkin"],
       ["同步余额 one.info", "/credentials/one/sync"],
+      ["清除冷却 one.info", "/credentials/one/reset-cooldown"],
       ["批量签到", "/checkin"],
       ["同步全部余额", "/sync"],
     ]) {
@@ -179,6 +180,45 @@ describe("scoped credential buttons", () => {
         expect.objectContaining({ timeout: 300000 }),
       );
     }
-    expect(post).toHaveBeenCalledTimes(5);
+    expect(post).toHaveBeenCalledTimes(6);
+  });
+
+  it("keeps the cooldown reset available for a disabled account and a failed write", async () => {
+    // Neither condition may hide the button: a failed durable clear has to stay retryable, and a
+    // disabled account can still hold a cooldown worth clearing.
+    vi.mocked(useResource).mockReturnValue({
+      data: [
+        { id: "one", name: "one.info", enabled: false, profile: "cn-cli", health: "circuit_open" },
+      ],
+      reload: vi.fn(),
+      loading: false,
+      error: null,
+    });
+    const post = vi.spyOn(api, "post").mockResolvedValue({
+      data: {
+        results: [
+          {
+            id: "one",
+            name: "one.info",
+            ok: false,
+            changed_in_memory: true,
+            durable: false,
+            message: "内存冷却已清除，但写入失败，重启后可能恢复；请稍后重试",
+          },
+        ],
+      },
+    });
+    render(<Credentials />);
+    const button = screen.getByRole("button", { name: "清除冷却 one.info" });
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => fireEvent.click(button));
+    expect(post).toHaveBeenLastCalledWith(
+      "/credentials/one/reset-cooldown",
+      undefined,
+      expect.objectContaining({ timeout: 300000 }),
+    );
+    // The failure is surfaced rather than silently swallowed.
+    expect(await screen.findByText("未完成")).toBeTruthy();
+    expect(screen.getByText(/写入失败/)).toBeTruthy();
   });
 });

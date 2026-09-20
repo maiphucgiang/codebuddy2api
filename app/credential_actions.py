@@ -9,11 +9,18 @@ from .credential_io import credential_file_lock
 
 
 def run(gateway, action, identity=None, *, consent_revision=None):
-    if action not in {"refresh", "checkin", "sync", "travel", "travel-status", "trial"} or (action in {"refresh", "travel", "travel-status", "trial"} and identity is None):
+    if action not in {"refresh", "checkin", "sync", "travel", "travel-status", "trial", "reset-cooldown"} or (action in {"refresh", "travel", "travel-status", "trial", "reset-cooldown"} and identity is None):
         raise HTTPException(404, "凭证操作不存在")
     if consent_revision is not None and (action != "travel" or identity is None or consent_revision != buddy.AGREEMENT_REVISION):
         raise HTTPException(400, "首领确认无效或协议版本已变化")
     config = gateway.CONFIG
+    # Clearing a cooldown only edits local state: it needs neither the ledger nor a network round
+    # trip, and it must stay available while the periodic maintenance sweep holds its lock. It is
+    # also allowed for a disabled account, since a stale cooldown is worth clearing either way.
+    if action == "reset-cooldown":
+        result = _reset_cooldowns(gateway, identity)
+        _audit(config, result)
+        return {"ok": result["ok"], "results": [result]}
     pool, ledger = config.get("cred_pool"), config.get("ledger")
     if pool is None or (action not in {"refresh", "trial"} and (ledger is None or gateway.credits_mod is None)):
         raise HTTPException(503, "凭证维护尚未就绪")
@@ -49,30 +56,64 @@ def run(gateway, action, identity=None, *, consent_revision=None):
                         result["checkin_ok"] = True
                     result.update(ok=False, message="操作失败，保留已有数据；请检查账号状态后重试")
             results.append(result)
-            audit = config.get("audit_store")
-            if audit:
-                try:
-                    details = {"credential": result["id"], "ok": result["ok"]}
-                    if action == "trial":
-                        details.update(outcome="success" if result["ok"] else "error", stage=result.get("state"),
-                                       status_code=result.get("status"),
-                                       code=str(result["code"]) if result.get("code") is not None else None,
-                                       duration_ms=(time.monotonic() - started) * 1000)
-                    trip = result.get("travel") if action == "checkin" else result if action in {"travel", "travel-status"} else None
-                    if isinstance(trip, dict):
-                        details.update(outcome="success" if trip.get("ok") else "warning" if trip.get("buddy_blocked") else "error",
-                                       stage=trip.get("phase"), status_code=trip.get("http_status"),
-                                       code=trip.get("reason") or (str(trip["code"]) if trip.get("code") is not None else None),
-                                       consent_source=trip.get("consent_source"))
-                    audit.event("admin", "credential." + action, details)
-                except Exception:
-                    pass
+            _audit(config, result, started)
         response = {"ok": bool(results) and all(r["ok"] for r in results), "results": results}
         if identity is None and ledger is not None:
             response["credits"] = ledger.snapshot()  # Keep the legacy check-in response field.
         return response
     finally:
         gateway._HOUSEKEEP_LOCK.release()
+
+
+def _audit(config, result, started=None):
+    """Record one credential action; auditing must never break the action itself."""
+    audit = config.get("audit_store")
+    if not audit:
+        return
+    try:
+        action = result.get("action")
+        details = {"credential": result["id"], "ok": result["ok"]}
+        if action == "trial":
+            details.update(outcome="success" if result["ok"] else "error", stage=result.get("state"),
+                           status_code=result.get("status"),
+                           code=str(result["code"]) if result.get("code") is not None else None,
+                           duration_ms=(time.monotonic() - started) * 1000 if started is not None else None)
+        if action == "reset-cooldown":
+            # The audit sanitizer keeps a fixed key allowlist, so report the split outcome through
+            # fields it retains rather than widening a shared schema.
+            details.update(outcome="success" if result["ok"] else "error",
+                           stage="durable" if result.get("durable") else "memory_only",
+                           code="reset_cooldown" if result.get("durable") else "reset_cooldown_write_failed")
+        trip = result.get("travel") if action == "checkin" else result if action in {"travel", "travel-status"} else None
+        if isinstance(trip, dict):
+            details.update(outcome="success" if trip.get("ok") else "warning" if trip.get("buddy_blocked") else "error",
+                           stage=trip.get("phase"), status_code=trip.get("http_status"),
+                           code=trip.get("reason") or (str(trip["code"]) if trip.get("code") is not None else None),
+                           consent_source=trip.get("consent_source"))
+        audit.event("admin", "credential." + str(action), details)
+    except Exception:
+        pass
+
+
+def _reset_cooldowns(gateway, identity):
+    """Lift every cooldown an account holds, reporting memory and durability separately."""
+    pool = gateway.CONFIG.get("cred_pool")
+    if pool is None:
+        raise HTTPException(503, "凭证维护尚未就绪")
+    pool._rescan()
+    entry = next((e for e in pool.entries() if e.get("account_key") == identity), None)
+    if entry is None:
+        raise HTTPException(404, "凭证不存在或身份已变化")
+    outcome = pool.reset_cooldowns_for(identity)
+    result = {"id": identity, "name": Path(entry["id"]).name, "action": "reset-cooldown",
+              "ok": outcome["durable"], "changed_in_memory": outcome["changed_in_memory"],
+              "durable": outcome["durable"]}
+    if outcome["durable"]:
+        result["message"] = "已清除该账号的冷却" if outcome["changed_in_memory"] else "该账号当前没有冷却"
+    else:
+        # Never let a failed write read as a completed reset: a restart would restore the row.
+        result["message"] = "内存冷却已清除，但写入失败，重启后可能恢复；请稍后重试"
+    return result
 
 
 def _one(gateway, pool, ledger, entry, action, *, automatic=False, consent_revision=None):

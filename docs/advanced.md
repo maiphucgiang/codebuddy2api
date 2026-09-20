@@ -110,9 +110,11 @@ Trial credits are manual-only for eligible `intl-work` accounts: use the credent
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | Start/poll login; `site=cn` (default), `intl` (international WorkBuddy) or `intl-codebuddy` (international CodeBuddy) |
 | `GET /admin/credits` · `POST /admin/checkin` | Inspect credits; daily-idempotent check-in followed by domestic travel when enabled |
 | `POST /admin/sync` | Synchronize all enabled accounts' balances, catalogs and usage; no check-in or trial claims |
-| `POST /admin/credentials/{id}/{action}` | Single-account `refresh`, `checkin`, `sync`, `travel-status` (query only), `travel` (claim then dispatch), or `trial` (one-time trial credits) |
+| `POST /admin/credentials/{id}/{action}` | Single-account `refresh`, `checkin`, `sync`, `travel-status` (query only), `travel` (claim then dispatch), `trial` (one-time trial credits), or `reset-cooldown` (local-only) |
 
 Travel results include `phase`, optional safe `error_kind`/`http_status`/`code`, and snapshot `remaining_seconds`. `claimed`/`departed` remain true for confirmed writes even if a later query sets `ok=false` and `stale=true`; query status before another attempt.
+
+`reset-cooldown` takes no request body and lifts every cooldown held by one account — both its 401/403 circuit breaker and its per-model 429 cooldowns — so an operator can recover from a cooldown recorded in error without restarting the gateway. It only edits local state: it never refreshes a token, contacts upstream, or queues synchronization, and it works for a manually disabled account. The result separates `changed_in_memory` from `durable`; `ok` is false when the write failed, in which case the in-memory reset is already effective but a restart would restore the stored row, and the request can simply be repeated.
 
 Pages use `/dashboard/*`, management APIs use `/admin/*`, and clients retain `/v1/*`. `/cn` and `/intl` API prefixes are not registered. Automatic model routing requires no client URL changes.
 

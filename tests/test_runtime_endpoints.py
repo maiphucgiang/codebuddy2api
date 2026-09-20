@@ -10,6 +10,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
@@ -22,6 +23,8 @@ from fastapi.testclient import TestClient
 
 import converter
 from app import upstream_io
+from app import runtime_management
+from app.usage_snapshots import UsageSnapshots
 
 
 ROUTES = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
@@ -776,6 +779,120 @@ class AuxiliaryCapacityTests(unittest.IsolatedAsyncioTestCase):
         finally:
             gate.release()
 
+
+
+class StartupUsageHydrationTests(unittest.TestCase):
+    """Exercise the real main() startup path, not a look-alike helper call."""
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"CODEBUDDY_AUTH_DIR": str(self.root)}, clear=False))
+        self.path = self.root / "usage-snapshots.json"
+
+    def credential(self, uid="synthetic-uid"):
+        now = time.time()
+        path = self.root / "account.info"
+        path.write_text(json.dumps({"account": {"uid": uid}, "auth": {
+            "accessToken": "synthetic-token", "refreshToken": "synthetic-refresh",
+            "domain": "www.codebuddy.cn", "expiresAt": (now + 86400) * 1000,
+            "lastRefreshTime": now * 1000}}), encoding="utf-8")
+        return path
+
+    def test_main_publishes_cached_usage_before_serving(self):
+        """The aggregate must be populated by the time uvicorn.run is entered."""
+        path = self.credential()
+        # Preseed the cache for the identity this credential will resolve to.
+        probe = converter.CredentialPool([path], blocks_path=self.root / "blocks.json")
+        entry = probe._entries[0]
+        snapshots = UsageSnapshots(self.path)
+        snapshots.store(entry["id"], entry["account_key"], "domestic",
+                        {"by_day": {"2026-09-19": {"m": 6.0}}, "total_credits": 6.0,
+                         "requests": 3, "partial": False})
+
+        observed = {}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(converter.CONFIG))
+            stack.enter_context(patch("sys.argv", ["converter.py", "--skip-check",
+                                                  "--auth-file", str(path)]))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(patch.object(converter.threading, "Thread"))       # No real threads.
+            stack.enter_context(patch.object(converter, "credits_mod", None))      # No network.
+            stack.enter_context(patch.object(converter, "seed_credentials"))
+            stack.enter_context(patch.object(converter, "preflight", return_value=True))
+            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
+            # handle is left open on Windows.
+            stack.enter_context(patch.object(runtime_management, "initialize"))
+            stack.enter_context(patch.object(runtime_management, "install"))
+
+            def capture(*args, **kwargs):
+                # Inspect the aggregate at the moment the server would start serving.
+                observed["usage"] = converter.CONFIG.get("usage_daily")
+                observed["accounts"] = converter.CONFIG.get("usage_daily_accounts")
+            stack.enter_context(patch.object(converter.uvicorn, "run", side_effect=capture))
+            converter.main()
+
+        self.assertIsNotNone(observed["usage"], "main() never published usage")
+        self.assertEqual(observed["usage"]["total_credits"], 6.0)
+        self.assertEqual(observed["usage"]["requests"], 3)
+        self.assertEqual(observed["usage"]["stale_accounts"], ["account.info"])
+        self.assertTrue(observed["accounts"][entry["id"]]["stale"])
+
+    def test_main_without_a_cache_leaves_usage_empty(self):
+        """An empty deployment must not be disturbed by the hydration step."""
+        path = self.credential()
+        observed = {}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(converter.CONFIG))
+            stack.enter_context(patch("sys.argv", ["converter.py", "--skip-check",
+                                                  "--auth-file", str(path)]))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(patch.object(converter.threading, "Thread"))
+            stack.enter_context(patch.object(converter, "credits_mod", None))
+            stack.enter_context(patch.object(converter, "seed_credentials"))
+            stack.enter_context(patch.object(converter, "preflight", return_value=True))
+            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
+            # handle is left open on Windows.
+            stack.enter_context(patch.object(runtime_management, "initialize"))
+            stack.enter_context(patch.object(runtime_management, "install"))
+            stack.enter_context(patch.object(converter.uvicorn, "run",
+                                            side_effect=lambda *a, **k: observed.setdefault("usage",
+                                                                                            converter.CONFIG.get("usage_daily"))))
+            converter.main()
+        self.assertIsNone(observed["usage"])
+        self.assertFalse(self.path.exists())
+
+    def test_main_starts_no_maintenance_thread_before_hydration(self):
+        """Hydration must complete before the maintenance threads are started."""
+        path = self.credential()
+        probe = converter.CredentialPool([path], blocks_path=self.root / "blocks.json")
+        entry = probe._entries[0]
+        UsageSnapshots(self.path).store(entry["id"], entry["account_key"], "domestic",
+                                       {"by_day": {}, "total_credits": 1.0, "requests": 1,
+                                        "partial": False})
+        events = []
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(converter.CONFIG))
+            stack.enter_context(patch("sys.argv", ["converter.py", "--skip-check",
+                                                  "--auth-file", str(path)]))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(patch.object(converter, "credits_mod", None))
+            stack.enter_context(patch.object(converter, "seed_credentials"))
+            stack.enter_context(patch.object(converter, "preflight", return_value=True))
+            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
+            # handle is left open on Windows.
+            stack.enter_context(patch.object(runtime_management, "initialize"))
+            stack.enter_context(patch.object(runtime_management, "install"))
+            real_thread = converter.threading.Thread
+
+            def note_thread(*args, **kwargs):
+                events.append(("thread", converter.CONFIG.get("usage_daily") is not None))
+                return Mock()
+            stack.enter_context(patch.object(converter.threading, "Thread", side_effect=note_thread))
+            stack.enter_context(patch.object(converter.uvicorn, "run"))
+            converter.main()
+        # Every thread must have been started after usage was published.
+        self.assertTrue(events)
+        self.assertTrue(all(published for _, published in events), events)
 
 
 class ConfigurationTests(unittest.TestCase):

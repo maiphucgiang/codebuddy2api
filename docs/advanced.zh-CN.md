@@ -110,9 +110,11 @@ scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` 
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | 发起与轮询登录；`site=cn`（默认）、`intl`（国际 WorkBuddy）或 `intl-codebuddy`（国际 CodeBuddy） |
 | `GET /admin/credits` · `POST /admin/checkin` | 查询额度；按日幂等签到，国内按开关继续旅行 |
 | `POST /admin/sync` | 同步全部启用账号的余额、目录和用量，不签到、不领取试用 |
-| `POST /admin/credentials/{id}/{action}` | 单账号 `refresh`、`checkin`、`sync`、`travel-status`（仅查询）、`travel`（领取后派出）或 `trial`（一次性体验积分） |
+| `POST /admin/credentials/{id}/{action}` | 单账号 `refresh`、`checkin`、`sync`、`travel-status`（仅查询）、`travel`（领取后派出）、`trial`（一次性体验积分）或 `reset-cooldown`（仅本地状态） |
 
 旅行结果包含 `phase`、可选的安全诊断 `error_kind`/`http_status`/`code` 和查询时的 `remaining_seconds`。后续查询失败会设置 `ok=false`、`stale=true`，但保留已确认的 `claimed`/`departed`；再次操作前先查询核验。
+
+`reset-cooldown` 不接受请求体，会清除该账号的全部冷却：既包括 401/403 认证熔断，也包括按模型的 429 冷却。这样在冷却被误判或上游已恢复时，无需重启网关即可放行。它只修改本地状态：不刷新 Token、不访问上游、不排队同步，人工停用的账号同样可用。结果区分 `changed_in_memory` 与 `durable`；写入失败时 `ok` 为 false，此时内存冷却已清除但重启会恢复盘上记录，直接重试该请求即可。
 
 页面使用 `/dashboard/*`，管理 API 使用 `/admin/*`，客户端保留原 `/v1/*`；不注册 `/cn`、`/intl` API 前缀。模型自动选路不要求客户端改变地址。
 
