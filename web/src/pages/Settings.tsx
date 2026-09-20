@@ -41,7 +41,12 @@ const modeLabels: Record<string, string> = {
 function displayValue(value: unknown) {
   return typeof value === "boolean" ? (value ? "开启" : "关闭") : text(value);
 }
-function normalize(value: unknown): { revision: number; items: Setting[]; audit: RecordValue } {
+function normalize(value: unknown): {
+  revision: number;
+  items: Setting[];
+  audit: RecordValue;
+  session: RecordValue;
+} {
   const d = object(value);
   if (typeof d.revision !== "number") throw new Error("设置响应缺少 revision");
   const items = list(d.items).map((item) => {
@@ -69,7 +74,12 @@ function normalize(value: unknown): { revision: number; items: Setting[]; audit:
       max: typeof item.max === "number" ? item.max : undefined,
     };
   });
-  return { revision: d.revision, items, audit: object(d.audit, "审计状态") };
+  return {
+    revision: d.revision,
+    items,
+    audit: object(d.audit, "审计状态"),
+    session: object(d.session ?? {}, "会话存储状态"),
+  };
 }
 function SettingsForm({
   data,
@@ -241,6 +251,16 @@ function SettingsForm({
           <Fields data={data.audit} />
         </details>
       </Panel>
+      {data.session.degraded === true && (
+        <Panel title="会话存储">
+          <Badge tone="bad">撤销未生效</Badge>
+          <p>会话快照无法写入或清除，退出登录可能未真正生效。请检查管理目录权限后重试退出登录。</p>
+          <details className={s.chartData}>
+            <summary>查看存储详情</summary>
+            <Fields data={data.session} />
+          </details>
+        </Panel>
+      )}
     </form>
   );
 }

@@ -69,6 +69,9 @@ def install_admin(app, config, gateway):
         return app.state.admin_auth
     control, audit = config["control_store"], config["audit_store"]
     auth = AdminAuth(config)
+    # Resolve the key epoch now: a process that only serves inference traffic would
+    # otherwise never clear a snapshot belonging to a superseded key.
+    auth.reconcile()
     mutation_lock = threading.RLock()
     oauth_lock = threading.RLock()
     oauth_tasks = OrderedDict()
@@ -102,7 +105,8 @@ def install_admin(app, config, gateway):
         items.append({"key": "auto_accept_buddy", "value": config.get("auto_accept_buddy") is True,
                       "stored": None, "source": config.get("auto_accept_buddy_source", "default"),
                       "mode": "startup", "type": "boolean", "label": "全部国内账号首次领猫预授权", "locked": True})
-        return {"revision": control.snapshot()["revision"], "items": items, "audit": audit.storage()}
+        return {"revision": control.snapshot()["revision"], "items": items, "audit": audit.storage(),
+                "session": auth.storage()}
 
     def audit_settings(values):
         mapping = {"audit_max_bytes": "max_bytes", "audit_retention_days": "retention_days",
@@ -220,7 +224,10 @@ def install_admin(app, config, gateway):
 
     @route("DELETE", "/admin/session")
     async def session_delete(request):
-        auth.logout(request)
+        if not auth.logout(request):
+            # The session is still valid on disk; keep the cookie so the client can retry.
+            event("session.revoke_failed", {"code": "session_storage_unavailable"})
+            return error_response(503, "会话未能持久撤销，请检查管理目录权限后重试")
         response = JSONResponse({"authenticated": False})
         response.delete_cookie(COOKIE_NAME, path="/admin", httponly=True, samesite="strict", secure=request.url.scheme == "https")
         return response

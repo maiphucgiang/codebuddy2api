@@ -152,10 +152,48 @@ class PersistedSessionTests(unittest.TestCase):
         AdminAuth({"api_key": "", "session_path": self.path}).enabled()
         self.assert_revoked(sid)
 
+    def test_startup_reconciles_without_any_admin_request(self):
+        """An inference-only process must still retire the superseded key's snapshot.
+
+        `_key()` is lazy and inference traffic bypasses `AdminMiddleware`, so without an
+        explicit startup reconcile the intermediate process never touches the file and
+        restarting back to the original key adopts it.
+        """
+        for intermediate in ("rotated-synthetic-key", ""):
+            with self.subTest(intermediate=intermediate):
+                sid, _ = self.login(AdminAuth(self.config))
+                # A restart that only serves inference: construct and reconcile, no request.
+                AdminAuth({"api_key": intermediate, "session_path": self.path}).reconcile()
+                self.assert_revoked(sid)
+
+    def test_startup_reconcile_happens_for_the_installed_admin(self):
+        """`install_admin` must reconcile, not wait for the first `/admin` request."""
+        from unittest.mock import Mock
+        from app.admin_api import install_admin
+        from fastapi import FastAPI
+        config = dict(self.config, control_store=Mock(), audit_store=Mock())
+        with patch.object(AdminAuth, "reconcile", autospec=True) as reconciled:
+            install_admin(FastAPI(), config, Mock())
+        reconciled.assert_called_once()
+
     def test_logout_revokes_the_persisted_session(self):
         first = AdminAuth(self.config)
         sid, _ = self.login(first)
-        first.logout(request(cookie=sid))
+        self.assertTrue(first.logout(request(cookie=sid)))
+        self.assert_revoked(sid)
+
+    def test_logout_reports_a_revocation_that_could_not_be_persisted(self):
+        """Both the rewrite and the unlink fallback can fail; that must not be acknowledged."""
+        first = AdminAuth(self.config)
+        sid, _ = self.login(first)
+        with patch("app.admin_auth.tempfile.mkstemp", side_effect=OSError("read-only")), \
+                patch("app.admin_auth.os.unlink", side_effect=OSError("read-only")):
+            self.assertFalse(first.logout(request(cookie=sid)))
+        self.assertTrue(first.storage()["degraded"])
+        # The session is still live, so a retry can still revoke it once storage recovers.
+        self.assertEqual(first.session(request(cookie=sid))[0], sid)
+        self.assertTrue(first.logout(request(cookie=sid)))
+        self.assertFalse(first.storage()["degraded"])
         self.assert_revoked(sid)
 
     def test_in_process_revocation_clears_the_snapshot(self):
@@ -178,20 +216,25 @@ class PersistedSessionTests(unittest.TestCase):
 
     def test_symlinked_snapshot_is_never_followed(self):
         import json
-        # A valid snapshot sits at the target, so following the link would be observable
-        # even on platforms that do not provide O_NOFOLLOW.
+        # Both cases matter: a link to a plain file, and — the one that can actually tell
+        # "rejected" from "parsed and discarded" — a link to a valid session snapshot.
+        sentinel = self.directory / "sentinel.json"
+        sentinel.write_text("outside-sentinel", encoding="utf-8")
         target = self.directory / "real.json"
         self.write_document_at(target, version=SESSION_FILE_VERSION, fingerprint=self.fingerprint(),
                                sessions={"a" * 32: {"csrf_token": "b" * 32, "expires": 9_999_999_999}})
-        link = self.directory / "link.json"
-        try:
-            link.symlink_to(target)
-        except (OSError, NotImplementedError):
-            self.skipTest("symlinks are unavailable on this platform")
-        auth = AdminAuth({"api_key": self.key, "session_path": link})
-        self.assertTrue(auth.enabled())                       # Rejected, not a startup crash.
-        self.assertEqual(auth.session(request(cookie="a" * 32)), (None, None))
-        self.assertTrue(target.exists())                      # The target is untouched.
+        for name, victim in (("plain file", sentinel), ("valid snapshot", target)):
+            with self.subTest(target=name):
+                link = self.directory / f"link-{name.replace(' ', '-')}.json"
+                try:
+                    link.symlink_to(victim)
+                except (OSError, NotImplementedError):
+                    self.skipTest("symlinks are unavailable on this platform")
+                auth = AdminAuth({"api_key": self.key, "session_path": link})
+                self.assertTrue(auth.enabled())                # Rejected, not a startup crash.
+                self.assertEqual(dict(auth.sessions), {})       # The target was never adopted.
+                self.assertEqual(auth.session(request(cookie="a" * 32)), (None, None))
+                self.assertTrue(victim.exists())                # And was left untouched.
         self.assertIn("a" * 32, json.loads(target.read_text(encoding="utf-8"))["sessions"])
 
     def test_expired_records_are_dropped_from_the_snapshot(self):
@@ -266,19 +309,6 @@ class PersistedSessionTests(unittest.TestCase):
         with patch("app.admin_auth.tempfile.mkstemp", side_effect=OSError("disk full")):
             AdminAuth({"api_key": "rotated-synthetic-key", "session_path": self.path}).enabled()
         self.assert_revoked(sid)
-
-    def test_symlinked_snapshot_is_never_followed(self):
-        target = self.directory / "real.json"
-        target.write_text("outside-sentinel", encoding="utf-8")
-        link = self.directory / "link.json"
-        try:
-            link.symlink_to(target)
-        except (OSError, NotImplementedError):
-            self.skipTest("symlinks are unavailable on this platform")
-        auth = AdminAuth({"api_key": self.key, "session_path": link})
-        self.assertTrue(auth.enabled())
-        self.assertEqual(auth.session(request(cookie="sid")), (None, None))
-        self.assertTrue(target.exists())                     # The target is untouched.
 
     def test_missing_path_keeps_sessions_in_memory_only(self):
         auth = AdminAuth({"api_key": self.key})

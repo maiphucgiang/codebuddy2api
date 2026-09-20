@@ -50,6 +50,7 @@ const settings = {
     },
   ],
   audit: { degraded: false, logical_bytes: 0 },
+  session: { degraded: false, last_error: null, path: "/tmp/admin-sessions.json" },
 };
 
 describe("concise user-facing copy", () => {
@@ -103,6 +104,20 @@ describe("concise user-facing copy", () => {
       /revision|schema|WebUI 不写入|服务端校验为准|内部常量/,
     );
     expect(screen.getByText("查看存储详情").closest("details")?.open).toBe(false);
+  });
+
+  it("surfaces a session store that could not persist a revocation", () => {
+    resource({ ...settings, session: { degraded: true, last_error: "OSError" } });
+    render(<Settings />);
+    expect(screen.getByText("会话存储")).toBeTruthy();
+    expect(screen.getByText("撤销未生效")).toBeTruthy();
+    expect(screen.getByText(/退出登录可能未真正生效/)).toBeTruthy();
+  });
+
+  it("stays quiet while the session store is healthy", () => {
+    resource(settings);
+    render(<Settings />);
+    expect(screen.queryByText("会话存储")).toBeNull();
   });
 
   it("still submits the revision and only edited settings", async () => {

@@ -22,7 +22,8 @@ class AdminApiTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.store = ControlStore(self.root / "control.sqlite3")
         self.addCleanup(self.store.close)
-        self.config = {"api_key": "synthetic-key", "control_store": self.store, "max_images": 16}
+        self.config = {"api_key": "synthetic-key", "control_store": self.store, "max_images": 16,
+                       "session_path": self.root / "admin-sessions.json"}
         self.audit = Mock()
         self.audit.storage.return_value = {"db_bytes": 0}
         self.audit.list_records.return_value = {"items": [], "next_cursor": None, "has_more": False}
@@ -319,6 +320,28 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/admin/settings").status_code, 401)
         self.assertEqual(self.client.get("/admin/settings", headers=self.headers).status_code, 401)
         self.assertEqual(self.client.get("/admin/settings", headers={"X-Api-Key": "rotated-key"}).status_code, 200)
+
+    def test_logout_reports_when_the_session_could_not_be_persistently_revoked(self):
+        """A logout that cannot reach durable storage must not answer `authenticated: false`."""
+        from unittest.mock import patch
+        response = self.client.post("/admin/session", json={"api_key": "synthetic-key"}, headers={"Origin": "http://testserver"})
+        csrf = {"Origin": "http://testserver", "X-CSRF-Token": response.json()["csrf_token"]}
+        old = self.client.cookies.get(COOKIE_NAME)
+        with patch("app.admin_auth.tempfile.mkstemp", side_effect=OSError("read-only")), \
+                patch("app.admin_auth.os.unlink", side_effect=OSError("read-only")):
+            denied = self.client.delete("/admin/session", headers=csrf)
+        self.assertEqual(denied.status_code, 503)
+        self.assertTrue(self.auth.storage()["degraded"])
+        # The cookie is still valid, so the client can retry rather than silently lose access.
+        self.assertEqual(self.client.get("/admin/settings", headers={"Cookie": f"{COOKIE_NAME}={old}"}).status_code, 200)
+        self.assertEqual(self.client.delete("/admin/session", headers=csrf).status_code, 200)
+        self.assertEqual(self.client.get("/admin/settings", headers={"Cookie": f"{COOKIE_NAME}={old}"}).status_code, 401)
+
+    def test_session_storage_state_is_reported_in_settings(self):
+        state = self.client.get("/admin/settings", headers=self.headers).json()["session"]
+        self.assertFalse(state["degraded"])
+        self.assertIsNone(state["last_error"])
+        self.assertTrue(state["path"])
 
     def test_https_cookie_and_bounded_sessions(self):
         from starlette.requests import Request

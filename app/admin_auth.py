@@ -124,6 +124,7 @@ class AdminAuth:
         self._configured_key = None
         self._identity = None
         self._path = _session_path(config.get("session_path"))
+        self._storage_error = None  # Set when the snapshot could not be written or cleared.
 
     @staticmethod
     def _fingerprint(key):
@@ -150,6 +151,23 @@ class AdminAuth:
             return None
         return number if math.isfinite(number) and 0 < number < 1e11 else None
 
+    def _storage_failed(self, error):
+        """Record why the snapshot could not be made durable, so callers can report it."""
+        self._storage_error = type(error).__name__
+
+    def _storage_ok(self):
+        self._storage_error = None
+
+    def storage(self):
+        """Whether the snapshot's durable state is known-good, mirroring AuditStore.storage().
+
+        Reports the outcome of the last write or clear: a successful clear leaves no
+        snapshot, so the on-disk state is consistent again and the flag goes back to False.
+        """
+        return {"path": str(self._path) if self._path is not None else None,
+                "degraded": self._storage_error is not None,
+                "last_error": self._storage_error}
+
     def _revoke(self):
         """Revoke the persisted snapshot; returns False when it could not be cleared."""
         if self._path is None:
@@ -158,8 +176,10 @@ class AdminAuth:
             os.unlink(self._path)
         except FileNotFoundError:
             return True
-        except OSError:
+        except OSError as error:
+            self._storage_failed(error)
             return False
+        self._storage_ok()
         return True
 
     def _is_direct_file(self, metadata):
@@ -236,6 +256,8 @@ class AdminAuth:
         if len(restored) != len(entries):
             # Expired records were dropped: rewrite the snapshot, so a wall clock that
             # later moves backward cannot restore them from the file we just read.
+            # A failure here is recorded as degraded state by _persist(); the entries we
+            # already adopted stay valid, so this is not a reason to reject the snapshot.
             self._persist()
         return True
 
@@ -265,8 +287,10 @@ class AdminAuth:
             os.chmod(temporary, 0o600)
             os.replace(temporary, self._path)
             temporary = None
-        except (OSError, ValueError):
+            self._storage_ok()
+        except (OSError, ValueError) as error:
             # Fall back to removing the stale snapshot so revoked sessions cannot return.
+            self._storage_failed(error)
             return self._revoke()
         finally:
             if temporary is not None:
@@ -303,6 +327,17 @@ class AdminAuth:
     def allowed_origins(self):
         """Extra trusted browser origins from hot configuration."""
         return origin_allowlist(self.config.get("admin_allowed_origins"))
+
+    def reconcile(self):
+        """Resolve the key epoch at startup rather than on the first `/admin` request.
+
+        `_key()` is otherwise lazy, so a process that only serves inference traffic never
+        reaches it and would leave the previous epoch's snapshot on disk. Restarting back
+        to the original key would then adopt that snapshot and resurrect a cookie which the
+        rotation in between was supposed to revoke.
+        """
+        with self.lock:
+            self._key()
 
     def enabled(self):
         with self.lock:
@@ -361,9 +396,20 @@ class AdminAuth:
             return (sid, dict(item)), 200
 
     def logout(self, request):
+        """Revoke the cookie's session; returns False when the snapshot could not be updated.
+
+        The entry is kept when the snapshot cannot be rewritten, so a retry is still
+        authenticated and can finish the revocation instead of being acknowledged early.
+        """
+        sid = request.cookies.get(COOKIE_NAME)
         with self.lock:
-            if self.sessions.pop(request.cookies.get(COOKIE_NAME), None) is not None:
-                self._persist()
+            item = self.sessions.pop(sid, None)
+            if item is None:
+                return True
+            if self._persist():
+                return True
+            self.sessions[sid] = item
+            return False
 
 
 class AdminMiddleware:

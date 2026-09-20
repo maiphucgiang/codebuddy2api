@@ -68,6 +68,7 @@ const settings = {
     shm_bytes: 32768,
     degraded: false,
   },
+  session: { degraded: false, last_error: null, path: "/tmp/admin-sessions.json" },
 };
 async function mockAPI(page: Page, authenticated = true) {
   const calls: { method: string; path: string; body: unknown }[] = [];
