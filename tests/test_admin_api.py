@@ -343,6 +343,17 @@ class AdminApiTests(unittest.TestCase):
         self.assertIsNone(state["last_error"])
         self.assertTrue(state["path"])
 
+    def test_a_superseded_snapshot_that_cannot_be_revoked_fails_closed(self):
+        """Mid-process epoch changes must deny with 503, never serve management traffic."""
+        from unittest.mock import patch
+        self.assertEqual(self.client.get("/admin/settings", headers=self.headers).status_code, 200)
+        self.config["api_key"] = "rotated-synthetic-key"
+        with patch.object(type(self.auth), "_persist", return_value=False), \
+                patch.object(type(self.auth), "_revoke", return_value=False):
+            denied = self.client.get("/admin/settings", headers=self.headers)
+        self.assertEqual(denied.status_code, 503)
+        self.assertIn("会话快照", denied.json()["error"]["message"])
+
     def test_https_cookie_and_bounded_sessions(self):
         from starlette.requests import Request
         secure = self.enterContext(TestClient(self.app, base_url="https://testserver"))

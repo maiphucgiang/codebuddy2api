@@ -4,15 +4,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import os
+import stat
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from app.admin_auth import AdminAuth, COOKIE_NAME, MAX_PERSISTED_SESSIONS, SESSION_FILE_VERSION, SESSION_TTL
+from app.admin_auth import (AdminAuth, COOKIE_NAME, MAX_PERSISTED_SESSIONS, SESSION_FILE_VERSION,
+                            SESSION_TTL, SessionStoreError)
 from app.gateway_management import install_pages
 
 
@@ -309,6 +313,71 @@ class PersistedSessionTests(unittest.TestCase):
         with patch("app.admin_auth.tempfile.mkstemp", side_effect=OSError("disk full")):
             AdminAuth({"api_key": "rotated-synthetic-key", "session_path": self.path}).enabled()
         self.assert_revoked(sid)
+
+    @contextmanager
+    def undeletable_snapshot(self):
+        """Make the snapshot impossible to replace or remove, with real permissions.
+
+        Windows blocks unlink and the atomic replace on a read-only file; POSIX needs a
+        read-only directory for the same effect. Sibling files stay writable either way.
+        """
+        def locked():
+            try:
+                os.unlink(self.path)
+            except OSError:
+                return True
+            return False
+
+        originals = [(self.path, stat.S_IMODE(self.path.stat().st_mode))]
+        os.chmod(self.path, stat.S_IREAD)
+        if not locked():
+            originals.append((self.directory, stat.S_IMODE(self.directory.stat().st_mode)))
+            os.chmod(self.directory, stat.S_IREAD | stat.S_IEXEC)
+        if not locked():
+            for target, mode in reversed(originals):
+                os.chmod(target, mode)
+            self.skipTest("this platform cannot make the snapshot undeletable")
+        try:
+            yield
+        finally:
+            for target, mode in reversed(originals):
+                try:
+                    os.chmod(target, mode)
+                except OSError:
+                    pass
+
+    def test_startup_fails_when_a_superseded_snapshot_cannot_be_revoked(self):
+        """Activating a new epoch over a surviving snapshot would let a later start revive it.
+
+        The rotation must abort instead, leaving the epoch unactivated so a retry can
+        finish the job once storage recovers.
+        """
+        for label, intermediate in (("rotation", "rotated-synthetic-key"), ("disabled key", "")):
+            with self.subTest(case=label):
+                sid, _ = self.login(AdminAuth(self.config))
+                with self.undeletable_snapshot():
+                    auth = AdminAuth({"api_key": intermediate, "session_path": self.path})
+                    with self.assertRaises(SessionStoreError):
+                        auth.reconcile()
+                    # Startup failed, so the epoch was not activated and is retried.
+                    with self.assertRaises(SessionStoreError):
+                        auth.reconcile()
+                    self.assertTrue(auth.storage()["degraded"])
+                # Once storage recovers, the retry revokes the snapshot for real.
+                auth.reconcile()
+                self.assertFalse(auth.storage()["degraded"])
+                self.assert_revoked(sid)
+
+    def test_startup_failure_reaches_the_installed_admin(self):
+        """`install_admin` must propagate the failure rather than completing startup."""
+        from unittest.mock import Mock
+        from app.admin_api import install_admin
+        from fastapi import FastAPI
+        config = dict(self.config, control_store=Mock(), audit_store=Mock())
+        with patch.object(AdminAuth, "reconcile", autospec=True,
+                          side_effect=SessionStoreError("snapshot survives")):
+            with self.assertRaises(SessionStoreError):
+                install_admin(FastAPI(), config, Mock())
 
     def test_missing_path_keeps_sessions_in_memory_only(self):
         auth = AdminAuth({"api_key": self.key})

@@ -22,6 +22,15 @@ from starlette.responses import JSONResponse
 COOKIE_NAME = "cb_admin_session"
 SESSION_TTL = 12 * 3600
 
+
+class SessionStoreError(RuntimeError):
+    """A superseded session snapshot could not be durably revoked.
+
+    Startup must abort on this: the surviving snapshot could otherwise be adopted by a
+    later start under the superseded key, resurrecting sessions that were meant to die.
+    """
+
+
 # Optional persisted session table so a restart does not force another login.
 # Revocation is enforced by clearing this file: the stored fingerprint only tells us
 # which key epoch the snapshot belongs to, it is not an integrity MAC over the sessions.
@@ -305,19 +314,26 @@ class AdminAuth:
         if not isinstance(key, str):
             key = ""
         if self._configured_key is None or not hmac.compare_digest(key.encode(), self._configured_key.encode()):
-            restoring = self._configured_key is None
-            self._configured_key = key
+            previous, self._configured_key = self._configured_key, key
+            restoring = previous is None
             self.sessions.clear()
             # Restoring a previous key must not restore that epoch's OAuth owner.
             self._identity = secrets.token_urlsafe(32)
             if restoring:
                 # Adopt only a snapshot that matches the current epoch; anything else is
                 # revoked, so switching back to an old key cannot resurrect its sessions.
-                if not self._restore(key):
-                    self._revoke()
+                durable = self._restore(key) or self._revoke()
             else:
                 # A rotated or cleared key revokes every session, on disk as well.
-                self._persist()
+                durable = self._persist()
+            if not durable:
+                # Leave the epoch unactivated, so the failure is retried instead of being
+                # recorded as done. `_configured_key` is what _persist() fingerprints, so
+                # it has to be set for the attempt above and rolled back here.
+                self._configured_key = previous
+                raise SessionStoreError(
+                    f"无法持久撤销上一 epoch 的会话快照（{self._storage_error or 'unknown'}）："
+                    f"{self._path}；请修复管理目录权限后重启，否则旧会话可能被复活")
         return key
 
     def csrf_enabled(self):
@@ -335,6 +351,9 @@ class AdminAuth:
         reaches it and would leave the previous epoch's snapshot on disk. Restarting back
         to the original key would then adopt that snapshot and resurrect a cookie which the
         rotation in between was supposed to revoke.
+
+        Raises SessionStoreError when that revocation cannot be made durable; the caller
+        must abort startup rather than activate the new epoch.
         """
         with self.lock:
             self._key()
@@ -427,7 +446,14 @@ class AdminMiddleware:
                 message = {**message, "headers": headers + [(b"cache-control", b"no-store"), (b"pragma", b"no-cache"), (b"expires", b"0")]}
             await send(message)
 
-        if not self.auth.enabled():
+        try:
+            enabled = self.auth.enabled()
+        except SessionStoreError:
+            # The key epoch changed but its superseded snapshot survives. Deny rather than
+            # continue: startup refuses this case, so it is only reachable mid-process.
+            return await error_response(
+                503, "会话快照无法持久撤销，管理接口已锁定；请检查管理目录权限后重启")(scope, receive, no_cache)
+        if not enabled:
             return await error_response(503, "未配置 API key，管理接口已锁定")(scope, receive, no_cache)
         path, method = scope["path"], scope["method"]
         public_session = path == "/admin/session" and method in ("POST", "GET")
