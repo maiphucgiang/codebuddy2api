@@ -316,35 +316,60 @@ class PersistedSessionTests(unittest.TestCase):
 
     @contextmanager
     def undeletable_snapshot(self):
-        """Make the snapshot impossible to replace or remove, with real permissions.
+        """Lock the snapshot so the atomic replace and the unlink both fail.
 
-        Windows blocks unlink and the atomic replace on a read-only file; POSIX needs a
-        read-only directory for the same effect. Sibling files stay writable either way.
+        Windows protects a file by its read-only mode; POSIX protects removal by directory
+        permission, so the directory is locked too. Whether the lock actually took effect is
+        checked against a throwaway probe, never against the snapshot itself, so a platform
+        where removal cannot be blocked is skipped instead of silently passing.
         """
-        def locked():
+        probe = self.directory / "probe.tmp"
+        originals = [(self.path, stat.S_IMODE(self.path.stat().st_mode))]
+
+        def arm():
+            """Recreate the probe, then apply the same protection the snapshot gets."""
+            os.chmod(self.path, stat.S_IREAD)
             try:
-                os.unlink(self.path)
+                os.chmod(probe, 0o600)
+                os.unlink(probe)
+            except OSError:
+                pass
+            probe.write_text("x", encoding="utf-8")
+            os.chmod(probe, stat.S_IREAD)
+
+        def removal_blocked():
+            try:
+                os.unlink(probe)
             except OSError:
                 return True
             return False
 
-        originals = [(self.path, stat.S_IMODE(self.path.stat().st_mode))]
-        os.chmod(self.path, stat.S_IREAD)
-        if not locked():
-            originals.append((self.directory, stat.S_IMODE(self.directory.stat().st_mode)))
-            os.chmod(self.directory, stat.S_IREAD | stat.S_IEXEC)
-        if not locked():
-            for target, mode in reversed(originals):
-                os.chmod(target, mode)
-            self.skipTest("this platform cannot make the snapshot undeletable")
-        try:
-            yield
-        finally:
+        def restore():
             for target, mode in reversed(originals):
                 try:
                     os.chmod(target, mode)
                 except OSError:
                     pass
+
+        arm()
+        if not removal_blocked():
+            # The file mode did not protect it (POSIX), so lock the directory as well. The
+            # probe has to be recreated while the directory is still writable.
+            arm()
+            originals.append((self.directory, stat.S_IMODE(self.directory.stat().st_mode)))
+            os.chmod(self.directory, stat.S_IREAD | stat.S_IEXEC)
+            if not removal_blocked():
+                restore()
+                self.skipTest("this platform cannot make the snapshot undeletable")
+        try:
+            yield
+        finally:
+            restore()
+            try:
+                os.chmod(probe, 0o600)
+                os.unlink(probe)
+            except OSError:
+                pass
 
     def test_startup_fails_when_a_superseded_snapshot_cannot_be_revoked(self):
         """Activating a new epoch over a surviving snapshot would let a later start revive it.
