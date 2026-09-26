@@ -243,6 +243,16 @@ WebUI 可以直接上传文件；以下限制针对 `POST /admin/credentials` �
 
 两种国际产品在选路后归并含图的连续 `user` 段，保留内容顺序和图片数据；国内请求、纯文本段及 system/assistant/tool 边界不变。消息级属性冲突或内容无法无损表达时返回 `400 / image_user_run_not_mergeable`，最终字节限制仍生效。图片兼容不随能力开关关闭，不增加重试，也不让文本模型获得原生视觉。
 
+## 思考兼容
+
+Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 和 Responses 的 `reasoning.effort` 映射为 `reasoning_effort`。显式顶层 `reasoning_effort` 优先，但 Messages 的 `disabled` 始终使用 `none`；模型能力检查仍生效。未提供控制参数时保留上游默认行为。
+
+未指定强度时，Messages 从实际选中账号的 `reasoning.defaultEffort` 或旧 `reasoning.effort` 选择声明支持的默认值；否则优先 `high`，再选可用选项，声明未知时回落为 `high`。换号后重新解析新账号的默认值。
+
+手工 `enabled` 要求整数 `budget_tokens >= 1024`，但该预算不等于上游精确 token 限额，`max_tokens` 原样转发；兼容映射不模拟原生自适应调度。仅支持 `display: summarized`。
+
+可读历史统一放入 `reasoning_content`，不混入普通正文。Responses 优先使用可读 `content`，其次使用 `summary`；摘要不能还原原生隐藏推理。签名不转发，`redacted_thinking`、仅含加密签名的思考及非空 Responses `encrypted_content` 在选路前返回 400；上游自行决定使用哪些可读历史。
+
 ## 请求边界
 
 - 三个生成协议统一将 `developer` 归一为 `system`，已有 system 移到首位，缺失时补默认值；归一化不修改调用方 payload。可选的 [Responses 投影](#responses-投影)和脱敏会另行处理内容，因此默认链路并非逐字透传。

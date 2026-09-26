@@ -243,6 +243,16 @@ Credential domain / token issuer determine the product identity. Chat and refres
 
 Both international profiles merge image-bearing consecutive `user` runs only after routing, preserving content order and image data. Domestic bodies, text-only runs and system/assistant/tool boundaries remain unchanged. Conflicting message attributes or unrepresentable content return `400 / image_user_run_not_mergeable`; final byte limits still apply. This compatibility step remains enabled when capability preflight is disabled; it neither adds retries nor makes a text model natively visual.
 
+## Reasoning compatibility
+
+Messages `enabled` / `adaptive` activate Chat reasoning; `output_config.effort` and Responses `reasoning.effort` map to `reasoning_effort`. An explicit top-level `reasoning_effort` takes precedence, except Messages `disabled` always selects `none`; model capability checks still apply. Omitted controls leave upstream defaults unchanged.
+
+Without an explicit effort, Messages activation uses the selected account's `reasoning.defaultEffort` or legacy `reasoning.effort`, restricted to its declared options. Otherwise it prefers `high`, then an available option; unknown declarations fall back to `high`. Failover resolves the replacement account's default again.
+
+Manual `enabled` requires an integer `budget_tokens >= 1024`, but the budget is not an exact upstream token limit; `max_tokens` is forwarded unchanged. This mapping does not reproduce native adaptive scheduling. Only `display: summarized` is supported.
+
+Readable history is kept in `reasoning_content`, never ordinary answer text. Responses uses readable `content` before `summary`; summaries cannot reconstruct native hidden reasoning. Signatures are not forwarded. `redacted_thinking`, encrypted-only thinking and non-empty Responses `encrypted_content` return 400 before routing; upstreams decide which readable history they use.
+
 ## Request boundaries
 
 - All three generation protocols normalize `developer` to `system`, move an existing system message first or insert a default. This normalization does not mutate the caller's payload. Optional [Responses projection](#responses-projection) and desensitization process content separately; the whole pipeline is not a verbatim pass-through by default.
