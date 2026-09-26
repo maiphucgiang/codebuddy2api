@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -321,6 +323,9 @@ def _sanitize_schema(schema: Any) -> Any:
     return result
 
 
+_CHAT_FUNCTION_NAME_LIMIT = 64
+
+
 class ToolRegistry:
     """Bidirectional mapping between Responses (namespace, name) and upstream Chat function names."""
 
@@ -359,10 +364,17 @@ class ToolRegistry:
             upstream_name = name
         else:
             base = f"{namespace}__{name}"
+            if len(base) > _CHAT_FUNCTION_NAME_LIMIT or re.fullmatch(r"[A-Za-z0-9_-]+", base) is None:
+                # Different identity pairs can share the same concatenated name.
+                identity = json.dumps(ident, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                digest = hashlib.sha256(identity).hexdigest()[:16]
+                prefix = re.sub(r"[^A-Za-z0-9_-]", "_", base[:_CHAT_FUNCTION_NAME_LIMIT - len(digest) - 1])
+                base = f"{prefix}_{digest}"
             candidate = base
             counter = 1
             while candidate in self.upstream_to_identity:
-                candidate = f"{base}_{counter}"
+                suffix = f"_{counter}"
+                candidate = f"{base[:_CHAT_FUNCTION_NAME_LIMIT - len(suffix)]}{suffix}"
                 counter += 1
             upstream_name = candidate
 

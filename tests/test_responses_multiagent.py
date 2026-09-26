@@ -3,6 +3,7 @@
 
 from copy import deepcopy
 import json
+import re
 import sys
 from pathlib import Path
 import unittest
@@ -426,6 +427,10 @@ class ResponsesMultiAgentInterfaceTests(unittest.TestCase):
 
         def respond(request):
             body = json.loads(request.content)
+            names = [tool["function"]["name"] for tool in body.get("tools", [])]
+            names.extend(call["function"]["name"] for message in body["messages"] for call in message.get("tool_calls", []))
+            if any(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) is None for name in names):
+                return httpx.Response(400, json={"error": {"message": "Invalid Chat function name", "type": "invalid_request_error"}})
             calls = None
             if body.get("tool_choice") == "required" and body.get("tools"):
                 calls = [{"id": "next_call", "function": {
@@ -657,6 +662,103 @@ class ResponsesMultiAgentInterfaceTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 413, response.text)
                 self.assertEqual(self.upstream_requests, [])
 
+
+
+    def test_nested_and_long_namespace_aliases_round_trip(self):
+        cases = [(["parent", "child"], "tool"), (["space group", "中文"], "run-command"),
+                 (["n" * 40], "f" * 40), (["n" * 31], "f" * 31)]
+        for parts, name in cases:
+            namespace = ".".join(parts)
+            tools = [{"type": "function", "name": name, "parameters": {"type": "object"}}]
+            for part in reversed(parts):
+                tools = [{"type": "namespace", "name": part, "tools": tools}]
+            payload = {"tool_choice": {"type": "function", "namespace": namespace, "name": name},
+                       "input": [{"role": "user", "content": "Previous task"},
+                                 {"type": "function_call", "namespace": namespace, "name": name,
+                                  "call_id": "past", "arguments": "{}"},
+                                 {"type": "function_call_output", "call_id": "past", "output": "done"},
+                                 {"type": "additional_tools", "tools": tools},
+                                 {"role": "user", "content": "Call the tool again"}]}
+            original = deepcopy(payload)
+            for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+                with self.subTest(namespace=namespace, name=name, stream=stream, mode=mode):
+                    request = deepcopy(payload)
+                    for turn in range(2):
+                        response, sent = self._boundary_request(request, stream, mode)
+                        self.assertEqual(response.status_code, 200, response.text)
+                        alias = sent["tools"][0]["function"]["name"]
+                        self.assertRegex(alias, r"\A[A-Za-z0-9_-]{1,64}\Z")
+                        historical = [call for message in sent["messages"] for call in message.get("tool_calls", [])]
+                        self.assertEqual(len(historical), turn + 1)
+                        self.assertTrue(all(call["function"]["name"] == alias for call in historical))
+                        self.assertEqual(sent["tool_choice"], "required")
+                        self.assertNotIn("_tool_registry", sent)
+                        data = (next(event["response"] for event in _parse_responses_sse_events(response.text)
+                                     if event["type"] == "response.completed") if stream else response.json())
+                        calls = [item for item in data["output"] if item["type"] == "function_call"]
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual((calls[0].get("namespace"), calls[0]["name"]), (namespace, name))
+                        request["input"].extend([*data["output"], {"type": "function_call_output",
+                            "call_id": calls[0]["call_id"], "output": "done"}, {"role": "user", "content": "Again"}])
+            self.assertEqual(payload, original)
+
+    def test_alias_collisions_remain_bounded_and_preserve_global_names(self):
+        from app.adapters.responses_adapter import ToolRegistry
+        for namespace, name in (("n" * 31, "f" * 31), ("parent.child" * 8, "function" * 8)):
+            base = ToolRegistry().register(namespace, name)
+            reserved = [base, *(base[:64 - len(f"_{index}")] + f"_{index}" for index in range(1, 13))]
+            for order in (reserved, list(reversed(reserved))):
+                with self.subTest(namespace=namespace, order=order):
+                    registry = ToolRegistry()
+                    for global_name in order:
+                        self.assertEqual(registry.register(None, global_name), global_name)
+                    alias = registry.register(namespace, name)
+                    self.assertRegex(alias, r"\A[A-Za-z0-9_-]{1,64}\Z")
+                    self.assertNotIn(alias, reserved)
+                    self.assertEqual(registry.get_identity(alias), (namespace, name))
+                    self.assertEqual(registry.register(namespace, name), alias)
+                    restored = ToolRegistry.from_dict(registry.to_dict())
+                    self.assertEqual(restored.get_upstream_name(namespace, name), alias)
+                    for global_name in reserved:
+                        self.assertEqual(restored.get_identity(global_name), (None, global_name))
+
+    def test_encoded_aliases_distinguish_normalized_and_truncated_identities(self):
+        from app.adapters.responses_adapter import ToolRegistry
+        identities = [("parent.child", "tool"), ("parent_child", "tool"), ("parent/child", "tool"),
+                      ("n" * 70 + "first", "tool"), ("n" * 70 + "second", "tool"),
+                      ("n" * 70, "__tool"), ("n" * 70 + "__", "tool")]
+        registry = ToolRegistry()
+        aliases = [registry.register(*identity) for identity in identities]
+        self.assertEqual(len(set(aliases)), len(identities))
+        for identity, alias in zip(identities, aliases):
+            self.assertRegex(alias, r"\A[A-Za-z0-9_-]{1,64}\Z")
+            self.assertEqual(ToolRegistry().register(*identity), alias)
+            self.assertEqual(registry.get_identity(alias), identity)
+
+
+    def test_bounded_aliases_do_not_reuse_retired_global_names(self):
+        from app.adapters.responses_adapter import ToolRegistry
+        for namespace, name in (("n" * 31, "f" * 31), ("parent.child" * 8, "tool")):
+            global_name = ToolRegistry().register(namespace, name)
+            payload = {"tools": [{"type": "namespace", "name": namespace, "tools": [{"type": "function", "name": name}]}],
+                       "tool_choice": {"type": "function", "namespace": namespace, "name": name},
+                       "input": [{"role": "user", "content": "Previous task"},
+                                 {"type": "function_call", "name": global_name, "call_id": "past", "arguments": "{}"},
+                                 {"type": "function_call_output", "call_id": "past", "output": "done"},
+                                 {"role": "user", "content": "Use the namespaced tool"}]}
+            for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+                with self.subTest(namespace=namespace, stream=stream, mode=mode):
+                    response, sent = self._boundary_request(payload, stream, mode)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    alias = sent["tools"][0]["function"]["name"]
+                    self.assertRegex(alias, r"\A[A-Za-z0-9_-]{1,64}\Z")
+                    self.assertNotEqual(alias, global_name)
+                    history = next(message["tool_calls"] for message in sent["messages"] if message.get("tool_calls"))
+                    self.assertEqual(history[0]["function"]["name"], global_name)
+                    data = (next(event["response"] for event in _parse_responses_sse_events(response.text)
+                                 if event["type"] == "response.completed") if stream else response.json())
+                    call = next(item for item in data["output"] if item["type"] == "function_call")
+                    self.assertEqual((call.get("namespace"), call["name"]), (namespace, name))
 
 
 if __name__ == "__main__":
