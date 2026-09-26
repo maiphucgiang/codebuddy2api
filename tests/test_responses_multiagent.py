@@ -606,5 +606,58 @@ class ResponsesMultiAgentInterfaceTests(unittest.TestCase):
 
 
 
+    def test_request_budget_counts_wire_bytes_without_tool_registry(self):
+        payloads = [self._sample_multiagent_payload(), {
+            "input": [{"role": "user", "content": "Previous task"},
+                      {"type": "function_call", "call_id": "old", "namespace": "retired",
+                       "name": "lookup", "arguments": "{}"},
+                      {"type": "function_call_output", "call_id": "old", "output": "done"},
+                      {"role": "user", "content": "汉字" * 800}]}]
+        payloads[0]["input"] = [{"role": "user", "content": "汉字" * 800}]
+        payloads[0]["tool_choice"] = {"type": "function", "namespace": "ns2", "name": "search"}
+        for index, payload in enumerate(payloads):
+            for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+                with self.subTest(payload=index, stream=stream, mode=mode):
+                    response, _ = self._boundary_request(payload, stream, mode)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    wire_size = len(self.upstream_requests[-1].content)
+                    with patch.dict(converter.CONFIG, {"max_request_bytes": wire_size}):
+                        response, sent = self._boundary_request(payload, stream, mode)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(len(self.upstream_requests[-1].content), wire_size)
+                    self.assertNotIn("_tool_registry", sent)
+                    data = (next(event["response"] for event in _parse_responses_sse_events(response.text)
+                                 if event["type"] == "response.completed") if stream else response.json())
+                    if index == 0:
+                        call = next(item for item in data["output"] if item["type"] == "function_call")
+                        self.assertEqual((call.get("namespace"), call["name"]), ("ns2", "search"))
+                    with patch.dict(converter.CONFIG, {"max_request_bytes": wire_size - 1}):
+                        response, _ = self._boundary_request(payload, stream, mode)
+                    self.assertEqual(response.status_code, 413, response.text)
+                    self.assertEqual(self.upstream_requests, [])
+
+
+
+    def test_request_budget_rechecks_routed_model_without_registry(self):
+        payload = self._sample_multiagent_payload()
+        payload["input"] = [{"role": "user", "content": "汉字" * 800}]
+        for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+            with self.subTest(stream=stream, mode=mode), patch.object(converter, "_upstream_model",
+                return_value="routed-" + "model" * 50):
+                response, _ = self._boundary_request(payload, stream, mode)
+                self.assertEqual(response.status_code, 200, response.text)
+                size = len(self.upstream_requests[-1].content)
+                with patch.dict(converter.CONFIG, {"max_request_bytes": size}):
+                    response, sent = self._boundary_request(payload, stream, mode)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(len(self.upstream_requests[-1].content), size)
+                self.assertNotIn("_tool_registry", sent)
+                with patch.dict(converter.CONFIG, {"max_request_bytes": size - 1}):
+                    response, _ = self._boundary_request(payload, stream, mode)
+                self.assertEqual(response.status_code, 413, response.text)
+                self.assertEqual(self.upstream_requests, [])
+
+
+
 if __name__ == "__main__":
     unittest.main()

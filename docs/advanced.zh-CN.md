@@ -42,7 +42,7 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `--request-context-mode` | `legacy` | `scoped` 启用显式会话与逐尝试追踪；变更只影响新请求 |
 | `--failover-max` | `0` | 请求在「一个字节都还没发给下游」之前失败时，最多再换几个凭证就地重放；`0` 表示如实把失败回给下游 |
 | `--retry-write-timeout` | `false` | 让「写请求体超时」也参与重放（换新连接与 `--failover-max` 换凭证），代价是已发出的那半截正文可能已被上游处理 |
-| `--max-request-bytes` | `33554432` | 处理后的上游 JSON 字节上限，须为正整数 |
+| `--max-request-bytes` | `33554432` | 处理后的上游 JSON 字节上限，不含网关内部元数据，须为正整数 |
 | `--log-body-limit` | `65536` | 旧文本预览兼容项；文本输出已停用，SQLite 诊断使用独立预算 |
 
 环境变量包括 `CODEBUDDY_AUTH_DIR`、`CODEBUDDY_IMPORT_DIR`、`CODEBUDDY2API_KEY`、`CODEBUDDY2API_ADMIN_CSRF`、`CODEBUDDY2API_ADMIN_ORIGINS`、`CODEBUDDY2API_KEEP_TOOL_METADATA`、`CODEBUDDY2API_STREAM_MODE`、`CODEBUDDY2API_LOG`、`CODEBUDDY2API_RESPONSES_PROJECTION_MODE`、`CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES`、`CODEBUDDY2API_MAX_IMAGES`、`CODEBUDDY2API_IMAGE_POLICY`、`CODEBUDDY2API_MAX_REQUEST_BYTES`、`CODEBUDDY2API_LOG_BODY_LIMIT`、`CODEBUDDY2API_FAILOVER_MAX`、`CODEBUDDY2API_RETRY_WRITE_TIMEOUT`。启动示例见[部署指南](deployment.zh-CN.md)。

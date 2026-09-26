@@ -384,6 +384,25 @@ class EndpointTests(unittest.TestCase):
             converter._guard_request_size(body)
         self.assertEqual(caught.exception.status_code, 413)
 
+    def test_request_byte_budget_excludes_only_top_level_local_metadata(self):
+        public = {"messages": [{"role": "user", "content": "汉字"}],
+                  "tools": [{"type": "function", "function": {"name": "echo", "parameters": {
+                      "type": "object", "properties": {"_tool_registry": {"type": "string", "default": "汉字" * 200}}}}}]}
+        registry = {"internal": "x" * 10000}
+        local_policy = object()
+        body = {**public, "_tool_registry": registry, "_runtime_note": object(),
+                converter._REQUEST_POLICY_KEY: local_policy}
+        size = len(json.dumps(public, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+        converter.CONFIG["max_request_bytes"] = size
+        self.assertEqual(converter._guard_request_size(body), size)
+        self.assertIs(body["_tool_registry"], registry)
+        self.assertIs(body[converter._REQUEST_POLICY_KEY], local_policy)
+        converter.CONFIG["max_request_bytes"] = size - 1
+        with self.assertRaises(converter.HTTPException) as caught:
+            converter._guard_request_size(body)
+        self.assertEqual(caught.exception.status_code, 413)
+
+
     def test_bad_payloads_and_auth_fail_without_upstream(self):
         for route in ROUTES:
             for value in (None, [], "not an object"):

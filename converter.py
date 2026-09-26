@@ -2724,12 +2724,18 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
     return body
 
 
+def _upstream_chat_body(body: dict) -> dict:
+    """Exclude process-local metadata from both wire JSON and its byte budget."""
+    return {key: value for key, value in body.items()
+            if key is not _REQUEST_POLICY_KEY and not (isinstance(key, str) and key.startswith("_"))}
+
+
 def _guard_request_size(body: dict) -> int:
     """Validate and measure upstream JSON bytes without truncating text or tool arguments."""
     size = 0
     limit = CONFIG["max_request_bytes"]
     try:
-        for part in json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False).iterencode(body):
+        for part in json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False).iterencode(_upstream_chat_body(body)):
             size += len(part.encode("utf-8"))
             if size > limit:
                 _log(f"[limit] 请求体超限，拒绝请求 | limit_bytes={limit}")
@@ -3097,7 +3103,7 @@ async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name
     try:
         resources = request_resources.get()
         clients = resources.clients if resources is not None and CONFIG.get("upstream_keepalive") else None
-        async with open_backend_stream(url, headers, body, read_timeout=timeout, on_retry=retry,
+        async with open_backend_stream(url, headers, _upstream_chat_body(body), read_timeout=timeout, on_retry=retry,
                                        retry_write_timeout=bool(CONFIG.get("retry_write_timeout")),
                                        clients=clients, headers_for_attempt=attempt_headers) as response:
             opened = True
@@ -3659,8 +3665,7 @@ async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, a
                                           tool_registry=tool_registry))
 
     async def fetch(routed, cred, headers, url):
-        routed_body = {k: v for k, v in routed.items() if not k.startswith("_")}
-        return await _fetch_checked_chat(url, headers, routed_body, model_name, rid, cred,
+        return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
                                          filter_retry=True, max_collect_bytes=policy.max_collect_bytes)
     try:
         collected = await await_or_hangup(
@@ -3706,9 +3711,8 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
                                               parallel_tool_calls=body.get("parallel_tool_calls", True),
                                               tool_registry=tool_registry))
     sent = False
-    upstream_body = {k: v for k, v in body.items() if not k.startswith("_")}
     upstream = _chat_sse_lines(
-        url, headers, upstream_body, model_name, t0, rid, cred,
+        url, headers, body, model_name, t0, rid, cred,
         policy=policy, tracker=tracker, state=state)
     try:
         try:
