@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import time
@@ -58,7 +59,8 @@ def responses_request_to_chat(body: dict) -> dict:
             if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list):
                 raw_tools.extend(item["tools"])
 
-    registry, chat_tools = _build_tool_registry_and_chat_tools(raw_tools)
+    registry, chat_tools = _build_tool_registry_and_chat_tools(
+        raw_tools, input_items=inp if isinstance(inp, list) else None)
 
     messages: list[dict] = []
 
@@ -292,13 +294,31 @@ def _extract_output_text(content_parts: list) -> str | list[dict]:
     return "".join(texts)
 
 
+_SCHEMA_MAPS = frozenset(("properties", "patternProperties", "$defs", "definitions",
+                          "dependentSchemas", "dependencies"))
+_SCHEMA_ARRAYS = frozenset(("allOf", "anyOf", "oneOf", "prefixItems", "items"))
+_SCHEMA_CHILDREN = frozenset(("items", "additionalItems", "contains", "unevaluatedItems",
+                             "additionalProperties", "unevaluatedProperties", "propertyNames",
+                             "not", "if", "then", "else", "contentSchema"))
+
+
 def _sanitize_schema(schema: Any) -> Any:
-    """Recursively strip 'encrypted' client-only marker from parameter schemas."""
-    if isinstance(schema, dict):
-        return {k: _sanitize_schema(v) for k, v in schema.items() if k != "encrypted"}
-    if isinstance(schema, list):
-        return [_sanitize_schema(item) for item in schema]
-    return schema
+    """Strip encryption markers in schema positions, preserving names and instance data."""
+    if not isinstance(schema, dict):
+        return deepcopy(schema)
+    result = {}
+    for key, value in schema.items():
+        if key == "encrypted" and isinstance(value, bool):
+            continue
+        if key in _SCHEMA_MAPS and isinstance(value, dict):
+            result[key] = {name: _sanitize_schema(child) for name, child in value.items()}
+        elif key in _SCHEMA_ARRAYS and isinstance(value, list):
+            result[key] = [_sanitize_schema(child) for child in value]
+        elif key in _SCHEMA_CHILDREN:
+            result[key] = _sanitize_schema(value)
+        else:
+            result[key] = deepcopy(value)
+    return result
 
 
 class ToolRegistry:
@@ -307,7 +327,6 @@ class ToolRegistry:
     def __init__(self, mappings: dict[str, dict[str, Any]] | None = None):
         self.upstream_to_identity: dict[str, tuple[str | None, str]] = {}
         self.identity_to_upstream: dict[tuple[str | None, str], str] = {}
-        self._name_to_identities: dict[str, list[tuple[str | None, str]]] = {}
 
         if mappings:
             for up_name, ident in mappings.items():
@@ -315,15 +334,24 @@ class ToolRegistry:
                 nm = ident.get("name", up_name) if isinstance(ident, dict) else up_name
                 self._record(up_name, ns, nm)
 
+    @staticmethod
+    def _identity(namespace, name) -> tuple[str | None, str]:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("function name must be a non-empty string")
+        if namespace is not None and (not isinstance(namespace, str) or not namespace.strip()):
+            raise ValueError("namespace must be a non-empty string")
+        return namespace, name
+
     def _record(self, upstream_name: str, namespace: str | None, name: str) -> None:
-        ident = (namespace, name)
+        ident = self._identity(namespace, name)
+        if upstream_name in self.upstream_to_identity and self.upstream_to_identity[upstream_name] != ident:
+            raise ValueError("tool identities must have distinct upstream names")
         self.upstream_to_identity[upstream_name] = ident
         self.identity_to_upstream[ident] = upstream_name
-        self._name_to_identities.setdefault(name, []).append(ident)
 
     def register(self, namespace: str | None, name: str) -> str:
         """Register a tool identity (namespace, name) and return its unique upstream name."""
-        ident = (namespace, name)
+        ident = self._identity(namespace, name)
         if ident in self.identity_to_upstream:
             return self.identity_to_upstream[ident]
 
@@ -348,18 +376,11 @@ class ToolRegistry:
         return None, upstream_name
 
     def get_upstream_name(self, namespace: str | None, name: str) -> str:
-        """Map (namespace, name) to upstream name, with fallback for historical calls."""
-        ident = (namespace, name)
-        if ident in self.identity_to_upstream:
-            return self.identity_to_upstream[ident]
-        if namespace is None:
-            if (None, name) in self.identity_to_upstream:
-                return self.identity_to_upstream[(None, name)]
-            matches = self._name_to_identities.get(name, [])
-            if len(matches) == 1:
-                return self.identity_to_upstream[matches[0]]
-            return name
-        return f"{namespace}__{name}"
+        """Resolve an exact identity already reserved from declarations or history."""
+        ident = self._identity(namespace, name)
+        if ident not in self.identity_to_upstream:
+            raise ValueError("unknown tool identity in this request")
+        return self.identity_to_upstream[ident]
 
     def to_dict(self) -> dict:
         return {
@@ -385,6 +406,8 @@ def _collect_raw_tools(tools: list, current_ns: str = "") -> list[tuple[str | No
         tool_type = t.get("type")
         if tool_type == "namespace" and isinstance(t.get("tools"), list):
             ns_name = t.get("name", "")
+            if not isinstance(ns_name, str) or not ns_name.strip():
+                raise ValueError("namespace.name must be a non-empty string")
             full_ns = f"{current_ns}.{ns_name}" if current_ns else ns_name
             collected.extend(_collect_raw_tools(t["tools"], full_ns))
         elif tool_type == "function" or "function" in t:
@@ -416,13 +439,23 @@ def _format_chat_tool(upstream_name: str, tool_def: dict) -> dict:
     return {"type": "function", "function": fn}
 
 
-def _build_tool_registry_and_chat_tools(raw_tools: list) -> tuple[ToolRegistry, list[dict]]:
-    """Build ToolRegistry and convert declared tools into unique Chat function tools."""
+def _build_tool_registry_and_chat_tools(raw_tools: list, *, input_items: list | None = None) -> tuple[ToolRegistry, list[dict]]:
+    """Reserve current and historical identities, advertising only currently declared tools."""
     collected = _collect_raw_tools(raw_tools)
     registry = ToolRegistry()
     result = []
 
-    # Register plain tools first so their upstream name strictly preserves original name.
+    identities = [(ns, name) for ns, name, _ in collected]
+    identities.extend((item.get("namespace"), item.get("name")) for item in (input_items or [])
+                      if isinstance(item, dict) and item.get("type") == "function_call")
+    # Historical global names must also remain available before allocating namespace aliases.
+    for ns, name in identities:
+        if ns is None:
+            registry.register(ns, name)
+    for ns, name in identities:
+        if ns is not None:
+            registry.register(ns, name)
+
     plain = [item for item in collected if item[0] is None]
     namespaced = [item for item in collected if item[0] is not None]
 
@@ -432,7 +465,7 @@ def _build_tool_registry_and_chat_tools(raw_tools: list) -> tuple[ToolRegistry, 
         if ident in seen_identities:
             continue
         seen_identities.add(ident)
-        upstream_name = registry.register(ns, name)
+        upstream_name = registry.get_upstream_name(ns, name)
         result.append(_format_chat_tool(upstream_name, tool_def))
 
     return registry, result
@@ -446,7 +479,7 @@ def _convert_tools_for_chat(tools: list) -> list:
 
 def _convert_tool_choice_for_chat(choice: Any, tool_registry: ToolRegistry | None = None) -> Any:
     """Convert Responses tool_choice to Chat Completions format."""
-    if not isinstance(choice, dict):
+    if not isinstance(choice, dict) or choice.get("type") != "function":
         return choice
     fn_obj = choice.get("function") if isinstance(choice.get("function"), dict) else choice
     name = fn_obj.get("name") if isinstance(fn_obj, dict) else None

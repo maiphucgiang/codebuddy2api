@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interface-level regression tests for Responses multi-agent tools and namespace identity mapping."""
 
+from copy import deepcopy
 import json
 import sys
 from pathlib import Path
@@ -418,6 +419,191 @@ class ResponsesMultiAgentInterfaceTests(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["name"], "spawn_agent")
         self.assertEqual(out[0]["namespace"], "collaboration")
+
+
+    def _boundary_request(self, payload, stream, mode, projection="balanced"):
+        self.upstream_requests.clear()
+
+        def respond(request):
+            body = json.loads(request.content)
+            calls = None
+            if body.get("tool_choice") == "required" and body.get("tools"):
+                calls = [{"id": "next_call", "function": {
+                    "name": body["tools"][0]["function"]["name"], "arguments": "{}"}}]
+            return httpx.Response(200, content=_chat_sse_stream(tool_calls=calls, content=None if calls else "OK"))
+
+        self.mock_response_generator = respond
+        body = {"input": [{"role": "user", "content": "Use the tool"}],
+                **deepcopy(payload), "model": "auto", "stream": stream}
+        with patch.dict(converter.CONFIG, {"stream_mode": mode, "responses_projection_mode": projection,
+                                           "keep_tool_metadata": True}):
+            response = self.client.post("/v1/responses", json=body)
+        sent = json.loads(self.upstream_requests[-1].content) if self.upstream_requests else None
+        return response, sent
+
+    def test_schema_cleanup_preserves_names_and_instance_data(self):
+        literal = {"encrypted": True, "payload": "fixture",
+                   "metadata": {"properties": {"encrypted": {"encrypted": False}}}}
+        schema = {
+            "type": "object", "encrypted": True,
+            "properties": {"encrypted": {"type": "boolean", "encrypted": True},
+                           "payload": {"type": "string", "encrypted": False},
+                           "metadata": {"type": "object", "additionalProperties": True}},
+            "required": ["encrypted", "payload"], "additionalProperties": False,
+            "$defs": {"encrypted": {"type": "boolean", "encrypted": True}},
+            "allOf": [{"encrypted": True, "properties": {"encrypted": {"$ref": "#/$defs/encrypted"}}}],
+            "default": literal, "const": literal, "enum": [literal], "examples": [literal],
+        }
+        expected = deepcopy(schema)
+        del expected["encrypted"]
+        del expected["properties"]["encrypted"]["encrypted"]
+        del expected["properties"]["payload"]["encrypted"]
+        del expected["$defs"]["encrypted"]["encrypted"]
+        del expected["allOf"][0]["encrypted"]
+        for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+            for projection in ("balanced", "passthrough"):
+                with self.subTest(stream=stream, mode=mode, projection=projection):
+                    response, sent = self._boundary_request({"tools": [{
+                        "type": "function", "name": "save", "parameters": schema}]}, stream, mode, projection)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(sent["tools"][0]["function"]["parameters"], expected)
+
+    def test_schema_cleanup_handles_nested_schema_positions(self):
+        nested = {"type": "object", "encrypted": True,
+                  "properties": {"encrypted": {"type": "boolean", "encrypted": True}}}
+        cleaned = {"type": "object", "properties": {"encrypted": {"type": "boolean"}}}
+        schema = {
+            "type": "object", "definitions": {"encrypted": nested},
+            "patternProperties": {"encrypted": nested}, "dependentSchemas": {"encrypted": nested},
+            "dependencies": {"encrypted": ["payload"], "payload": nested},
+            "additionalProperties": nested, "propertyNames": nested, "unevaluatedProperties": nested,
+            "items": nested, "contains": nested, "additionalItems": nested, "unevaluatedItems": nested,
+            "contentSchema": nested, "not": nested, "if": nested, "then": nested, "else": nested,
+            "anyOf": [nested], "oneOf": [nested], "prefixItems": [nested],
+        }
+        response, sent = self._boundary_request({"tools": [{"type": "function", "function": {
+            "name": "save", "parameters": schema}}]}, False, "compatible")
+        self.assertEqual(response.status_code, 200, response.text)
+        actual = sent["tools"][0]["function"]["parameters"]
+        self.assertEqual(actual["definitions"]["encrypted"], cleaned)
+        self.assertEqual(actual["patternProperties"]["encrypted"], cleaned)
+        self.assertEqual(actual["dependentSchemas"]["encrypted"], cleaned)
+        self.assertEqual(actual["dependencies"], {"encrypted": ["payload"], "payload": cleaned})
+        for key in ("additionalProperties", "propertyNames", "unevaluatedProperties", "items", "contains",
+                    "additionalItems", "unevaluatedItems", "contentSchema", "not", "if", "then", "else"):
+            self.assertEqual(actual[key], cleaned, key)
+        for key in ("anyOf", "oneOf", "prefixItems"):
+            self.assertEqual(actual[key], [cleaned], key)
+        response, sent = self._boundary_request({"tools": [{"type": "function", "name": "tuple",
+            "parameters": {"type": "array", "items": [nested, False]}}]}, False, "compatible")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(sent["tools"][0]["function"]["parameters"]["items"], [cleaned, False])
+
+    def test_explicit_choices_require_exact_current_identity(self):
+        function = {"type": "function", "name": "read", "parameters": {"type": "object"}}
+        namespaced = {"type": "namespace", "name": "vault", "tools": [function]}
+        cases = [
+            ([{**function, "name": "vault__read"}], {"type": "function", "namespace": "vault", "name": "read"}),
+            ([function], {"type": "custom", "name": "read"}),
+            ([function], {"name": "read"}),
+            ([namespaced], {"type": "function", "name": "read"}),
+            ([namespaced], {"type": "function", "namespace": "missing", "name": "read"}),
+        ]
+        for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+            for tools, choice in cases:
+                with self.subTest(stream=stream, mode=mode, choice=choice):
+                    response, _ = self._boundary_request({"tools": tools, "tool_choice": choice}, stream, mode)
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertEqual(self.upstream_requests, [])
+
+    def test_history_collisions_preserve_reasoning_and_agent_messages(self):
+        cases = [((None, "vault__read"), ("vault", "read")),
+                 (("vault", "read"), (None, "vault__read")),
+                 (("vault", "inner__read"), ("vault__inner", "read"))]
+        for current, prior in cases:
+            namespace, name = current
+            tool = {"type": "function", "name": name, "parameters": {"type": "object"}}
+            if namespace is not None:
+                tool = {"type": "namespace", "name": namespace, "tools": [tool]}
+            history = [
+                {"role": "user", "content": "Earlier request"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "prior thought"}]},
+                {"type": "function_call", "call_id": "prior_call", "namespace": prior[0],
+                 "name": prior[1], "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "prior_call", "output": "prior result"},
+                {"type": "additional_tools", "tools": [tool]},
+                {"type": "agent_message", "content": [{"type": "encrypted_content",
+                                                       "encrypted_content": "next task"}]},
+            ]
+            for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+                for projection in ("balanced", "passthrough"):
+                    with self.subTest(current=current, prior=prior, stream=stream, mode=mode, projection=projection):
+                        payload = {"input": history, "tool_choice": {"type": "function", "name": name, "namespace": namespace}}
+                        response, sent = self._boundary_request(payload, stream, mode, projection)
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(len(sent["tools"]), 1)
+                        active_name = sent["tools"][0]["function"]["name"]
+                        previous = next(message for message in sent["messages"] if message.get("tool_calls"))
+                        previous_name = previous["tool_calls"][0]["function"]["name"]
+                        self.assertNotEqual(previous_name, active_name)
+                        if prior[0] is None:
+                            self.assertEqual(previous_name, prior[1])
+                        self.assertEqual(previous["reasoning_content"], "prior thought")
+                        self.assertEqual(sent["messages"][-1]["content"], "next task")
+                        self.assertFalse(any(key.startswith("_") for key in sent))
+                        data = (next(event["response"] for event in _parse_responses_sse_events(response.text)
+                                     if event["type"] == "response.completed") if stream else response.json())
+                        call = next(item for item in data["output"] if item["type"] == "function_call")
+                        self.assertEqual((call.get("namespace"), call["name"]), current)
+
+    def test_retired_tools_are_not_exposed_or_selectable(self):
+        history = [{"role": "user", "content": "Earlier request"},
+                   {"type": "function_call", "call_id": "past", "name": "read", "namespace": "retired", "arguments": "{}"},
+                   {"type": "function_call_output", "call_id": "past", "output": "prior result"},
+                   {"role": "user", "content": "Continue"}]
+        for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+            with self.subTest(stream=stream, mode=mode):
+                response, sent = self._boundary_request({"input": history}, stream, mode)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertNotIn("tools", sent)
+                self.assertNotIn("_tool_registry", sent)
+                response, _ = self._boundary_request({"input": history, "tool_choice": {
+                    "type": "function", "name": "read", "namespace": "retired"}}, stream, mode)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(self.upstream_requests, [])
+
+    def test_upstream_retired_identity_cannot_become_an_executable_call(self):
+        payload = {"model": "auto",
+                   "tools": [{"type": "namespace", "name": "probe", "tools": [{"type": "function",
+                              "name": "record", "parameters": {"type": "object"}}]}],
+                   "tool_choice": {"type": "function", "name": "record", "namespace": "probe"},
+                   "input": [{"role": "user", "content": "Earlier request"},
+                             {"type": "function_call", "call_id": "past", "name": "probe__record", "arguments": "{}"},
+                             {"type": "function_call_output", "call_id": "past", "output": "done"},
+                             {"role": "user", "content": "Use the new tool"}]}
+        calls = [{"id": "invalid_call", "function": {"name": "probe__record", "arguments": "{}"}}]
+        self.mock_response_generator = lambda request: httpx.Response(200, content=_chat_sse_stream(tool_calls=calls))
+        for stream, mode in ((False, "compatible"), (True, "compatible"), (True, "realtime")):
+            with self.subTest(stream=stream, mode=mode), patch.dict(converter.CONFIG, {
+                "stream_mode": mode, "tool_call_max_retry": 0}):
+                response = self.client.post("/v1/responses", json={**payload, "stream": stream})
+                if not stream or response.status_code != 200:
+                    self.assertEqual(response.status_code, 502, response.text)
+                    continue
+                events = _parse_responses_sse_events(response.text)
+                self.assertTrue(any(event.get("type") in ("error", "response.failed") or event.get("error") for event in events))
+                self.assertFalse(any(event.get("type") in ("response.completed", "response.function_call_arguments.done") for event in events))
+                self.assertFalse(any(event.get("item", {}).get("type") == "function_call" for event in events))
+
+
+    def test_malformed_namespaces_return_400_without_upstream(self):
+        for namespace in ([], {}, True, 7, ""):
+            with self.subTest(namespace=namespace):
+                response, _ = self._boundary_request({"tools": [{"type": "function", "name": "read"}],
+                    "tool_choice": {"type": "function", "name": "read", "namespace": namespace}}, False, "compatible")
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(self.upstream_requests, [])
+
 
 
 if __name__ == "__main__":
