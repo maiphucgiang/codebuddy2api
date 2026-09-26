@@ -66,6 +66,7 @@ from app.upstream_io import (ChatSSEAccumulator, StreamOutputBudget, UpstreamHTT
 from app.inference_resources import (AccountCapacity, InferenceResourcesMiddleware, inference_lifespan,
                                      request_resources, release_credential)
 from app.request_context import SessionIdentifierError, current_context
+from app.reasoning import resolve_reasoning_effort, thinking_mode
 from app import model_capabilities
 from app.message_normalization import merge_intl_user_images
 from app.adapters.chat_input import normalize_chat_messages
@@ -1931,21 +1932,28 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(),
 def _route_chat(payload, body, rid, *, tried=()):
     """Validate account capabilities and derive each routed body from canonical input."""
     context = current_context()
+    protocol = context.protocol if context is not None else "chat"
+    mode = thinking_mode(payload) if protocol == "messages" else None
     enabled = context.capability_guard if context is not None else CONFIG.get("model_capability_guard", True)
     cred = None
     try:
-        requirements = (model_capabilities.Requirements.from_request(
-            body, payload, context.protocol if context is not None else "chat") if enabled else None)
+        requirements = model_capabilities.Requirements.from_request(body, payload, protocol) if enabled else None
         cred, headers = _cred_for(payload, body.get("model"), tried=tried, requirements=requirements)
         profile = profile_for_headers(headers)
         routed_model = _upstream_model(body.get("model"), profile)
-        if requirements is not None and CONFIG.get("cred_pool") is None:
+        metadata = None
+        if mode in ("enabled", "adaptive") or (requirements is not None and CONFIG.get("cred_pool") is None):
             entry = {"profile": profile, "account_key": account_key(
                 profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))}
-            failures = requirements.violations(model_capabilities.entry_model(sys.modules[__name__], entry, body.get("model")))
+            metadata = model_capabilities.entry_model(sys.modules[__name__], entry, body.get("model"))
+        if requirements is not None and CONFIG.get("cred_pool") is None:
+            failures = requirements.violations(metadata)
             if failures:
                 raise model_capabilities.capability_error(failures)
         canonical = body
+        effort = resolve_reasoning_effort(body.get("reasoning_effort"), mode, metadata)
+        if effort != body.get("reasoning_effort"):
+            body = {**body, "reasoning_effort": effort}
         if routed_model != body.get("model"):
             body = {**body, "model": routed_model}
         body, merged_runs, merged_messages = merge_intl_user_images(body, profile)

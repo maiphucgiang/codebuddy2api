@@ -7,6 +7,7 @@ import os
 import time
 from typing import Any
 
+from app.reasoning import extract_reasoning_text, map_reasoning_controls
 from app.upstream_io import (StreamOutputBudget, merge_tool_call_delta, new_tool_state,
                              seal_tool_identities, tool_identity_complete)
 
@@ -78,16 +79,12 @@ def responses_request_to_chat(body: dict) -> dict:
     # Forward supported parameters.
     for key in ("temperature", "top_p", "stop", "seed",
                 "presence_penalty", "frequency_penalty",
-                "response_format", "reasoning_effort", "parallel_tool_calls", "prompt_cache_key"):
+                "response_format", "parallel_tool_calls", "prompt_cache_key"):
         if key in body:
             chat[key] = body[key]
 
     # Explicit top-level values override equivalent nested fields.
-    reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict) and "reasoning_effort" not in chat:
-        effort = reasoning.get("effort")
-        if isinstance(effort, str) and effort.strip():
-            chat["reasoning_effort"] = effort
+    map_reasoning_controls(body, chat, protocol="responses")
     text = body.get("text")
     if isinstance(text, dict) and "response_format" not in chat:
         mapped = _text_format_to_response_format(text.get("format"))
@@ -108,17 +105,36 @@ def _convert_input_items(items: list) -> list[dict]:
     # Buffer adjacent assistant text and function calls.
     pending_assistant_content: str | list[dict] | None = None
     pending_tool_calls: list[dict] = []
+    pending_reasoning: list[str] = []
 
     def _flush_assistant():
         nonlocal pending_assistant_content, pending_tool_calls
-        if pending_assistant_content is not None or pending_tool_calls:
+        if pending_assistant_content is not None or pending_tool_calls or pending_reasoning:
             msg: dict[str, Any] = {"role": "assistant",
                                    "content": pending_assistant_content or ""}
             if pending_tool_calls:
                 msg["tool_calls"] = pending_tool_calls[:]
+            if pending_reasoning:
+                msg["reasoning_content"] = "".join(pending_reasoning)
             messages.append(msg)
             pending_assistant_content = None
             pending_tool_calls.clear()
+            pending_reasoning.clear()
+
+    def _set_assistant_content(content):
+        nonlocal pending_assistant_content
+        if pending_assistant_content is not None and not pending_tool_calls:
+            _flush_assistant()
+        # Realtime output can place text after a tool call within the same turn.
+        if pending_tool_calls and pending_assistant_content:
+            if isinstance(pending_assistant_content, str) and isinstance(content, str):
+                content = pending_assistant_content + content
+            else:
+                previous = (pending_assistant_content if isinstance(pending_assistant_content, list)
+                            else [{"type": "text", "text": pending_assistant_content}])
+                following = content if isinstance(content, list) else [{"type": "text", "text": content}]
+                content = previous + following
+        pending_assistant_content = content
 
     for item in items:
         if not isinstance(item, dict):
@@ -126,6 +142,13 @@ def _convert_input_items(items: list) -> list[dict]:
 
         item_type = item.get("type")
         role = item.get("role", "")
+
+        if item_type == "reasoning":
+            if role not in ("", "assistant"):
+                raise ValueError("reasoning requires an assistant item")
+            text = extract_reasoning_text(item)
+            pending_reasoning.append(text)
+            continue
 
         # Untyped role messages
         if item_type is None and role in ("user", "system", "developer"):
@@ -145,17 +168,15 @@ def _convert_input_items(items: list) -> list[dict]:
 
         # Assistant output from history
         if item_type == "message" and role == "assistant":
-            _flush_assistant()
             content_parts = item.get("content", [])
             text = _extract_output_text(content_parts) if isinstance(content_parts, list) else str(content_parts)
-            pending_assistant_content = text
+            _set_assistant_content(text)
             continue
 
         # Untyped assistant messages
         if item_type is None and role == "assistant":
-            _flush_assistant()
             content = _extract_content(item.get("content", ""))
-            pending_assistant_content = content
+            _set_assistant_content(content)
             continue
 
         # Merge calls into the preceding assistant message.

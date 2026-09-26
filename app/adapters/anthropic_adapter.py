@@ -7,6 +7,7 @@ import os
 import time
 from typing import Any
 
+from app.reasoning import extract_reasoning_text, map_reasoning_controls
 from app.upstream_io import (StreamOutputBudget, merge_tool_call_delta, new_tool_state,
                              seal_tool_identities, tool_identity_complete)
 
@@ -93,6 +94,7 @@ def anthropic_request_to_chat(body: dict) -> dict:
             raise ValueError("stop_sequences must be an array of strings")
         chat["stop"] = stop_sequences
 
+    map_reasoning_controls(body, chat, protocol="messages")
     return chat
 
 
@@ -124,6 +126,9 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
 
     # Structured content blocks
     blocks = content
+    if role != "assistant" and any(isinstance(block, dict) and block.get("type") in
+                                  ("thinking", "redacted_thinking") for block in blocks):
+        raise ValueError("thinking requires an assistant message")
 
     # User messages may contain tool results.
     if role == "user":
@@ -157,11 +162,14 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     if role == "assistant":
         content_out = _convert_content_blocks(blocks)
         tool_calls: list[dict] = []
+        thoughts: list[str] = []
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-            bt = block.get("type", "")
-            if bt == "tool_use":
+            thought = extract_reasoning_text(block)
+            if thought is not None:
+                thoughts.append(thought)
+            elif block.get("type") == "tool_use":
                 tc = {
                     "id": block.get("id", _rand_id("call_")),
                     "type": "function",
@@ -176,6 +184,8 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
         msg_out["content"] = content_out if content_out or has_text else None
         if tool_calls:
             msg_out["tool_calls"] = tool_calls
+        if thoughts:
+            msg_out["reasoning_content"] = "".join(thoughts)
         return [msg_out]
 
     content_out = _convert_content_blocks(blocks)
