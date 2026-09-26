@@ -3644,10 +3644,15 @@ async def create_response(request: Request,
 async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False,
                              payload=None, canonical=None, request=None, policy=None):
     policy = policy or _snapshot_stream_policy("messages" if anthropic else "responses", body)
-    converter = (AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name, parallel_tool_calls=body.get("parallel_tool_calls", True)))
+    tool_registry = body.get("_tool_registry")
+    converter = (AnthropicStreamConverter(model=model_name) if anthropic else
+                 ResponsesStreamConverter(model=model_name,
+                                          parallel_tool_calls=body.get("parallel_tool_calls", True),
+                                          tool_registry=tool_registry))
 
     async def fetch(routed, cred, headers, url):
-        return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
+        routed_body = {k: v for k, v in routed.items() if not k.startswith("_")}
+        return await _fetch_checked_chat(url, headers, routed_body, model_name, rid, cred,
                                          filter_retry=True, max_collect_bytes=policy.max_collect_bytes)
     try:
         collected = await await_or_hangup(
@@ -3671,6 +3676,7 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
     """Map protocol events while sharing connection, aggregation and failure handling."""
     protocol = "messages" if anthropic else "responses"
     policy = body.pop(_REQUEST_POLICY_KEY, None) or _snapshot_stream_policy(protocol, body)
+    tool_registry = body.get("_tool_registry")
     state = {}
     tracker = None
     declared_names = _declared_tool_names(body)
@@ -3684,14 +3690,17 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
                      ResponsesStreamConverter(model=model_name,
                                               parallel_tool_calls=body.get("parallel_tool_calls", True),
                                               realtime=True, budget=budget, tool_states=tracker.tools,
-                                              declared_names=declared_names))
+                                              declared_names=declared_names,
+                                              tool_registry=tool_registry))
     else:
         converter = (AnthropicStreamConverter(model=model_name) if anthropic else
                      ResponsesStreamConverter(model=model_name,
-                                              parallel_tool_calls=body.get("parallel_tool_calls", True)))
+                                              parallel_tool_calls=body.get("parallel_tool_calls", True),
+                                              tool_registry=tool_registry))
     sent = False
+    upstream_body = {k: v for k, v in body.items() if not k.startswith("_")}
     upstream = _chat_sse_lines(
-        url, headers, body, model_name, t0, rid, cred,
+        url, headers, upstream_body, model_name, t0, rid, cred,
         policy=policy, tracker=tracker, state=state)
     try:
         try:

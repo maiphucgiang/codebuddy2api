@@ -623,6 +623,193 @@ def test_parallel_tool_calls_roundtrip():
     print("✅ test_parallel_tool_calls_roundtrip")
 
 
+def test_tool_registry_and_identity_mapping():
+    """Verify ToolRegistry handles plain tools, namespaced tools, collision avoidance, and reversible lookup."""
+    from app.adapters.responses_adapter import ToolRegistry
+
+    registry = ToolRegistry()
+    # 1. Plain tool: must keep original name
+    name1 = registry.register(None, "collaboration__spawn_agent")
+    assert name1 == "collaboration__spawn_agent"
+    assert registry.get_identity("collaboration__spawn_agent") == (None, "collaboration__spawn_agent")
+
+    # 2. Namespaced tool colliding with existing plain tool: must disambiguate safely
+    name2 = registry.register("collaboration", "spawn_agent")
+    assert name2 == "collaboration__spawn_agent_1"
+    assert registry.get_identity("collaboration__spawn_agent_1") == ("collaboration", "spawn_agent")
+    # Plain tool lookup still returns original identity
+    assert registry.get_identity("collaboration__spawn_agent") == (None, "collaboration__spawn_agent")
+
+    # 3. Tool with __ in name inside namespace
+    name3 = registry.register("custom_ns", "exec__command")
+    assert name3 == "custom_ns__exec__command"
+    assert registry.get_identity("custom_ns__exec__command") == ("custom_ns", "exec__command")
+
+    # 4. Tools with same name in different namespaces
+    name_ns1 = registry.register("ns1", "search")
+    name_ns2 = registry.register("ns2", "search")
+    assert name_ns1 == "ns1__search"
+    assert name_ns2 == "ns2__search"
+    assert registry.get_identity("ns1__search") == ("ns1", "search")
+    assert registry.get_identity("ns2__search") == ("ns2", "search")
+
+    # 5. Serialization and round-trip
+    dumped = registry.to_dict()
+    restored = ToolRegistry.from_dict(dumped)
+    assert restored.get_identity("custom_ns__exec__command") == ("custom_ns", "exec__command")
+    assert restored.get_identity("collaboration__spawn_agent") == (None, "collaboration__spawn_agent")
+    assert restored.get_identity("collaboration__spawn_agent_1") == ("collaboration", "spawn_agent")
+    print("✅ test_tool_registry_and_identity_mapping")
+
+
+def test_responses_multiagent_request_conversion_and_schema_sanitization():
+    """Verify responses_request_to_chat converts tools, strips encrypted markers, and maps tool_choice and history."""
+    req = {
+        "model": "gpt-4o",
+        "tools": [
+            {
+                "type": "function",
+                "name": "collaboration__spawn_agent",
+                "description": "Standard unnamespaced tool",
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}},
+            },
+            {
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "Spawn an agent",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "message": {"type": "string", "encrypted": True},
+                                "task_name": {"type": "string"},
+                                "meta": {
+                                    "type": "object",
+                                    "properties": {
+                                        "secret": {"type": "string", "encrypted": True},
+                                        "public": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+            {
+                "type": "namespace",
+                "name": "ns1",
+                "tools": [{"type": "function", "name": "search", "parameters": {"type": "object"}}],
+            },
+            {
+                "type": "namespace",
+                "name": "ns2",
+                "tools": [{"type": "function", "name": "search", "parameters": {"type": "object"}}],
+            },
+            {
+                "type": "namespace",
+                "name": "custom_ns",
+                "tools": [{"type": "function", "name": "exec__command", "parameters": {"type": "object"}}],
+            },
+        ],
+        "tool_choice": {"type": "function", "name": "spawn_agent", "namespace": "collaboration"},
+        "input": [
+            {
+                "type": "additional_tools",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "extra",
+                        "tools": [{"type": "function", "name": "ping", "parameters": {"type": "object"}}],
+                    }
+                ],
+            },
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [
+                    {"type": "input_text", "text": "Task header\n"},
+                    {"type": "encrypted_content", "encrypted_content": "Sensitive payload text"},
+                ],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_hist_1",
+                "name": "spawn_agent",
+                "namespace": "collaboration",
+                "arguments": '{"task_name": "t1"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_hist_1",
+                "output": "ok",
+            },
+        ],
+    }
+
+    chat = responses_request_to_chat(req)
+    chat_tools = chat.get("tools", [])
+    tool_names = [t["function"]["name"] for t in chat_tools]
+
+    # 1. Verify plain tool preserved original name
+    assert "collaboration__spawn_agent" in tool_names
+    # 2. Verify namespaced tool disambiguated
+    assert "collaboration__spawn_agent_1" in tool_names
+    # 3. Verify same name under different namespaces preserved
+    assert "ns1__search" in tool_names
+    assert "ns2__search" in tool_names
+    # 4. Verify tool with __ in name inside namespace
+    assert "custom_ns__exec__command" in tool_names
+    # 5. Verify additional_tools registered
+    assert "extra__ping" in tool_names
+
+    # 6. Verify parameter schema cleaning (no 'encrypted' key anywhere)
+    collab_tool = next(t for t in chat_tools if t["function"]["name"] == "collaboration__spawn_agent_1")
+    props = collab_tool["function"]["parameters"]["properties"]
+    assert "encrypted" not in props["message"]
+    assert "encrypted" not in props["meta"]["properties"]["secret"]
+
+    # 7. Verify tool_choice mapped
+    assert chat.get("tool_choice") == {"type": "function", "function": {"name": "collaboration__spawn_agent_1"}}
+
+    # 8. Verify messages conversion
+    messages = chat.get("messages", [])
+    # User message from agent_message with encrypted_content
+    user_msg = next(m for m in messages if m["role"] == "user")
+    assert "Task header\n" in user_msg["content"]
+    assert "Sensitive payload text" in user_msg["content"]
+
+    # Assistant message from function_call
+    asst_msg = next(m for m in messages if m["role"] == "assistant")
+    assert asst_msg["tool_calls"][0]["function"]["name"] == "collaboration__spawn_agent_1"
+
+    # 9. Verify stream converter output reconstruction
+    conv = ResponsesStreamConverter(model="test", tool_registry=chat.get("_tool_registry"))
+
+    # Namespaced tool call
+    slot_collab = {"id": "c1", "name": "collaboration__spawn_agent_1", "args": "{}", "fc_id": "fc_1", "output_idx": 0, "emitted": False, "emitted_args_length": 0}
+    item_collab = conv._fc_item(slot_collab, "completed")
+    assert item_collab["name"] == "spawn_agent"
+    assert item_collab["namespace"] == "collaboration"
+
+    # Plain tool call
+    slot_plain = {"id": "c2", "name": "collaboration__spawn_agent", "args": "{}", "fc_id": "fc_2", "output_idx": 1, "emitted": False, "emitted_args_length": 0}
+    item_plain = conv._fc_item(slot_plain, "completed")
+    assert item_plain["name"] == "collaboration__spawn_agent"
+    assert "namespace" not in item_plain
+
+    # Custom namespace with __ in name
+    slot_custom = {"id": "c3", "name": "custom_ns__exec__command", "args": "{}", "fc_id": "fc_3", "output_idx": 2, "emitted": False, "emitted_args_length": 0}
+    item_custom = conv._fc_item(slot_custom, "completed")
+    assert item_custom["name"] == "exec__command"
+    assert item_custom["namespace"] == "custom_ns"
+
+    print("✅ test_responses_multiagent_request_conversion_and_schema_sanitization")
+
+
 if __name__ == "__main__":
     test_simple_text_request()
     test_array_input_request()
@@ -647,4 +834,6 @@ if __name__ == "__main__":
     test_usage_maps_cached_tokens_and_omits_when_unknown()
     test_reasoning_effort_and_text_format_are_mapped()
     test_parallel_tool_calls_roundtrip()
+    test_tool_registry_and_identity_mapping()
+    test_responses_multiagent_request_conversion_and_schema_sanitization()
     print(f"\n🎉 All {22} tests passed!")
