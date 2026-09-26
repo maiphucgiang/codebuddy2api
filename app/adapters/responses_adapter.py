@@ -69,9 +69,19 @@ def responses_request_to_chat(body: dict) -> dict:
         chat["model"] = body["model"]
 
     # Normalize function tool definitions.
-    tools = body.get("tools")
+    tools = list(body.get("tools") or [])
+    inp = body.get("input", [])
+    if isinstance(inp, list):
+        for item in inp:
+            if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list):
+                tools.extend(item["tools"])
+
+    ns_map = _build_tool_namespace_map(tools)
+
     if tools:
         chat["tools"] = _convert_tools_for_chat(tools)
+    if ns_map:
+        chat["_tool_namespaces"] = ns_map
     if "tool_choice" in body:
         chat["tool_choice"] = body["tool_choice"]
 
@@ -126,6 +136,17 @@ def _convert_input_items(items: list) -> list[dict]:
 
         item_type = item.get("type")
         role = item.get("role", "")
+
+        # Ignore additional_tools in message sequence
+        if item_type == "additional_tools":
+            continue
+
+        # Agent message from multi-agent collaboration
+        if item_type == "agent_message":
+            _flush_assistant()
+            content = _extract_content(item.get("content", ""))
+            messages.append({"role": "user", "content": content})
+            continue
 
         # Untyped role messages
         if item_type is None and role in ("user", "system", "developer"):
@@ -208,6 +229,10 @@ def _extract_content(content) -> str | list[dict]:
                 kind = p.get("type")
                 if kind in ("input_text", "text", "output_text"):
                     parts.append({"type": "text", "text": p.get("text", "")})
+                elif kind == "encrypted_content":
+                    text = p.get("encrypted_content") or p.get("text", "")
+                    if isinstance(text, str) and text:
+                        parts.append({"type": "text", "text": text})
                 elif kind == "input_image":
                     if p.get("file_id"):
                         raise ValueError("Responses input_image file_id is not supported; provide image_url instead")
@@ -242,24 +267,77 @@ def _extract_output_text(content_parts: list) -> str | list[dict]:
     return "".join(texts)
 
 
-def _convert_tools_for_chat(tools: list) -> list:
-    """Convert Responses tool definitions to Chat function objects."""
-    result = []
+def _build_tool_namespace_map(tools: list, current_ns: str = "") -> dict[str, str]:
+    """Map tool names to their declaring namespace for Responses event reconstruction."""
+    ns_map: dict[str, str] = {}
     for t in tools:
         if not isinstance(t, dict):
             continue
-        if t.get("type") != "function":
+        t_type = t.get("type")
+        if t_type == "namespace" and isinstance(t.get("tools"), list):
+            ns_name = t.get("name", "")
+            full_ns = f"{current_ns}.{ns_name}" if current_ns else ns_name
+            ns_map.update(_build_tool_namespace_map(t["tools"], full_ns))
+        elif t_type == "function":
+            name = t.get("name") or (t.get("function", {}).get("name") if isinstance(t.get("function"), dict) else "")
+            if name and current_ns:
+                ns_map[name] = current_ns
+    return ns_map
+
+
+def _convert_tools_for_chat(tools: list) -> list:
+    """Convert Responses tool definitions to Chat function objects."""
+    result = []
+    seen_names = set()
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        tool_type = t.get("type")
+        if tool_type == "namespace" and isinstance(t.get("tools"), list):
+            for sub_tool in _convert_tools_for_chat(t["tools"]):
+                fn_name = sub_tool.get("function", {}).get("name")
+                if fn_name and fn_name not in seen_names:
+                    seen_names.add(fn_name)
+                    result.append(sub_tool)
+            continue
+        if tool_type != "function":
             continue
         # Already in Chat format.
         if "function" in t:
-            result.append(t)
+            tool_obj = json.loads(json.dumps(t))
+            fn_dict = tool_obj.get("function")
+            if isinstance(fn_dict, dict) and "parameters" in fn_dict:
+                props = (fn_dict.get("parameters") or {}).get("properties")
+                if isinstance(props, dict):
+                    for p_name, p_val in props.items():
+                        if isinstance(p_val, dict) and "encrypted" in p_val:
+                            p_val.pop("encrypted", None)
+            fn_name = fn_dict.get("name") if isinstance(fn_dict, dict) else None
+            if fn_name and fn_name not in seen_names:
+                seen_names.add(fn_name)
+                result.append(tool_obj)
+            elif not fn_name:
+                result.append(tool_obj)
             continue
         # Nest the flat Responses function fields.
-        fn: dict[str, Any] = {"name": t.get("name", "")}
+        name = t.get("name", "")
+        if name and name in seen_names:
+            continue
+        if name:
+            seen_names.add(name)
+        fn: dict[str, Any] = {"name": name}
         if "description" in t:
             fn["description"] = t["description"]
         if "parameters" in t:
-            fn["parameters"] = t["parameters"]
+            params = t["parameters"]
+            if isinstance(params, dict):
+                params = json.loads(json.dumps(params))
+                props = params.get("properties")
+                if isinstance(props, dict):
+                    for p_name, p_val in props.items():
+                        if isinstance(p_val, dict) and "encrypted" in p_val:
+                            p_val.pop("encrypted", None)
+            fn["parameters"] = params
         if "strict" in t:
             fn["strict"] = t["strict"]
         result.append({"type": "function", "function": fn})
@@ -275,7 +353,8 @@ class ResponsesStreamConverter:
 
     def __init__(self, model: str = "unknown", parallel_tool_calls: bool = True, *,
                  realtime: bool = False, budget: StreamOutputBudget | None = None,
-                 tool_states: dict | None = None, declared_names=None):
+                 tool_states: dict | None = None, declared_names=None,
+                 tool_namespaces: dict[str, str] | None = None):
         self.resp_id = _rand_id("resp_")
         self.msg_id = _rand_id("msg_")
         self.model = model
@@ -284,6 +363,7 @@ class ResponsesStreamConverter:
         self._budget = budget if budget is not None else StreamOutputBudget(0)
         self._tool_states = tool_states
         self._local_tool_states: dict[int, dict] = {}
+        self._tool_namespaces = dict(tool_namespaces or {})
         self._declared_names = frozenset(
             value for value in (declared_names or ()) if isinstance(value, str) and value)
         self.created_at = int(time.time())
@@ -698,14 +778,34 @@ class ResponsesStreamConverter:
         }
 
     def _fc_item(self, tc: dict, status: str, *, include_arguments: bool = True) -> dict:
-        return {
+        raw_name = tc["name"] or (tc.get("state", {}).get("name") or "")
+        name = raw_name
+        ns = tc.get("namespace")
+        if not ns:
+            if "." in raw_name:
+                ns_prefix, base_name = raw_name.split(".", 1)
+                if ns_prefix in ("collaboration", "collaboration-optimize") or (self._tool_namespaces and base_name in self._tool_namespaces):
+                    ns = ns_prefix
+                    name = base_name
+            elif "__" in raw_name:
+                ns_prefix, base_name = raw_name.split("__", 1)
+                if ns_prefix in ("collaboration", "collaboration-optimize") or (self._tool_namespaces and base_name in self._tool_namespaces):
+                    ns = ns_prefix
+                    name = base_name
+            elif self._tool_namespaces and raw_name in self._tool_namespaces:
+                ns = self._tool_namespaces[raw_name]
+
+        item: dict[str, Any] = {
             "type": "function_call",
             "id": tc["fc_id"],
             "call_id": tc["id"] or (tc.get("state", {}).get("id") or ""),
-            "name": tc["name"] or (tc.get("state", {}).get("name") or ""),
+            "name": name,
             "arguments": self._tool_arguments(tc) if include_arguments else "",
             "status": status,
         }
+        if ns:
+            item["namespace"] = ns
+        return item
 
     def _response_obj(self, status: str, incomplete_reason: str | None = None) -> dict:
         output = []

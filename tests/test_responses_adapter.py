@@ -623,6 +623,75 @@ def test_parallel_tool_calls_roundtrip():
     print("✅ test_parallel_tool_calls_roundtrip")
 
 
+def test_encrypted_content_and_namespace_tools():
+    """Extract encrypted_content in agent_message and sanitize namespace tools."""
+    req = {
+        "model": "deepseek-v4.1-flash",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "collaboration",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "spawn_agent",
+                                "description": "Spawn an agent",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string", "encrypted": True},
+                                        "task_name": {"type": "string"},
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [
+                    {"type": "input_text", "text": "Payload:\n"},
+                    {"type": "encrypted_content", "encrypted_content": "Execute news task"},
+                ],
+            },
+        ],
+    }
+    chat = responses_request_to_chat(req)
+    tools = chat.get("tools", [])
+    assert len(tools) == 1
+    fn = tools[0]["function"]
+    assert fn["name"] == "spawn_agent"
+    assert "encrypted" not in fn["parameters"]["properties"]["message"]
+    messages = chat.get("messages", [])
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert "Execute news task" in messages[0]["content"]
+    assert "Payload:\n" in messages[0]["content"]
+
+    conv = ResponsesStreamConverter(model="deepseek", tool_namespaces=chat.get("_tool_namespaces"))
+    slot = {
+        "id": "call_1",
+        "name": "spawn_agent",
+        "args": "{}",
+        "fc_id": "fc_1",
+        "output_idx": 0,
+        "emitted": False,
+        "emitted_args_length": 0,
+    }
+    item = conv._fc_item(slot, "completed")
+    assert item["type"] == "function_call"
+    assert item["name"] == "spawn_agent"
+    assert item["namespace"] == "collaboration"
+    print("✅ test_encrypted_content_and_namespace_tools")
+
+
 if __name__ == "__main__":
     test_simple_text_request()
     test_array_input_request()
@@ -647,4 +716,5 @@ if __name__ == "__main__":
     test_usage_maps_cached_tokens_and_omits_when_unknown()
     test_reasoning_effort_and_text_format_are_mapped()
     test_parallel_tool_calls_roundtrip()
+    test_encrypted_content_and_namespace_tools()
     print(f"\n🎉 All {22} tests passed!")
