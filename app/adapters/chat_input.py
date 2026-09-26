@@ -3,6 +3,8 @@ import json
 
 from fastapi import HTTPException
 
+from app.reasoning import ReasoningInputError, extract_reasoning_text
+
 
 _ANTHROPIC_BLOCKS = ("tool_use", "tool_result", "thinking", "redacted_thinking", "image")
 
@@ -116,17 +118,15 @@ def _convert_message(message, index, pending):
                 raise _invalid(location + ".tool_use_id", "tool_result must match one preceding, unanswered tool call")
             result_ids.add(identifier)
             results.append(result)
-        elif kind == "thinking":
+        elif kind in ("thinking", "redacted_thinking"):
             if role != "assistant":
                 raise _invalid(location, "thinking requires an assistant message")
             if message.get("reasoning_content") not in (None, ""):
                 raise _invalid(location, "thinking conflicts with existing reasoning_content")
-            if not isinstance(block.get("thinking"), str):
-                raise _invalid(location + ".thinking", "Thinking content must be a string")
-            # Anthropic signatures have no Chat equivalent and must not become visible text.
-            thoughts.append(block["thinking"])
-        elif kind == "redacted_thinking":
-            raise _invalid(location, "redacted_thinking cannot be converted to Chat; use the Messages protocol")
+            try:
+                thoughts.append(extract_reasoning_text(block))
+            except ReasoningInputError as error:
+                raise _invalid(location + ("." + error.field if error.field else ""), str(error)) from None
         else:
             parts.append(_content_part(block, location))
     if results:

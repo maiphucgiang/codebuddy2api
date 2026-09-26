@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+import hashlib
 import json
 import os
+import re
 import time
 from typing import Any
 
+from app.reasoning import extract_reasoning_text, map_reasoning_controls
 from app.upstream_io import (StreamOutputBudget, merge_tool_call_delta, new_tool_state,
                              seal_tool_identities, tool_identity_complete)
 
@@ -47,6 +51,19 @@ def _text_format_to_response_format(fmt) -> dict | None:
 
 def responses_request_to_chat(body: dict) -> dict:
     """Convert Responses input, instructions and tools to a Chat request."""
+    # Collect declared tools from both top-level tools and input additional_tools items.
+    raw_tools = []
+    if isinstance(body.get("tools"), list):
+        raw_tools.extend(body["tools"])
+    inp = body.get("input", [])
+    if isinstance(inp, list):
+        for item in inp:
+            if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list):
+                raw_tools.extend(item["tools"])
+
+    registry, chat_tools = _build_tool_registry_and_chat_tools(
+        raw_tools, input_items=inp if isinstance(inp, list) else None)
+
     messages: list[dict] = []
 
     # instructions → system message
@@ -55,11 +72,10 @@ def responses_request_to_chat(body: dict) -> dict:
         messages.append({"role": "system", "content": instructions})
 
     # input → messages
-    inp = body.get("input", [])
     if isinstance(inp, str):
         messages.append({"role": "user", "content": inp})
     elif isinstance(inp, list):
-        messages.extend(_convert_input_items(inp))
+        messages.extend(_convert_input_items(inp, tool_registry=registry))
 
     # Build the Chat request body.
     chat: dict[str, Any] = {"messages": messages, "stream": True}
@@ -68,26 +84,22 @@ def responses_request_to_chat(body: dict) -> dict:
     if "model" in body:
         chat["model"] = body["model"]
 
-    # Normalize function tool definitions.
-    tools = body.get("tools")
-    if tools:
-        chat["tools"] = _convert_tools_for_chat(tools)
+    if chat_tools:
+        chat["tools"] = chat_tools
+    if registry.upstream_to_identity:
+        chat["_tool_registry"] = registry.to_dict()
     if "tool_choice" in body:
-        chat["tool_choice"] = body["tool_choice"]
+        chat["tool_choice"] = _convert_tool_choice_for_chat(body["tool_choice"], tool_registry=registry)
 
     # Forward supported parameters.
     for key in ("temperature", "top_p", "stop", "seed",
                 "presence_penalty", "frequency_penalty",
-                "response_format", "reasoning_effort", "parallel_tool_calls", "prompt_cache_key"):
+                "response_format", "parallel_tool_calls", "prompt_cache_key"):
         if key in body:
             chat[key] = body[key]
 
     # Explicit top-level values override equivalent nested fields.
-    reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict) and "reasoning_effort" not in chat:
-        effort = reasoning.get("effort")
-        if isinstance(effort, str) and effort.strip():
-            chat["reasoning_effort"] = effort
+    map_reasoning_controls(body, chat, protocol="responses")
     text = body.get("text")
     if isinstance(text, dict) and "response_format" not in chat:
         mapped = _text_format_to_response_format(text.get("format"))
@@ -102,23 +114,42 @@ def responses_request_to_chat(body: dict) -> dict:
     return chat
 
 
-def _convert_input_items(items: list) -> list[dict]:
+def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None) -> list[dict]:
     """Convert input items and merge adjacent assistant messages with tool calls."""
     messages: list[dict] = []
     # Buffer adjacent assistant text and function calls.
     pending_assistant_content: str | list[dict] | None = None
     pending_tool_calls: list[dict] = []
+    pending_reasoning: list[str] = []
 
     def _flush_assistant():
         nonlocal pending_assistant_content, pending_tool_calls
-        if pending_assistant_content is not None or pending_tool_calls:
+        if pending_assistant_content is not None or pending_tool_calls or pending_reasoning:
             msg: dict[str, Any] = {"role": "assistant",
                                    "content": pending_assistant_content or ""}
             if pending_tool_calls:
                 msg["tool_calls"] = pending_tool_calls[:]
+            if pending_reasoning:
+                msg["reasoning_content"] = "".join(pending_reasoning)
             messages.append(msg)
             pending_assistant_content = None
             pending_tool_calls.clear()
+            pending_reasoning.clear()
+
+    def _set_assistant_content(content):
+        nonlocal pending_assistant_content
+        if pending_assistant_content is not None and not pending_tool_calls:
+            _flush_assistant()
+        # Realtime output can place text after a tool call within the same turn.
+        if pending_tool_calls and pending_assistant_content:
+            if isinstance(pending_assistant_content, str) and isinstance(content, str):
+                content = pending_assistant_content + content
+            else:
+                previous = (pending_assistant_content if isinstance(pending_assistant_content, list)
+                            else [{"type": "text", "text": pending_assistant_content}])
+                following = content if isinstance(content, list) else [{"type": "text", "text": content}]
+                content = previous + following
+        pending_assistant_content = content
 
     for item in items:
         if not isinstance(item, dict):
@@ -126,6 +157,24 @@ def _convert_input_items(items: list) -> list[dict]:
 
         item_type = item.get("type")
         role = item.get("role", "")
+
+        # Ignore additional_tools in message sequence.
+        if item_type == "additional_tools":
+            continue
+
+        # Agent message from multi-agent collaboration.
+        if item_type == "agent_message":
+            _flush_assistant()
+            content = _extract_content(item.get("content", ""))
+            messages.append({"role": "user", "content": content})
+            continue
+
+        if item_type == "reasoning":
+            if role not in ("", "assistant"):
+                raise ValueError("reasoning requires an assistant item")
+            text = extract_reasoning_text(item)
+            pending_reasoning.append(text)
+            continue
 
         # Untyped role messages
         if item_type is None and role in ("user", "system", "developer"):
@@ -145,17 +194,15 @@ def _convert_input_items(items: list) -> list[dict]:
 
         # Assistant output from history
         if item_type == "message" and role == "assistant":
-            _flush_assistant()
             content_parts = item.get("content", [])
             text = _extract_output_text(content_parts) if isinstance(content_parts, list) else str(content_parts)
-            pending_assistant_content = text
+            _set_assistant_content(text)
             continue
 
         # Untyped assistant messages
         if item_type is None and role == "assistant":
-            _flush_assistant()
             content = _extract_content(item.get("content", ""))
-            pending_assistant_content = content
+            _set_assistant_content(content)
             continue
 
         # Merge calls into the preceding assistant message.
@@ -165,11 +212,14 @@ def _convert_input_items(items: list) -> list[dict]:
                 raise ValueError("function_call.arguments must be a JSON string")
             if pending_assistant_content is None:
                 pending_assistant_content = ""
+            raw_name = item.get("name", "")
+            ns = item.get("namespace")
+            mapped_name = tool_registry.get_upstream_name(ns, raw_name) if tool_registry else raw_name
             pending_tool_calls.append({
                 "id": item.get("call_id", item.get("id", _rand_id("call_"))),
                 "type": "function",
                 "function": {
-                    "name": item.get("name", ""),
+                    "name": mapped_name,
                     "arguments": arguments,
                 },
             })
@@ -208,6 +258,10 @@ def _extract_content(content) -> str | list[dict]:
                 kind = p.get("type")
                 if kind in ("input_text", "text", "output_text"):
                     parts.append({"type": "text", "text": p.get("text", "")})
+                elif kind == "encrypted_content":
+                    text = p.get("encrypted_content") or p.get("text", "")
+                    if isinstance(text, str) and text:
+                        parts.append({"type": "text", "text": text})
                 elif kind == "input_image":
                     if p.get("file_id"):
                         raise ValueError("Responses input_image file_id is not supported; provide image_url instead")
@@ -242,28 +296,210 @@ def _extract_output_text(content_parts: list) -> str | list[dict]:
     return "".join(texts)
 
 
-def _convert_tools_for_chat(tools: list) -> list:
-    """Convert Responses tool definitions to Chat function objects."""
-    result = []
+_SCHEMA_MAPS = frozenset(("properties", "patternProperties", "$defs", "definitions",
+                          "dependentSchemas", "dependencies"))
+_SCHEMA_ARRAYS = frozenset(("allOf", "anyOf", "oneOf", "prefixItems", "items"))
+_SCHEMA_CHILDREN = frozenset(("items", "additionalItems", "contains", "unevaluatedItems",
+                             "additionalProperties", "unevaluatedProperties", "propertyNames",
+                             "not", "if", "then", "else", "contentSchema"))
+
+
+def _sanitize_schema(schema: Any) -> Any:
+    """Strip encryption markers in schema positions, preserving names and instance data."""
+    if not isinstance(schema, dict):
+        return deepcopy(schema)
+    result = {}
+    for key, value in schema.items():
+        if key == "encrypted" and isinstance(value, bool):
+            continue
+        if key in _SCHEMA_MAPS and isinstance(value, dict):
+            result[key] = {name: _sanitize_schema(child) for name, child in value.items()}
+        elif key in _SCHEMA_ARRAYS and isinstance(value, list):
+            result[key] = [_sanitize_schema(child) for child in value]
+        elif key in _SCHEMA_CHILDREN:
+            result[key] = _sanitize_schema(value)
+        else:
+            result[key] = deepcopy(value)
+    return result
+
+
+_CHAT_FUNCTION_NAME_LIMIT = 64
+
+
+class ToolRegistry:
+    """Bidirectional mapping between Responses (namespace, name) and upstream Chat function names."""
+
+    def __init__(self, mappings: dict[str, dict[str, Any]] | None = None):
+        self.upstream_to_identity: dict[str, tuple[str | None, str]] = {}
+        self.identity_to_upstream: dict[tuple[str | None, str], str] = {}
+
+        if mappings:
+            for up_name, ident in mappings.items():
+                ns = ident.get("namespace") if isinstance(ident, dict) else None
+                nm = ident.get("name", up_name) if isinstance(ident, dict) else up_name
+                self._record(up_name, ns, nm)
+
+    @staticmethod
+    def _identity(namespace, name) -> tuple[str | None, str]:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("function name must be a non-empty string")
+        if namespace is not None and (not isinstance(namespace, str) or not namespace.strip()):
+            raise ValueError("namespace must be a non-empty string")
+        return namespace, name
+
+    def _record(self, upstream_name: str, namespace: str | None, name: str) -> None:
+        ident = self._identity(namespace, name)
+        if upstream_name in self.upstream_to_identity and self.upstream_to_identity[upstream_name] != ident:
+            raise ValueError("tool identities must have distinct upstream names")
+        self.upstream_to_identity[upstream_name] = ident
+        self.identity_to_upstream[ident] = upstream_name
+
+    def register(self, namespace: str | None, name: str) -> str:
+        """Register a tool identity (namespace, name) and return its unique upstream name."""
+        ident = self._identity(namespace, name)
+        if ident in self.identity_to_upstream:
+            return self.identity_to_upstream[ident]
+
+        if namespace is None:
+            upstream_name = name
+        else:
+            base = f"{namespace}__{name}"
+            if len(base) > _CHAT_FUNCTION_NAME_LIMIT or re.fullmatch(r"[A-Za-z0-9_-]+", base) is None:
+                # Different identity pairs can share the same concatenated name.
+                identity = json.dumps(ident, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                digest = hashlib.sha256(identity).hexdigest()[:16]
+                prefix = re.sub(r"[^A-Za-z0-9_-]", "_", base[:_CHAT_FUNCTION_NAME_LIMIT - len(digest) - 1])
+                base = f"{prefix}_{digest}"
+            candidate = base
+            counter = 1
+            while candidate in self.upstream_to_identity:
+                suffix = f"_{counter}"
+                candidate = f"{base[:_CHAT_FUNCTION_NAME_LIMIT - len(suffix)]}{suffix}"
+                counter += 1
+            upstream_name = candidate
+
+        self._record(upstream_name, namespace, name)
+        return upstream_name
+
+    def get_identity(self, upstream_name: str) -> tuple[str | None, str]:
+        """Map upstream function name back to (namespace, name). Never guess by prefix."""
+        if upstream_name in self.upstream_to_identity:
+            return self.upstream_to_identity[upstream_name]
+        return None, upstream_name
+
+    def get_upstream_name(self, namespace: str | None, name: str) -> str:
+        """Resolve an exact identity already reserved from declarations or history."""
+        ident = self._identity(namespace, name)
+        if ident not in self.identity_to_upstream:
+            raise ValueError("unknown tool identity in this request")
+        return self.identity_to_upstream[ident]
+
+    def to_dict(self) -> dict:
+        return {
+            up_name: {"namespace": ident[0], "name": ident[1]}
+            for up_name, ident in self.upstream_to_identity.items()
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> ToolRegistry:
+        if isinstance(data, cls):
+            return data
+        if not isinstance(data, dict):
+            return cls()
+        return cls(data)
+
+
+def _collect_raw_tools(tools: list, current_ns: str = "") -> list[tuple[str | None, str, dict]]:
+    """Recursively collect (namespace, name, tool_def) from Responses tools."""
+    collected = []
     for t in tools:
         if not isinstance(t, dict):
             continue
-        if t.get("type") != "function":
+        tool_type = t.get("type")
+        if tool_type == "namespace" and isinstance(t.get("tools"), list):
+            ns_name = t.get("name", "")
+            if not isinstance(ns_name, str) or not ns_name.strip():
+                raise ValueError("namespace.name must be a non-empty string")
+            full_ns = f"{current_ns}.{ns_name}" if current_ns else ns_name
+            collected.extend(_collect_raw_tools(t["tools"], full_ns))
+        elif tool_type == "function" or "function" in t:
+            fn = t.get("function") if isinstance(t.get("function"), dict) else t
+            name = fn.get("name") or t.get("name")
+            if isinstance(name, str) and name:
+                collected.append((current_ns or None, name, t))
+    return collected
+
+
+def _format_chat_tool(upstream_name: str, tool_def: dict) -> dict:
+    """Format tool definition for Chat Completions, ensuring sanitized schema."""
+    if "function" in tool_def:
+        tool_obj = json.loads(json.dumps(tool_def))
+        fn_dict = tool_obj.get("function")
+        if isinstance(fn_dict, dict):
+            fn_dict["name"] = upstream_name
+            if "parameters" in fn_dict:
+                fn_dict["parameters"] = _sanitize_schema(fn_dict["parameters"])
+        return tool_obj
+
+    fn: dict[str, Any] = {"name": upstream_name}
+    if "description" in tool_def:
+        fn["description"] = tool_def["description"]
+    if "parameters" in tool_def:
+        fn["parameters"] = _sanitize_schema(tool_def["parameters"])
+    if "strict" in tool_def:
+        fn["strict"] = tool_def["strict"]
+    return {"type": "function", "function": fn}
+
+
+def _build_tool_registry_and_chat_tools(raw_tools: list, *, input_items: list | None = None) -> tuple[ToolRegistry, list[dict]]:
+    """Reserve current and historical identities, advertising only currently declared tools."""
+    collected = _collect_raw_tools(raw_tools)
+    registry = ToolRegistry()
+    result = []
+
+    identities = [(ns, name) for ns, name, _ in collected]
+    identities.extend((item.get("namespace"), item.get("name")) for item in (input_items or [])
+                      if isinstance(item, dict) and item.get("type") == "function_call")
+    # Historical global names must also remain available before allocating namespace aliases.
+    for ns, name in identities:
+        if ns is None:
+            registry.register(ns, name)
+    for ns, name in identities:
+        if ns is not None:
+            registry.register(ns, name)
+
+    plain = [item for item in collected if item[0] is None]
+    namespaced = [item for item in collected if item[0] is not None]
+
+    seen_identities: set[tuple[str | None, str]] = set()
+    for ns, name, tool_def in plain + namespaced:
+        ident = (ns, name)
+        if ident in seen_identities:
             continue
-        # Already in Chat format.
-        if "function" in t:
-            result.append(t)
-            continue
-        # Nest the flat Responses function fields.
-        fn: dict[str, Any] = {"name": t.get("name", "")}
-        if "description" in t:
-            fn["description"] = t["description"]
-        if "parameters" in t:
-            fn["parameters"] = t["parameters"]
-        if "strict" in t:
-            fn["strict"] = t["strict"]
-        result.append({"type": "function", "function": fn})
-    return result
+        seen_identities.add(ident)
+        upstream_name = registry.get_upstream_name(ns, name)
+        result.append(_format_chat_tool(upstream_name, tool_def))
+
+    return registry, result
+
+
+def _convert_tools_for_chat(tools: list) -> list:
+    """Backwards-compatible helper for converting Responses tools."""
+    _, chat_tools = _build_tool_registry_and_chat_tools(tools)
+    return chat_tools
+
+
+def _convert_tool_choice_for_chat(choice: Any, tool_registry: ToolRegistry | None = None) -> Any:
+    """Convert Responses tool_choice to Chat Completions format."""
+    if not isinstance(choice, dict) or choice.get("type") != "function":
+        return choice
+    fn_obj = choice.get("function") if isinstance(choice.get("function"), dict) else choice
+    name = fn_obj.get("name") if isinstance(fn_obj, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        return choice
+    namespace = fn_obj.get("namespace", choice.get("namespace")) if isinstance(fn_obj, dict) else choice.get("namespace")
+    mapped_name = tool_registry.get_upstream_name(namespace, name) if tool_registry else name
+    return {"type": "function", "function": {"name": mapped_name}}
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +511,9 @@ class ResponsesStreamConverter:
 
     def __init__(self, model: str = "unknown", parallel_tool_calls: bool = True, *,
                  realtime: bool = False, budget: StreamOutputBudget | None = None,
-                 tool_states: dict | None = None, declared_names=None):
+                 tool_states: dict | None = None, declared_names=None,
+                 tool_registry: ToolRegistry | dict | None = None,
+                 tool_namespaces: dict[str, str] | None = None):
         self.resp_id = _rand_id("resp_")
         self.msg_id = _rand_id("msg_")
         self.model = model
@@ -284,6 +522,13 @@ class ResponsesStreamConverter:
         self._budget = budget if budget is not None else StreamOutputBudget(0)
         self._tool_states = tool_states
         self._local_tool_states: dict[int, dict] = {}
+        if isinstance(tool_registry, ToolRegistry):
+            self._tool_registry = tool_registry
+        elif isinstance(tool_registry, dict):
+            self._tool_registry = ToolRegistry.from_dict(tool_registry)
+        else:
+            self._tool_registry = None
+        self._tool_namespaces = dict(tool_namespaces or {})
         self._declared_names = frozenset(
             value for value in (declared_names or ()) if isinstance(value, str) and value)
         self.created_at = int(time.time())
@@ -698,14 +943,26 @@ class ResponsesStreamConverter:
         }
 
     def _fc_item(self, tc: dict, status: str, *, include_arguments: bool = True) -> dict:
-        return {
+        raw_name = tc["name"] or (tc.get("state", {}).get("name") or "")
+        name = raw_name
+        ns = tc.get("namespace")
+        if not ns:
+            if self._tool_registry:
+                ns, name = self._tool_registry.get_identity(raw_name)
+            elif self._tool_namespaces and raw_name in self._tool_namespaces:
+                ns = self._tool_namespaces[raw_name]
+
+        item: dict[str, Any] = {
             "type": "function_call",
             "id": tc["fc_id"],
             "call_id": tc["id"] or (tc.get("state", {}).get("id") or ""),
-            "name": tc["name"] or (tc.get("state", {}).get("name") or ""),
+            "name": name,
             "arguments": self._tool_arguments(tc) if include_arguments else "",
             "status": status,
         }
+        if ns:
+            item["namespace"] = ns
+        return item
 
     def _response_obj(self, status: str, incomplete_reason: str | None = None) -> dict:
         output = []

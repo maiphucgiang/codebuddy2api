@@ -75,7 +75,11 @@ Cherry Studio、ZCode、LobeChat、NextChat、Open WebUI 或自研 SDK 客户端
 - 先将 `developer` 转为 `system` 并置顶首条系统消息，再关联工具结果；不改动调用方原始载荷。
 - Chat 兼容混入的 Anthropic `tool_use` / `tool_result` 历史，保留调用 ID、参数、结果图片与错误标记；普通 `thinking` 转为 `reasoning_content`，不混入正文，原生 Chat 字段保持不变。
 - 字段冲突、工具结果无法关联、不支持的混合内容块及 `redacted_thinking` 在选路前返回 HTTP 400。需拆分的用户消息只能包含 `role`、`content`，且 `tool_result` 必须在普通文本/图片之前；Anthropic 思考签名不转发。
-- 指定名称的函数选择会以 `required` 且仅含该函数的形式发往上游；无效名称在本地拒绝。
+- Messages 的 `thinking` 块和 Responses 的可读 `reasoning` 项统一保留为 assistant `reasoning_content`，支持完整历史及工具续接；仅含加密状态的历史返回 HTTP 400。
+- Messages 的 `thinking` / `output_config.effort` 与 Responses 的 `reasoning.effort` 会映射到上游思考控制；默认值和预算限制见[思考兼容](advanced.zh-CN.md#思考兼容)。
+- 指定名称的函数选择会以 `required` 且仅含该函数的形式发往上游。Responses 按 `(namespace, name)` 精确匹配；未知或仅在历史中出现的选择返回 HTTP 400。
+- Responses 分别保留当前与历史工具身份。Schema 清理仅移除 schema 位置的布尔 `encrypted` 标记，保留属性名、定义及字面数据。
+- 命名空间工具（含嵌套和长名称）使用不超过 64 字符的合法 Chat 别名；Responses 输出与历史保留原命名空间和名称，普通工具名称保持不变。
 - 错误按客户端协议各自的形态返回（OpenAI 的 `error` 对象与 Anthropic 的 `{"type":"error"}`），状态码保留。实时模式可能先送出有效增量，随后才遇到非法终端状态、断连或大小错误；合法截断/过滤仍保留协议原生区别。客户端不能仅凭 SSE 已开启就认定最终成功。
 - `POST /v1/messages/count_tokens` 返回按字符估算的启发式结果，用于预算参考，不是精确计数。
 

@@ -42,7 +42,7 @@ Compose explicitly passes some environment variables and CLI flags, so deleting 
 | `--request-context-mode` | `legacy` | `scoped` enables explicit sessions and per-attempt tracing; changes apply to new requests |
 | `--failover-max` | `0` | Extra credentials tried when a request fails before the first response byte reaches the client; `0` keeps the upstream behaviour of surfacing the failure directly |
 | `--retry-write-timeout` | `false` | Opt a request-body write timeout into replay (fresh connection and `--failover-max`), accepting that bytes already sent may have been processed |
-| `--max-request-bytes` | `33554432` | Positive byte limit for the processed upstream JSON |
+| `--max-request-bytes` | `33554432` | Positive byte limit for processed upstream JSON, excluding gateway-only metadata |
 | `--log-body-limit` | `65536` | Legacy text-preview option; text output is retired and SQLite diagnostics use their own budget |
 
 Environment variables include `CODEBUDDY_AUTH_DIR`, `CODEBUDDY_IMPORT_DIR`, `CODEBUDDY2API_KEY`, `CODEBUDDY2API_ADMIN_CSRF`, `CODEBUDDY2API_ADMIN_ORIGINS`, `CODEBUDDY2API_KEEP_TOOL_METADATA`, `CODEBUDDY2API_STREAM_MODE`, `CODEBUDDY2API_LOG`, `CODEBUDDY2API_RESPONSES_PROJECTION_MODE`, `CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES`, `CODEBUDDY2API_MAX_IMAGES`, `CODEBUDDY2API_IMAGE_POLICY`, `CODEBUDDY2API_MAX_REQUEST_BYTES`, `CODEBUDDY2API_LOG_BODY_LIMIT`, `CODEBUDDY2API_FAILOVER_MAX` and `CODEBUDDY2API_RETRY_WRITE_TIMEOUT`. See [deployment](deployment.md) for startup examples.
@@ -242,6 +242,16 @@ Credential domain / token issuer determine the product identity. Chat and refres
 `model_capability_guard` defaults to `true`; use WebUI settings, `--model-capability-guard false` or `CODEBUDDY2API_MODEL_CAPABILITY_GUARD=false` to disable it. Explicit mismatches return 400 before sending, within existing bindings and the current free-first tier; unknown capabilities remain compatible. Requests retain their entry-time switch. Checks cover images, tools/history, declared reasoning options and the `max_tokens` output limit (including mapped Responses `max_output_tokens`); input tokens are not estimated, `max_completion_tokens` is not renamed or checked against this limit, and Anthropic thinking budgets are not converted. Disabling this guard leaves authentication, catalog authorization, capacity and size limits intact.
 
 Both international profiles merge image-bearing consecutive `user` runs only after routing, preserving content order and image data. Domestic bodies, text-only runs and system/assistant/tool boundaries remain unchanged. Conflicting message attributes or unrepresentable content return `400 / image_user_run_not_mergeable`; final byte limits still apply. This compatibility step remains enabled when capability preflight is disabled; it neither adds retries nor makes a text model natively visual.
+
+## Reasoning compatibility
+
+Messages `enabled` / `adaptive` activate Chat reasoning; `output_config.effort` and Responses `reasoning.effort` map to `reasoning_effort`. An explicit top-level `reasoning_effort` takes precedence, except Messages `disabled` always selects `none`; model capability checks still apply. Omitted controls leave upstream defaults unchanged.
+
+Without an explicit effort, Messages activation uses the selected account's `reasoning.defaultEffort` or legacy `reasoning.effort`, restricted to its declared options. Otherwise it prefers `high`, then an available option; unknown declarations fall back to `high`. Failover resolves the replacement account's default again.
+
+Manual `enabled` requires an integer `budget_tokens >= 1024`, but the budget is not an exact upstream token limit; `max_tokens` is forwarded unchanged. This mapping does not reproduce native adaptive scheduling. Only `display: summarized` is supported.
+
+Readable history is kept in `reasoning_content`, never ordinary answer text. Responses uses readable `content` before `summary`; summaries cannot reconstruct native hidden reasoning. Signatures are not forwarded. `redacted_thinking`, encrypted-only thinking and non-empty Responses `encrypted_content` return 400 before routing; upstreams decide which readable history they use.
 
 ## Request boundaries
 

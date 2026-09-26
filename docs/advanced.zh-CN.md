@@ -42,7 +42,7 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `--request-context-mode` | `legacy` | `scoped` 启用显式会话与逐尝试追踪；变更只影响新请求 |
 | `--failover-max` | `0` | 请求在「一个字节都还没发给下游」之前失败时，最多再换几个凭证就地重放；`0` 表示如实把失败回给下游 |
 | `--retry-write-timeout` | `false` | 让「写请求体超时」也参与重放（换新连接与 `--failover-max` 换凭证），代价是已发出的那半截正文可能已被上游处理 |
-| `--max-request-bytes` | `33554432` | 处理后的上游 JSON 字节上限，须为正整数 |
+| `--max-request-bytes` | `33554432` | 处理后的上游 JSON 字节上限，不含网关内部元数据，须为正整数 |
 | `--log-body-limit` | `65536` | 旧文本预览兼容项；文本输出已停用，SQLite 诊断使用独立预算 |
 
 环境变量包括 `CODEBUDDY_AUTH_DIR`、`CODEBUDDY_IMPORT_DIR`、`CODEBUDDY2API_KEY`、`CODEBUDDY2API_ADMIN_CSRF`、`CODEBUDDY2API_ADMIN_ORIGINS`、`CODEBUDDY2API_KEEP_TOOL_METADATA`、`CODEBUDDY2API_STREAM_MODE`、`CODEBUDDY2API_LOG`、`CODEBUDDY2API_RESPONSES_PROJECTION_MODE`、`CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES`、`CODEBUDDY2API_MAX_IMAGES`、`CODEBUDDY2API_IMAGE_POLICY`、`CODEBUDDY2API_MAX_REQUEST_BYTES`、`CODEBUDDY2API_LOG_BODY_LIMIT`、`CODEBUDDY2API_FAILOVER_MAX`、`CODEBUDDY2API_RETRY_WRITE_TIMEOUT`。启动示例见[部署指南](deployment.zh-CN.md)。
@@ -242,6 +242,16 @@ WebUI 可以直接上传文件；以下限制针对 `POST /admin/credentials` �
 `model_capability_guard` 默认 `true`，可在 WebUI、`--model-capability-guard false` 或 `CODEBUDDY2API_MODEL_CAPABILITY_GUARD=false` 关闭。仅在现有绑定和当前免费优先范围内筛选，明确不兼容返回 400、不发上游；未知能力兼容放行，每条请求固定入口开关。检查图片、工具及历史、已声明思考选项，以及 `max_tokens` 输出上限（含 Responses 映射的 `max_output_tokens`）；不估算输入 token，不对 `max_completion_tokens` 改名或套用该上限，不转换 Anthropic 思考预算。关闭不绕过鉴权、目录授权、容量或大小限制。
 
 两种国际产品在选路后归并含图的连续 `user` 段，保留内容顺序和图片数据；国内请求、纯文本段及 system/assistant/tool 边界不变。消息级属性冲突或内容无法无损表达时返回 `400 / image_user_run_not_mergeable`，最终字节限制仍生效。图片兼容不随能力开关关闭，不增加重试，也不让文本模型获得原生视觉。
+
+## 思考兼容
+
+Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 和 Responses 的 `reasoning.effort` 映射为 `reasoning_effort`。显式顶层 `reasoning_effort` 优先，但 Messages 的 `disabled` 始终使用 `none`；模型能力检查仍生效。未提供控制参数时保留上游默认行为。
+
+未指定强度时，Messages 从实际选中账号的 `reasoning.defaultEffort` 或旧 `reasoning.effort` 选择声明支持的默认值；否则优先 `high`，再选可用选项，声明未知时回落为 `high`。换号后重新解析新账号的默认值。
+
+手工 `enabled` 要求整数 `budget_tokens >= 1024`，但该预算不等于上游精确 token 限额，`max_tokens` 原样转发；兼容映射不模拟原生自适应调度。仅支持 `display: summarized`。
+
+可读历史统一放入 `reasoning_content`，不混入普通正文。Responses 优先使用可读 `content`，其次使用 `summary`；摘要不能还原原生隐藏推理。签名不转发，`redacted_thinking`、仅含加密签名的思考及非空 Responses `encrypted_content` 在选路前返回 400；上游自行决定使用哪些可读历史。
 
 ## 请求边界
 

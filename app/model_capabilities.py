@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from app.safe_logging import sanitize_log_text
 
 from app.model_catalog_view import SharedModel
+from app.reasoning import resolve_reasoning_effort, thinking_mode
 PROFILES = frozenset(("cn-cli", "cn-work", "intl-cli", "intl-work"))
 _TEXT = frozenset(("id", "name", "vendor", "description", "descriptionZh", "descriptionEn", "credits", "summary"))
 _BOOL = frozenset(("supportsImages", "disabledMultimodal", "supportsToolCall", "supportsReasoning",
@@ -209,8 +210,7 @@ class Requirements:
         tools = bool(body.get("tools")) or any(isinstance(message, dict) and
                     (message.get("role") == "tool" or message.get("tool_calls")) for message in messages)
         effort = body.get("reasoning_effort")
-        thinking = (payload or {}).get("thinking") if protocol == "messages" else None
-        thinking = thinking.get("type") if isinstance(thinking, dict) else None
+        thinking = thinking_mode(payload or {}) if protocol == "messages" else None
         output = body.get("max_tokens")
         param = "max_output_tokens" if protocol == "responses" else "max_tokens"
         if output is not None and _positive(output) is None:
@@ -227,16 +227,17 @@ class Requirements:
             failures.append(("unsupported_image_input", self.image_param, "当前路由的模型声明不支持图片输入"))
         if self.tools and caps["tools"] is False:
             failures.append(("unsupported_tools", "tools", "当前路由的模型声明不支持工具调用"))
-        enabled = self.effort not in (None, "none") or self.thinking in ("enabled", "adaptive")
-        disabled = self.effort == "none" or self.thinking == "disabled"
+        effort = resolve_reasoning_effort(self.effort, self.thinking, model)
+        enabled = effort not in (None, "none")
+        disabled = effort == "none"
         if enabled and caps["reasoning"] is False:
             failures.append(("unsupported_reasoning", "reasoning_effort", "当前路由的模型声明不支持思考"))
         if disabled and caps["thinking_disable"] is False:
             failures.append(("reasoning_required", "reasoning_effort", "当前路由的模型声明不能关闭思考"))
         reasoning = model.get("reasoning") if isinstance(model.get("reasoning"), dict) else {}
         efforts = reasoning.get("supportedEfforts")
-        if (self.effort not in (None, "none") and isinstance(efforts, list) and (efforts or isinstance(model, SharedModel))
-                and all(isinstance(value, str) for value in efforts) and self.effort not in efforts):
+        if (effort not in (None, "none") and isinstance(efforts, list) and (efforts or isinstance(model, SharedModel))
+                and all(isinstance(value, str) for value in efforts) and effort not in efforts):
             failures.append(("unsupported_reasoning_effort", "reasoning_effort", "思考强度不在当前模型声明的选项中"))
         maximum = _positive(model.get("maxOutputTokens"))
         if maximum is not None and self.max_output is not None and self.max_output > maximum:
