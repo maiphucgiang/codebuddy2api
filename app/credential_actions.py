@@ -50,11 +50,11 @@ def run(gateway, action, identity=None, *, consent_revision=None):
                         result.update(travel=followup, checkin_ok=result["ok"],
                                       ok=result["ok"] if followup.get("buddy_blocked") else result["ok"] and followup["ok"],
                                       message=result["message"] + "；" + followup["message"])
-                except Exception:
+                except Exception as error:
                     # Upstream exception text may contain headers or credential file paths.
                     if action == "checkin" and result["ok"]:
                         result["checkin_ok"] = True
-                    result.update(ok=False, message="操作失败，保留已有数据；请检查账号状态后重试")
+                    result.update(ok=False, message=f"操作失败（{type(error).__name__}），保留已有数据；请检查账号状态后重试")
             results.append(result)
             _audit(config, result, started)
         response = {"ok": bool(results) and all(r["ok"] for r in results), "results": results}

@@ -37,6 +37,15 @@ function expiry(value: unknown, milliseconds = false) {
     ? new Date(milliseconds ? value : value * 1000).toLocaleString("zh-CN")
     : text(value);
 }
+const lastErrorLabels: Record<string, string> = {
+  http_401: "上游 401（登录态被拒）",
+  http_403: "上游 403（无权限）",
+  credential_error: "凭证同步失败（详见操作结果）",
+};
+function lastErrorLabel(value: unknown) {
+  const key = text(value);
+  return lastErrorLabels[key] ?? key;
+}
 export { safeOAuthUrl } from "../OAuth";
 function boundModels(credential: Credential): string[] {
   return Array.isArray(credential.bindings)
@@ -430,6 +439,17 @@ export function Credentials() {
                                 : text(c.health)}
                           </Badge>
                           <small>{c.token_expired === true ? "Token 已过期" : ""}</small>
+                          {c.last_error_code != null && (
+                            <small>
+                              最近错误：{text(lastErrorLabel(c.last_error_code))}
+                              {number(c.last_failure_at) !== null
+                                ? ` · ${expiry(c.last_failure_at)}`
+                                : ""}
+                            </small>
+                          )}
+                          {typeof c.sync_error === "string" && c.sync_error !== "" && (
+                            <small>失败原因：{text(c.sync_error)}</small>
+                          )}
                         </td>
                         <td>
                           {cooldowns ? (

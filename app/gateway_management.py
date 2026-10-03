@@ -59,6 +59,7 @@ class Management:
                                             "http_403" if entry.get("last_error") == "backend HTTP 403" else
                                             "credential_error" if entry.get("last_error") else None),
                            last_failure_at=entry.get("last_failure_at"),
+                           sync_error=(balance.get("error") or entry.get("last_error") or None),
                            cooldowns=cooldowns, credits=balance.get("credits") or None,
                            sync_pending=path in pool._sync_pending or path in pool._syncing or path in pool._sync_retry,
                            catalog_ready=(self.CONFIG.get("account_catalogs") or {}).get(identity, {}).get("models") is not None,
