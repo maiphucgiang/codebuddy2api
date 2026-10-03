@@ -60,6 +60,7 @@ def _public_credential(item):
               "fail_until", "cooldown_until", "cooldown_remaining", "last_failure_at", "catalog_ready", "bindings",
               "auto_checkin", "auto_travel", "travel_supported", "checkin", "travel",
               "trial_supported", "trial",
+              "daily_chat_supported", "auto_daily_chat", "daily_chat",
               "token_expired", "token_expires_at", "last_refresh_time", "sessions", "sticky_sessions", "last_error_code"}
     result = {key: value for key, value in item.items() if key in fields}
     identity = item.get("account_key") or item.get("id")
@@ -368,8 +369,8 @@ def install_admin(app, config, gateway):
     @route("PATCH", "/admin/credentials/{id}")
     async def credentials_patch(request):
         data = await _body(request)
-        if set(data) not in ({"enabled"}, {"auto_checkin"}, {"auto_travel"}) or any(type(value) is not bool for value in data.values()):
-            raise ValueError("仅接受一个布尔字段：enabled、auto_checkin 或 auto_travel")
+        if set(data) not in ({"enabled"}, {"auto_checkin"}, {"auto_travel"}, {"auto_daily_chat"}) or any(type(value) is not bool for value in data.values()):
+            raise ValueError("仅接受一个布尔字段：enabled、auto_checkin、auto_travel 或 auto_daily_chat")
         field, value = next(iter(data.items()))
         identity = request.path_params["id"]
         def apply():
@@ -381,6 +382,8 @@ def install_admin(app, config, gateway):
                     gateway.admin_set_credential_enabled(identity, value)
                 elif field == "auto_checkin":
                     gateway.admin_set_auto_checkin(identity, value)
+                elif field == "auto_daily_chat":
+                    gateway.admin_set_auto_daily_chat(identity, value)
                 else:
                     gateway.admin_set_auto_travel(identity, value)
             event("credential." + field, {"credential": identity, field: value})

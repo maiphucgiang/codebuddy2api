@@ -8,7 +8,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.staticfiles import StaticFiles
 
-from . import checkin, model_policy, travel, trial_management
+from . import checkin, daily_chat, model_policy, travel, trial_management
 
 
 class Management:
@@ -26,6 +26,7 @@ class Management:
         pool._rescan()
         now = time.time()
         trials = trial_management.inventory(self.CONFIG.get("trial_ledger"))
+        daily_chats = self.CONFIG.get("control_store")
         with pool._lock:
             entries = {entry["id"]: entry for entry in pool.entries()}
             result = []
@@ -53,6 +54,9 @@ class Management:
                            trial=(trial_management.view(trials.get(identity), now=now) if trials is not None
                                   else trial_management.failure("storage_error"))
                                  if entry.get("profile") == "intl-work" else trial_management.failure("not_applicable"),
+                           daily_chat_supported=daily_chat.supported(entry.get("profile")),
+                           auto_daily_chat=model_policy.credential_auto_daily_chat(self.CONFIG, entry),
+                           daily_chat=self._daily_chat_view(daily_chats, identity, now),
                            fail_until=until, cooldown_until=until,
                            cooldown_remaining=max(0, round(until - now)),
                            last_error_code=("http_401" if entry.get("last_error") == "backend HTTP 401" else
@@ -108,6 +112,30 @@ class Management:
             if enabled and not travel.supported(entry.get("profile")):
                 raise HTTPException(400, "旅行仅适用于国内账号")
             self.CONFIG["control_store"].set_auto_travel(identity, enabled)
+
+    def admin_set_auto_daily_chat(self, identity, enabled):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            if enabled and not daily_chat.supported(entry.get("profile")):
+                raise HTTPException(400, "活跃打卡仅适用于国际 WorkBuddy 账号")
+            self.CONFIG["control_store"].set_auto_daily_chat(identity, enabled)
+        # Persist only: enabling never launches a turn; the sweep decides when to run it.
+
+    @staticmethod
+    def _daily_chat_view(store, identity, now):
+        """Today's turn state, or the availability prompt when nothing is recorded yet."""
+        if store is None:
+            return daily_chat.failure_view()
+        try:
+            record = store.daily_chat_record(identity, daily_chat.today(now))
+        except Exception:
+            return daily_chat.failure_view()
+        return daily_chat.view(record)
 
     def admin_delete_guard(self, name, *, unbind=False):
         """Block a still-bound delete, or return the identity to unbind after removal."""

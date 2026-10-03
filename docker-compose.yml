@@ -15,6 +15,9 @@ services:
     environment:
       CODEBUDDY2API_KEY: ${CODEBUDDY2API_KEY:-}
       CODEBUDDY2API_ADMIN_CSRF: ${CODEBUDDY2API_ADMIN_CSRF:-true}
+      # Daily guards key on a local calendar day, so the container should share the
+      # operator's zone; a UTC container turns those guards over at 08:00 Beijing.
+      TZ: ${TZ:-UTC}
       # First-Buddy onboarding may send one bounded real WorkBuddy conversation per account.
       CODEBUDDY2API_AUTO_ACCEPT_BUDDY: ${CODEBUDDY2API_AUTO_ACCEPT_BUDDY:-false}
       # Unset variables remain configurable through the WebUI.

@@ -122,7 +122,14 @@ export function Credentials() {
   const [notice, setNotice] = useState<string | null>(null);
   const [maintenance, setMaintenance] = useState<Record<string, unknown>[]>([]);
   const maintain = (
-    action: "refresh" | "checkin" | "sync" | "travel" | "travel-status" | "reset-cooldown",
+    action:
+      | "refresh"
+      | "checkin"
+      | "sync"
+      | "travel"
+      | "travel-status"
+      | "daily-chat"
+      | "reset-cooldown",
     credential?: Credential,
   ) => {
     if (busy) return;
@@ -185,7 +192,7 @@ export function Credentials() {
   };
   const preference = (
     credential: Credential,
-    field: "auto_checkin" | "auto_travel",
+    field: "auto_checkin" | "auto_travel" | "auto_daily_chat",
     enabled: boolean,
   ) => {
     run(async () => {
@@ -199,8 +206,14 @@ export function Credentials() {
         !Number.isInteger(saved.revision)
       )
         throw new Error("设置保存结果未确认，请刷新列表核验");
+      const label =
+        field === "auto_checkin"
+          ? "自动签到"
+          : field === "auto_travel"
+            ? "自动旅行"
+            : "自动活跃打卡";
       setNotice(
-        `${field === "auto_checkin" ? "自动签到" : "自动旅行"}已${enabled ? "开启" : "关闭"}；保存不会立即领取，后续维护按新设置执行。`,
+        `${label}已${enabled ? "开启" : "关闭"}；保存不会立即执行，后续维护按新设置执行。`,
       );
     });
   };
@@ -332,6 +345,10 @@ export function Credentials() {
                     const checkin =
                       c.checkin && typeof c.checkin === "object" ? object(c.checkin) : null;
                     const trip = c.travel && typeof c.travel === "object" ? object(c.travel) : null;
+                    const dailyChat =
+                      c.daily_chat && typeof c.daily_chat === "object"
+                        ? object(c.daily_chat)
+                        : null;
                     return (
                       <tr key={c.id}>
                         <td>
@@ -406,6 +423,29 @@ export function Credentials() {
                               ? `上次旅行：${trip ? text(trip.message) : "尚未查询"}`
                               : "旅行仅适用于国内账号"}
                           </small>
+                          <label className={s.check}>
+                            <input
+                              type="checkbox"
+                              role="switch"
+                              aria-label={`自动活跃打卡 ${c.name ?? c.id}`}
+                              checked={c.auto_daily_chat === true}
+                              disabled={
+                                busy ||
+                                c.daily_chat_supported !== true ||
+                                typeof c.auto_daily_chat !== "boolean"
+                              }
+                              onChange={(e) => preference(c, "auto_daily_chat", e.target.checked)}
+                            />
+                            自动活跃打卡
+                          </label>
+                          <small>
+                            {c.daily_chat_supported === true
+                              ? `今日打卡：${dailyChat ? text(dailyChat.message) : "尚未执行"}`
+                              : "活跃打卡仅适用于国际 WorkBuddy 账号"}
+                          </small>
+                          {dailyChat?.acp_usage != null && (
+                            <small>本次会话成本：{text(dailyChat.acp_usage)} 积分</small>
+                          )}
                           {trip?.stale === true && <small>状态可能已变化，请先查询核验</small>}
                           {c.travel_supported === true && <TravelSummary trip={trip} />}
                           {c.enabled === false && <small>账号停用期间不执行自动任务</small>}
@@ -502,6 +542,15 @@ export function Credentials() {
                                 onClick={() => setTrialTarget(c)}
                               >
                                 领取体验积分
+                              </button>
+                            )}
+                            {c.daily_chat_supported === true && (
+                              <button
+                                disabled={busy || c.enabled !== true}
+                                aria-label={`活跃打卡 ${c.name ?? c.id}`}
+                                onClick={() => maintain("daily-chat", c)}
+                              >
+                                活跃打卡
                               </button>
                             )}
                             {c.travel_supported === true && (

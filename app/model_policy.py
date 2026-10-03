@@ -41,6 +41,12 @@ def credential_auto_travel(config, entry):
     return supported and snapshot(config)["credentials"].get(entry.get("account_key"), {}).get("auto_travel", True)
 
 
+def credential_auto_daily_chat(config, entry):
+    """A turn spends credits on the account, so international accounts opt in explicitly."""
+    supported = entry.get("profile") == "intl-work"
+    return supported and snapshot(config)["credentials"].get(entry.get("account_key"), {}).get("auto_daily_chat", False)
+
+
 def default_rule(source):
     return {"public_id": source, "upstream_id": source, "custom": False,
             "enabled": True, "keep_original": False,

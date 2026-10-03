@@ -50,7 +50,7 @@ from app.adapters.anthropic_adapter import (
 
 from app import auth_oauth
 from app import trial_rewards
-from app import buddy, checkin as checkin_service, model_policy, travel
+from app import buddy, daily_chat, checkin as checkin_service, model_policy, travel
 from app.credential_cooldowns import CredentialCooldowns
 from app.model_blocks import ModelBlocks
 from app.usage_snapshots import UsageSnapshots
@@ -1411,6 +1411,18 @@ def _sync_error(pool, ledger, entry, generation, phase, error):
     _log(f"[{phase}] {Path(entry['id']).name} 同步失败（保留旧数据）: {message}")
 
 
+def _daily_chat_done(entry, day):
+    """Today's turn already confirmed, so the sweep must not spend another one."""
+    store = CONFIG.get("control_store")
+    if store is None or not entry.get("account_key"):
+        return True
+    try:
+        return store.daily_chat_done(entry["account_key"], day)
+    except Exception:
+        # An unreadable record is treated as done: never guess a turn was free to send.
+        return True
+
+
 def _buddy_context(entry, headers, consent_revision=None):
     def select_model(requested=None):
         from app.audit_store import safe_label
@@ -1464,7 +1476,7 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
             return None  # A path now owned by another account must be rescheduled with its own preferences.
         site = site_for_headers(headers)
         token, uid, domain = _bearer_token(headers), headers.get("X-User-Id", ""), headers.get("X-Domain", "")
-        day = time.strftime("%Y-%m-%d")
+        day = daily_chat.today()
         if checkin and model_policy.credential_auto_checkin(CONFIG, entry) and not ledger.checkin_done(cid, day):
             try:
                 def can_claim():
@@ -1498,6 +1510,24 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                 buddy.daily_warning(CONFIG, entry.get("account_key"), entry.get("profile"), trip)
             except Exception as error:
                 _sync_error(pool, ledger, entry, generation, "travel", error)
+        if not model_policy.credential_enabled(CONFIG, entry):
+            return None
+        # A daily-activity turn spends credits on the account and is opt-in, so it runs
+        # before the balance refresh reads back whatever it cost. Each account waits for
+        # its own slot inside the day so the accounts never go out together.
+        if (checkin and model_policy.credential_auto_daily_chat(CONFIG, entry)
+                and not _daily_chat_done(entry, day)
+                and daily_chat.is_due(entry.get("account_key"), day)):
+            try:
+                def can_chat():
+                    return (model_policy.credential_auto_daily_chat(CONFIG, entry)
+                            and pool.apply_if_current(cm, generation, lambda: None))
+                turn = daily_chat.perform(token, profile, uid=uid, domain=domain, can_write=can_chat,
+                                          store=CONFIG.get("control_store"),
+                                          identity=entry.get("account_key"))
+                _log(f"[dailychat] {Path(cid).name}: state={turn.get('state')} ok={turn.get('ok')}")
+            except Exception as error:
+                _sync_error(pool, ledger, entry, generation, "dailychat", error)
         if not model_policy.credential_enabled(CONFIG, entry):
             return None
         balance = credits_mod.fetch_credits(token, uid=uid, domain=domain)
@@ -1748,6 +1778,14 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
         pool._warn_storage("cooldown", pool._cooldowns.last_error is None)
         if CONFIG.get("usage_snapshots") is not None:
             CONFIG["usage_snapshots"].prune()
+        control_store = CONFIG.get("control_store")
+        if control_store is not None:
+            # Daily-activity rows are diagnostic only, so old ones are dropped rather
+            # than kept as history; the day itself is still read back from this table.
+            try:
+                control_store.prune_daily_chats()
+            except Exception as error:
+                _log(f"[housekeeper] 打卡记录清理失败: {_network_error_text(error)}")
         ids = pool.begin_sync(all_entries=not pending_only)
         failed = set()
         try:
@@ -1889,7 +1927,7 @@ _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
 def _log(msg: str):
     """Persist allowlisted runtime events in SQLite, never free-form text or secrets."""
     audit = CONFIG.get("audit_store")
-    component = re.match(r"\[(cred|credits|models|usage|trial|checkin|housekeeper)\]", msg)
+    component = re.match(r"\[(cred|credits|models|usage|trial|checkin|dailychat|housekeeper)\]", msg)
     if audit is not None and component:
         # Persist event codes, not free-form lines which may contain upstream data.
         code = "cooldown" if "熔断" in msg or "冷却" in msg else "failure" if "失败" in msg or "异常" in msg else "updated"

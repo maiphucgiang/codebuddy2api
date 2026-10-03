@@ -4,12 +4,14 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from . import buddy, checkin, model_policy, travel, trial_management
+from . import buddy, checkin, daily_chat, model_policy, travel, trial_management
 from .credential_io import credential_file_lock
 
 
 def run(gateway, action, identity=None, *, consent_revision=None):
-    if action not in {"refresh", "checkin", "sync", "travel", "travel-status", "trial", "reset-cooldown"} or (action in {"refresh", "travel", "travel-status", "trial", "reset-cooldown"} and identity is None):
+    if action not in {"refresh", "checkin", "sync", "travel", "travel-status", "trial",
+                      "daily-chat", "reset-cooldown"} or (action in {
+            "refresh", "travel", "travel-status", "trial", "daily-chat", "reset-cooldown"} and identity is None):
         raise HTTPException(404, "凭证操作不存在")
     if consent_revision is not None and (action != "travel" or identity is None or consent_revision != buddy.AGREEMENT_REVISION):
         raise HTTPException(400, "首领确认无效或协议版本已变化")
@@ -32,7 +34,7 @@ def run(gateway, action, identity=None, *, consent_revision=None):
         entries = [dict(e) for e in pool.entries() if identity is None or e.get("account_key") == identity]
         if identity is not None and not entries:
             raise HTTPException(404, "凭证不存在或身份已变化")
-        if action in {"trial", "travel", "travel-status"}:
+        if action in {"trial", "travel", "travel-status", "daily-chat"}:
             entries = entries[:1]  # One account identity represents one manual action.
         results = []
         for entry in entries:
@@ -78,6 +80,12 @@ def _audit(config, result, started=None):
                            status_code=result.get("status"),
                            code=str(result["code"]) if result.get("code") is not None else None,
                            duration_ms=(time.monotonic() - started) * 1000 if started is not None else None)
+        if action == "daily-chat":
+            details.update(outcome="success" if result["ok"] else "error", stage=result.get("state"),
+                           status_code=result.get("http_status"),
+                           code=result.get("error_kind") or (str(result["code"]) if result.get("code") is not None else None),
+                           conversation_id=result.get("conversation_id"),
+                           duration_ms=(time.monotonic() - started) * 1000 if started is not None else None)
         if action == "reset-cooldown":
             # The audit sanitizer keeps a fixed key allowlist, so report the split outcome through
             # fields it retains rather than widening a shared schema.
@@ -119,6 +127,20 @@ def _reset_cooldowns(gateway, identity):
 def _one(gateway, pool, ledger, entry, action, *, automatic=False, consent_revision=None):
     if action == "trial":
         return trial_management.perform(gateway, pool, entry)
+    if action == "daily-chat":
+        cm, cid = entry["cm"], entry["id"]
+        with cm._lock:
+            if cm.summary().get("account_key") != entry.get("account_key"):
+                return {"ok": False, "state": "changed", "message": "凭证身份已变化，请刷新列表"}
+            headers = cm.get_headers()
+            generation = cm._generation
+        result = daily_chat.perform(gateway._bearer_token(headers), gateway.profile_for_headers(headers),
+            uid=headers.get("X-User-Id", ""), domain=headers.get("X-Domain", ""),
+            can_write=lambda: pool.apply_if_current(cm, generation, lambda: None),
+            store=gateway.CONFIG.get("control_store"), identity=entry.get("account_key"))
+        if result.get("state") == "changed":
+            result.update(message="凭证已变化，打卡结果未确认，请刷新列表核验")
+        return result
     cm, cid = entry["cm"], entry["id"]
     if not model_policy.credential_enabled(gateway.CONFIG, entry):
         return {"ok": False, "skipped": True, "message": "账号已人工停用"}
@@ -153,7 +175,7 @@ def _one(gateway, pool, ledger, entry, action, *, automatic=False, consent_revis
             buddy.daily_warning(gateway.CONFIG, entry.get("account_key"), entry.get("profile"), result)
         return result
     if action == "checkin":
-        day = time.strftime("%Y-%m-%d")
+        day = daily_chat.today()
         if ledger.checkin_done(cid, day):
             current = pool.apply_if_current(cm, generation, lambda: None)
             return {"ok": current, "already": current, "state": "already" if current else "changed",

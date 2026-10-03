@@ -23,6 +23,14 @@ def _identifier(value, label):
     return value
 
 
+def _day(value, label="日期"):
+    """Accept only a YYYY-MM-DD local day; never a timestamp or free text."""
+    if (not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-"
+            or not value.replace("-", "").isdigit()):
+        raise ValueError(f"{label} 无效")
+    return value
+
+
 def buddy_claim_reserved(record):
     """Only pre-claim reservations may expire; a pending send can outlive its process."""
     return bool(record and (record["claimed"] or record["stage"] not in {"reserved", "agree", "buddy_agree"}))
@@ -107,6 +115,12 @@ class ControlStore:
                              "accept_started INTEGER NOT NULL DEFAULT 0, chat_started INTEGER NOT NULL DEFAULT 0, "
                              "completed INTEGER NOT NULL DEFAULT 0, model TEXT, chat_state TEXT NOT NULL DEFAULT 'pending', "
                              "total_tokens INTEGER, updated_at REAL NOT NULL)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS daily_chats ("
+                             "account_key TEXT NOT NULL, day TEXT NOT NULL, attempt_id TEXT NOT NULL, "
+                             "phase TEXT NOT NULL, conversation_id TEXT, sandbox_status TEXT, "
+                             "usage_before REAL, usage_after REAL, acp_usage REAL, "
+                             "reserved_at REAL NOT NULL, confirmed_at REAL, updated_at REAL NOT NULL, "
+                             "PRIMARY KEY (account_key, day))")
             self._db.execute("CREATE TABLE IF NOT EXISTS runtime_state (name TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS state_imports (name TEXT PRIMARY KEY, imported INTEGER NOT NULL, migrated_at REAL NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS gateway_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL, announced INTEGER NOT NULL DEFAULT 0 CHECK(announced IN (0,1)))")
@@ -134,9 +148,10 @@ class ControlStore:
             validate_model(source, rule, data["models"], legacy_scopes=True)  # Preserve legacy scope intersections.
         for identity, metadata in data["credentials"].items():
             _identifier(identity, "账号指纹")
-            if (not isinstance(metadata, dict) or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel"}
+            if (not isinstance(metadata, dict) or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel", "auto_daily_chat"}
                     or type(metadata.get("enabled")) is not bool
-                    or any(key in metadata and type(metadata[key]) is not bool for key in ("auto_checkin", "auto_travel"))):
+                    or any(key in metadata and type(metadata[key]) is not bool for key in
+                           ("auto_checkin", "auto_travel", "auto_daily_chat"))):
                 raise ValueError("管理数据库凭证元数据无效")
         return {"revision": row[0], **data}
 
@@ -243,6 +258,13 @@ class ControlStore:
             raise ValueError("auto_travel 必须为布尔值")
         return self._update(None, lambda state: state["credentials"].setdefault(
             account_key, {"enabled": True}).update(auto_travel=enabled))
+
+    def set_auto_daily_chat(self, account_key, enabled):
+        _identifier(account_key, "账号指纹")
+        if type(enabled) is not bool:
+            raise ValueError("auto_daily_chat 必须为布尔值")
+        return self._update(None, lambda state: state["credentials"].setdefault(
+            account_key, {"enabled": True}).update(auto_daily_chat=enabled))
 
     def has_buddy_consent(self, identity, revision):
         _identifier(identity, "账号指纹")
@@ -423,6 +445,109 @@ class ControlStore:
                              "chat_state=COALESCE(?,chat_state),total_tokens=COALESCE(?,total_tokens),updated_at=? "
                              "WHERE account_key=?",
                              (int(completed), chat_state, total_tokens, time.time(), identity))
+
+
+    # -- International daily-activity turns ------------------------------------
+    # One row per account per local day. A turn may consume credits on the account
+    # and is never replayed automatically, so only an unsent reservation is
+    # cancellable: a sent-but-unconfirmed one stays pending until the next day.
+
+    _DAILY_CHAT_PHASES = ("reserved", "sent", "confirmed", "cancelled", "reconciled")
+
+    def daily_chat_record(self, identity, day):
+        _identifier(identity, "账号指纹")
+        _day(day)
+        with self._lock:
+            cursor = self._db.execute("SELECT * FROM daily_chats WHERE account_key=? AND day=?",
+                                      (identity, day))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def reserve_daily_chat(self, identity, day):
+        """Reserve the single daily turn; a completed or already-sent day is never reopened.
+
+        A ``reserved`` row is retryable because it means nothing was written upstream
+        yet (the caller only marks ``sent`` once the turn can really run), so a crash
+        or a failed sandbox provisioning does not cost the day.
+        """
+        _identifier(identity, "账号指纹")
+        _day(day)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                previous = self.daily_chat_record(identity, day)
+                if previous and previous["phase"] not in {"reserved", "cancelled", "reconciled"}:
+                    self._db.execute("COMMIT")
+                    return None
+                attempt = uuid.uuid4().hex
+                self._db.execute(
+                    "INSERT INTO daily_chats (account_key,day,attempt_id,phase,reserved_at,updated_at) "
+                    "VALUES(?,?,?,'reserved',?,?) ON CONFLICT(account_key,day) DO UPDATE SET "
+                    "attempt_id=excluded.attempt_id,phase='reserved',conversation_id=NULL,"
+                    "sandbox_status=NULL,usage_before=NULL,usage_after=NULL,acp_usage=NULL,"
+                    "reserved_at=excluded.reserved_at,confirmed_at=NULL,updated_at=excluded.updated_at",
+                    (identity, day, attempt, time.time(), time.time()))
+                self._db.execute("COMMIT")
+                return {"attempt_id": attempt}
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def transition_daily_chat(self, identity, day, attempt, phase):
+        """Late receipts cannot reopen or replace an already reconciled reservation."""
+        _identifier(identity, "账号指纹")
+        _day(day)
+        _identifier(attempt, "尝试 ID")
+        if phase not in self._DAILY_CHAT_PHASES:
+            raise ValueError("打卡阶段无效")
+        expected = {"sent": ("reserved",),
+                    "confirmed": ("sent", "confirmed", "reconciled"),
+                    "cancelled": ("reserved", "sent", "cancelled"),
+                    "reconciled": ("reserved", "sent", "confirmed", "reconciled")}[phase]
+        with self._lock:
+            updated = self._db.execute(
+                "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN ("
+                + ",".join("?" for _ in expected) + ")",
+                (phase, phase, phase, time.time(), time.time(), identity, day, attempt, *expected))
+            if updated.rowcount != 1:
+                raise ValueError("打卡预留已变化")
+
+    def daily_chat_checkpoint(self, identity, day, *, sandbox_status=None, usage_before=None,
+                              usage_after=None, acp_usage=None, conversation_id=None):
+        _identifier(identity, "账号指纹")
+        _day(day)
+        if sandbox_status is not None:
+            _identifier(sandbox_status, "会话状态")
+        if conversation_id is not None:
+            _identifier(conversation_id, "会话 ID")
+        for name, value in (("usage_before", usage_before), ("usage_after", usage_after),
+                            ("acp_usage", acp_usage)):
+            if value is not None and (type(value) not in (int, float) or not 0 <= value <= 10**9):
+                raise ValueError(f"{name} 无效")
+        with self._lock:
+            self._db.execute(
+                "UPDATE daily_chats SET sandbox_status=COALESCE(?,sandbox_status), "
+                "conversation_id=COALESCE(?,conversation_id), usage_before=COALESCE(?,usage_before), "
+                "usage_after=COALESCE(?,usage_after), acp_usage=COALESCE(?,acp_usage), updated_at=? "
+                "WHERE account_key=? AND day=?",
+                (sandbox_status, conversation_id, usage_before, usage_after, acp_usage,
+                 time.time(), identity, day))
+
+    def daily_chat_done(self, identity, day):
+        record = self.daily_chat_record(identity, day)
+        return bool(record and record["phase"] in {"confirmed", "reconciled"})
+
+    def prune_daily_chats(self, keep_days=30):
+        """Drop old rows; records are diagnostic, never a source of truth for routing."""
+        keep_days = int(keep_days)
+        if not 1 <= keep_days <= 3650:
+            raise ValueError("保留天数无效")
+        cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - keep_days * 86400))
+        with self._lock:
+            self._db.execute("DELETE FROM daily_chats WHERE day<?", (cutoff,))
 
 
     def close(self):
