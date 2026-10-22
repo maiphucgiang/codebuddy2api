@@ -52,6 +52,7 @@ The template binds to localhost only. Configure HTTPS and restrict network acces
 - **Model:** a public ID from the WebUI or `GET /v1/models`.
 - All accounts share these URLs; no region parameter is needed. Anthropic SDKs append `/v1/messages` themselves, so leave it out of the Base URL.
 - The search endpoints run web searches only — no model calls. See [Web search](docs/clients.md#web-search).
+- Tool parameters: across all three inference protocols, an empty parameter root becomes an object schema. Legacy field maps with boolean `required` flags are wrapped in `properties`, with required names collected at the root. Roots containing schema keywords or `$`/`x-` extensions, and nested schemas, are left untouched.
 
 [Codex CLI, Claude Code / CC Switch and other client examples →](docs/clients.md)
 
