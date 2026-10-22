@@ -84,8 +84,7 @@ from app.rate_measurement import RateBook
 from app.inference_auth import require_api_key
 from app.admin_auth import SessionStoreError
 from app.content_filter import ContentFilterDetector, is_filter_error
-from app.tool_schema import normalize_tool_parameter_roots
-from app.upstream_compat import (channel_fallback_url, is_channel_check_error, normalize_tool_patterns,
+from app.upstream_compat import (channel_fallback_url, is_channel_check_error, normalize_tool_schemas,
                                  should_channel_fallback)
 from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
@@ -3582,10 +3581,9 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
             messages = [messages[system_index], *messages[:system_index], *messages[system_index + 1:]]
             message_indices.insert(0, message_indices.pop(system_index))
     body["messages"] = normalize_chat_messages(messages, message_indices=message_indices)
-    body = normalize_tool_parameter_roots(body)
+    body = normalize_tool_schemas(body)
     _normalize_tool_choice(body)
     body["stream"] = True
-    body = normalize_tool_patterns(body)
     body.setdefault("stream_options", {"include_usage": True})
     body = _chat_body_desensitize(body)
     _guard_request_size(body)

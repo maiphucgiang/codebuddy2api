@@ -12,6 +12,10 @@ _SCHEMA_ARRAYS = frozenset(("allOf", "anyOf", "oneOf", "prefixItems", "items"))
 _SCHEMA_CHILDREN = frozenset(("items", "additionalItems", "contains", "unevaluatedItems",
                               "additionalProperties", "unevaluatedProperties", "propertyNames",
                               "not", "if", "then", "else", "contentSchema"))
+# Keywords whose values are schemas cannot be told apart from fields by shape alone.
+_SCHEMA_VALUED = _SCHEMA_MAPS | _SCHEMA_CHILDREN
+# Keywords holding arbitrary instance data are ambiguous whatever their shape.
+_INSTANCE_KEYWORDS = frozenset(("const", "default"))
 # Backslashes allow the code to sit in JSON that upstream embedded as an escaped string.
 _CHANNEL_CODE = re.compile(r"""(['"])code\\*\1\s*:\s*\\*(['"]?)(?:11128|11-128)\\*\2(?!\d)""",
                            re.IGNORECASE)
@@ -72,22 +76,94 @@ def _has_underscore_escape(value) -> bool:
         return True
 
 
-def normalize_tool_patterns(body: dict) -> dict:
-    """Normalize tool declarations and structured-output schemas, copying only what changes."""
+def _looks_like_field(value) -> bool:
+    """A legacy field carries a boolean required flag, a field type or an enum."""
+    return (type(value.get("required")) is bool or isinstance(value.get("type"), (str, list))
+            or isinstance(value.get("enum"), list))
+
+
+def _holds_field(name: str, value: dict) -> bool:
+    """Whether an object under this root key is a legacy field rather than a schema keyword value."""
+    if name in _INSTANCE_KEYWORDS:
+        return False
+    if name in _SCHEMA_VALUED:
+        return _looks_like_field(value)
+    # Other keywords hold scalars or arrays, so an object under them can only be a field.
+    return True
+
+
+def _parameter_root(parameters):
+    """Wrap an empty root or a field map with legacy boolean required flags in an object schema.
+
+    A root is legacy only when every value is a field object and at least one field carries a boolean
+    ``required``. A keyword such as ``pattern`` or ``description`` holding an object is a field name;
+    schema-valued keywords must also look like a field, and ``const``/``default`` never count. Anything
+    else is passed through.
+    """
+    if not isinstance(parameters, dict):
+        return parameters
+    if not parameters:
+        return {"type": "object", "properties": {}}
+    if (any(name.startswith(("$", "x-")) for name in parameters)
+            or not all(isinstance(field, dict) and type(field.get("required", False)) is bool
+                       for field in parameters.values())
+            or not any("required" in field for field in parameters.values())
+            or not all(_holds_field(name, field) for name, field in parameters.items())):
+        return parameters
+    properties, required = {}, []
+    for name, field in parameters.items():
+        field = dict(field)
+        if field.pop("required", False):
+            required.append(name)
+        properties[name] = field
+    result = {"type": "object", "properties": properties}
+    if required:
+        result["required"] = required
+    return result
+
+
+def _normalize_declaration(declaration, *, roots: bool):
+    """Return the declaration with normalized parameters, or the same object when nothing changes."""
+    if not isinstance(declaration, dict) or "parameters" not in declaration:
+        return declaration
+    original = declaration["parameters"]
+    parameters = _parameter_root(original) if roots else original
+    if _has_underscore_escape(parameters):
+        parameters = deepcopy(parameters)
+        _normalize_schema_patterns(parameters)
+    return declaration if parameters is original else {**declaration, "parameters": parameters}
+
+
+def _normalize_tool(tool, key: str):
+    if key == "functions":
+        return _normalize_declaration(tool, roots=True)
+    if not isinstance(tool, dict):
+        return tool
+    function = tool.get("function")
+    if isinstance(function, dict) and tool.get("type", "function") == "function":
+        normalized = _normalize_declaration(function, roots=True)
+        if normalized is not function or "type" not in tool:
+            # An explicit type lets named tool_choice and upstream recognize the declaration.
+            tool = {**tool, "type": "function", "function": normalized}
+    # Bare entries are not function declarations, but their patterns still reach the RE2 upstream.
+    return _normalize_declaration(tool, roots=False)
+
+
+def normalize_tool_schemas(body: dict) -> dict:
+    """Make tool and structured-output schemas acceptable upstream, copying only what changes.
+
+    Function parameter roots become explicit object schemas, and RE2-incompatible ``\\_`` escapes are
+    removed from schema patterns. Messages, nested schemas and tool metadata are preserved.
+    """
     result = body
     for key in ("tools", "functions"):
         tools = body.get(key)
-        if not isinstance(tools, list) or not _has_underscore_escape(tools):
+        if not isinstance(tools, list):
             continue
-        result = result if result is not body else dict(body)
-        result[key] = tools = deepcopy(tools)
-        for tool in tools:
-            if not isinstance(tool, dict):
-                continue
-            function = tool.get("function")
-            if isinstance(function, dict):
-                _normalize_schema_patterns(function.get("parameters"))
-            _normalize_schema_patterns(tool.get("parameters"))
+        normalized = [_normalize_tool(tool, key) for tool in tools]
+        if any(new is not old for new, old in zip(normalized, tools)):
+            result = result if result is not body else dict(body)
+            result[key] = normalized
     response_format = body.get("response_format")
     if isinstance(response_format, dict) and _has_underscore_escape(response_format):
         result = result if result is not body else dict(body)

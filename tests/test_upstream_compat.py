@@ -15,7 +15,7 @@ import httpx
 
 import converter
 from app import buddy_task, growth_events, rate_measurement
-from app.upstream_compat import channel_fallback_url, is_channel_check_error, normalize_tool_patterns
+from app.upstream_compat import channel_fallback_url, is_channel_check_error, normalize_tool_schemas
 from tests import test_region_routing as fixtures
 
 CHANNEL_ERROR = {
@@ -43,7 +43,7 @@ class ToolPatternTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "agent_run", "parameters": schema}}],
         }
         before = deepcopy(body)
-        result = normalize_tool_patterns(body)
+        result = normalize_tool_schemas(body)
         actual = result["tools"][0]["function"]["parameters"]
         self.assertEqual(body, before)
         self.assertEqual(actual["properties"]["runId"]["pattern"], "^agent_run_")
@@ -59,7 +59,7 @@ class ToolPatternTests(unittest.TestCase):
             "tools": [{"name": "bare", "parameters": {"pattern": r"a\_b"}}],
             "functions": [{"name": "legacy", "parameters": {"pattern": r"c\_d"}}],
         }
-        result = normalize_tool_patterns(body)
+        result = normalize_tool_schemas(body)
         self.assertEqual(result["tools"][0]["parameters"]["pattern"], "a_b")
         self.assertEqual(result["functions"][0]["parameters"]["pattern"], "c_d")
 
@@ -72,7 +72,7 @@ class ToolPatternTests(unittest.TestCase):
                 "triple": {"pattern": r"a\\\_b"},
             },
         }}]}
-        result = normalize_tool_patterns(body)
+        result = normalize_tool_schemas(body)
         schema = result["tools"][0]["parameters"]
         self.assertEqual(schema["patternProperties"]["a_b"],
                          {"allOf": [{"const": "original"}, {"const": "existing"}]})
@@ -83,21 +83,21 @@ class ToolPatternTests(unittest.TestCase):
     def test_boolean_pattern_property_collisions_are_merged(self):
         body = {"tools": [{"name": "bare", "parameters": {
             "patternProperties": {r"^a\_b$": False, "^a_b$": {"type": "string"}}}}]}
-        result = normalize_tool_patterns(body)
+        result = normalize_tool_schemas(body)
         self.assertEqual(result["tools"][0]["parameters"]["patternProperties"],
                          {"^a_b$": {"allOf": [False, {"type": "string"}]}})
 
     def test_bodies_without_escapes_are_not_copied(self):
         body = {"tools": [{"name": "bare", "parameters": {"pattern": "a_b"}}],
                 "response_format": {"type": "json_object"}}
-        result = normalize_tool_patterns(body)
+        result = normalize_tool_schemas(body)
         self.assertIs(result, body)
         self.assertIs(result["tools"], body["tools"])
 
     def test_response_format_json_schema_is_normalized(self):
         body = {"response_format": {"type": "json_schema", "json_schema": {
             "name": "result", "schema": {"properties": {"runId": {"pattern": r"^agent\_run\_"}}}}}}
-        result = normalize_tool_patterns(body)
+        result = normalize_tool_schemas(body)
         schema = result["response_format"]["json_schema"]["schema"]
         self.assertEqual(schema["properties"]["runId"]["pattern"], "^agent_run_")
         self.assertEqual(body["response_format"]["json_schema"]["schema"]["properties"]["runId"]["pattern"], r"^agent\_run\_")

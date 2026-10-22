@@ -5,12 +5,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from copy import deepcopy
-import json
 import unittest
 from unittest.mock import patch
 
 import converter
-from app.tool_schema import normalize_tool_parameter_roots
+from app.upstream_compat import normalize_tool_schemas
 import test_region_routing as fixtures
 
 
@@ -33,11 +32,11 @@ class ToolSchemaTests(unittest.TestCase):
     def test_legacy_roots_are_normalized_without_mutating_the_request(self):
         body = {"tools": legacy_tools(), "messages": [{"role": "user", "content": "keep text"}]}
         before = deepcopy(body)
-        result = normalize_tool_parameter_roots(body)
+        result = normalize_tool_schemas(body)
         self.assertEqual(result["tools"], expected_tools())
         self.assertEqual(body, before)
         self.assertIs(result["messages"], body["messages"])
-        self.assertIs(normalize_tool_parameter_roots(result), result)
+        self.assertIs(normalize_tool_schemas(result), result)
 
     def test_preserves_field_constraints_metadata_and_required_order(self):
         nested = {"type": "string", "enum": ["x", "y"], "pattern": "^[a-z]+$", "default": "x"}
@@ -47,7 +46,7 @@ class ToolSchemaTests(unittest.TestCase):
         body = {"tools": [tool("example", fields)]}
         body["tools"][0]["function"].update(description="Keep metadata", strict=False)
         before = deepcopy(body)
-        result = normalize_tool_parameter_roots(body)
+        result = normalize_tool_schemas(body)
         schema = result["tools"][0]["function"]["parameters"]
         self.assertEqual(schema["required"], ["target", "values"])
         self.assertEqual(schema["properties"]["target"], nested)
@@ -58,7 +57,7 @@ class ToolSchemaTests(unittest.TestCase):
         self.assertEqual(body, before)
 
     def test_optional_only_map_has_no_root_required(self):
-        result = normalize_tool_parameter_roots({"tools": [tool("optional", {"value": {"type": "string", "required": False}})]})
+        result = normalize_tool_schemas({"tools": [tool("optional", {"value": {"type": "string", "required": False}})]})
         self.assertEqual(result["tools"][0]["function"]["parameters"],
                          {"type": "object", "properties": {"value": {"type": "string"}}})
 
@@ -68,7 +67,7 @@ class ToolSchemaTests(unittest.TestCase):
             "record": {"type": "object", "additionalProperties": {"type": "string"}}},
             "required": ["free"], "additionalProperties": False, "x-vendor": {"keep": True}}
         body = {"tools": [tool("standard", schema)]}
-        self.assertIs(normalize_tool_parameter_roots(body), body)
+        self.assertIs(normalize_tool_schemas(body), body)
         self.assertIs(body["tools"][0]["function"]["parameters"], schema)
 
     def test_ambiguous_or_incomplete_standard_roots_are_not_guessed(self):
@@ -84,23 +83,91 @@ class ToolSchemaTests(unittest.TestCase):
         for schema in schemas:
             with self.subTest(schema=schema):
                 body = {"tools": [tool("untouched", schema)]}
-                self.assertIs(normalize_tool_parameter_roots(body), body)
+                self.assertIs(normalize_tool_schemas(body), body)
+
+    def test_schema_keyword_field_names_do_not_hide_a_legacy_map(self):
+        fields = {"pattern": {"type": "string", "required": True}, "path": {"type": "string"},
+                  "description": {"type": "string", "required": False}}
+        result = normalize_tool_schemas({"tools": [tool("grep", fields)]})
+        self.assertEqual(result["tools"][0]["function"]["parameters"], {
+            "type": "object", "required": ["pattern"], "properties": {
+                "pattern": {"type": "string"}, "path": {"type": "string"},
+                "description": {"type": "string"}}})
+
+    def test_one_required_flag_is_enough_for_fields_without_a_single_type(self):
+        fields = {"target": {"type": "string", "required": True}, "note": {"type": ["string", "null"]},
+                  "mode": {"enum": ["a", "b"]}}
+        result = normalize_tool_schemas({"tools": [tool("mixed", fields)]})
+        self.assertEqual(result["tools"][0]["function"]["parameters"], {
+            "type": "object", "required": ["target"], "properties": {
+                "target": {"type": "string"}, "note": {"type": ["string", "null"]},
+                "mode": {"enum": ["a", "b"]}}})
+
+    def test_schema_keywords_holding_schema_values_keep_the_root_untouched(self):
+        for schema in [{"properties": {"a": {"type": "string"}}, "b": {"type": "string", "required": True}},
+                       {"description": "keep", "b": {"type": "string", "required": True}}]:
+            with self.subTest(schema=schema):
+                body = {"tools": [tool("standard", schema)]}
+                self.assertIs(normalize_tool_schemas(body), body)
+
+    def test_instance_data_keywords_keep_the_root_untouched(self):
+        for schema in [{"const": {"type": "object", "required": True}},
+                       {"default": {"type": "string", "required": True}, "b": {"type": "string"}}]:
+            with self.subTest(schema=schema):
+                body = {"tools": [tool("standard", schema)]}
+                self.assertIs(normalize_tool_schemas(body), body)
+
+    def test_enum_only_fields_under_schema_keywords_are_fields(self):
+        fields = {"items": {"enum": ["a", "b"]}, "format": {"enum": ["json", "text"]},
+                  "target": {"type": "string", "required": True}}
+        result = normalize_tool_schemas({"tools": [tool("export", fields)]})
+        self.assertEqual(result["tools"][0]["function"]["parameters"], {
+            "type": "object", "required": ["target"], "properties": {
+                "items": {"enum": ["a", "b"]}, "format": {"enum": ["json", "text"]},
+                "target": {"type": "string"}}})
+
+    def test_function_entries_without_a_type_are_normalized(self):
+        body = {"tools": [{"function": {"name": "list_workers", "parameters": {}}},
+                          {"function": {"name": "standard", "parameters": {"type": "object"}}}]}
+        result = normalize_tool_schemas(body)
+        self.assertEqual(result["tools"], [tool("list_workers", {"type": "object", "properties": {}}),
+                                           tool("standard", {"type": "object"})])
+        self.assertNotIn("type", body["tools"][0])
+
+    def test_named_choice_selects_a_function_entry_without_a_type(self):
+        body = {"model": "auto", "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"function": {"name": "list_workers", "parameters": {}}}],
+                "tool_choice": {"type": "function", "function": {"name": "list_workers"}}}
+        with patch.dict(converter.CONFIG, {"model_guard": False, "desensitize": False}):
+            result = converter._prepare_chat_body(body)
+        self.assertEqual(result["tools"], [tool("list_workers", {"type": "object", "properties": {}})])
+        self.assertEqual(result["tool_choice"], "required")
+
+    def test_legacy_roots_and_pattern_escapes_are_normalized_together(self):
+        fields = {"run_id": {"type": "string", "pattern": r"^agent\_run\_", "required": True}}
+        body = {"tools": [tool("agent_run", fields)]}
+        before = deepcopy(body)
+        result = normalize_tool_schemas(body)
+        self.assertEqual(result["tools"][0]["function"]["parameters"], {
+            "type": "object", "required": ["run_id"],
+            "properties": {"run_id": {"type": "string", "pattern": "^agent_run_"}}})
+        self.assertEqual(body, before)
 
     def test_non_function_tools_and_missing_parameters_are_untouched(self):
         for entry in [None, "unknown", {"type": "custom", "parameters": {}},
                       {"type": "function"}, {"type": "function", "function": {"name": "no_schema"}}]:
             with self.subTest(entry=entry):
                 body = {"tools": [entry]}
-                self.assertIs(normalize_tool_parameter_roots(body), body)
+                self.assertIs(normalize_tool_schemas(body), body)
         for body in [{}, {"tools": None}, {"functions": {}}, {"tools": []}]:
-            self.assertIs(normalize_tool_parameter_roots(body), body)
+            self.assertIs(normalize_tool_schemas(body), body)
 
     def test_legacy_functions_and_mixed_declarations(self):
         valid = tool("valid", {"type": "object", "properties": {}})
         body = {"tools": [valid, *legacy_tools()], "functions": [
             {"name": "flat", "parameters": {"target": {"type": "string", "required": True}}}]}
         before = deepcopy(body)
-        result = normalize_tool_parameter_roots(body)
+        result = normalize_tool_schemas(body)
         self.assertIs(result["tools"][0], valid)
         self.assertEqual(result["tools"][1:], expected_tools())
         self.assertEqual(result["functions"][0]["parameters"], expected_tools()[0]["function"]["parameters"])
