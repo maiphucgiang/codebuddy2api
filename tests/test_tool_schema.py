@@ -110,10 +110,38 @@ class ToolSchemaTests(unittest.TestCase):
                 body = {"tools": [tool("standard", schema)]}
                 self.assertIs(normalize_tool_schemas(body), body)
 
+    def test_instance_data_keywords_keep_the_root_untouched(self):
+        for schema in [{"const": {"type": "object", "required": True}},
+                       {"default": {"type": "string", "required": True}, "b": {"type": "string"}}]:
+            with self.subTest(schema=schema):
+                body = {"tools": [tool("standard", schema)]}
+                self.assertIs(normalize_tool_schemas(body), body)
+
+    def test_enum_only_fields_under_schema_keywords_are_fields(self):
+        fields = {"items": {"enum": ["a", "b"]}, "format": {"enum": ["json", "text"]},
+                  "target": {"type": "string", "required": True}}
+        result = normalize_tool_schemas({"tools": [tool("export", fields)]})
+        self.assertEqual(result["tools"][0]["function"]["parameters"], {
+            "type": "object", "required": ["target"], "properties": {
+                "items": {"enum": ["a", "b"]}, "format": {"enum": ["json", "text"]},
+                "target": {"type": "string"}}})
+
     def test_function_entries_without_a_type_are_normalized(self):
-        body = {"tools": [{"function": {"name": "list_workers", "parameters": {}}}]}
+        body = {"tools": [{"function": {"name": "list_workers", "parameters": {}}},
+                          {"function": {"name": "standard", "parameters": {"type": "object"}}}]}
         result = normalize_tool_schemas(body)
-        self.assertEqual(result["tools"][0]["function"]["parameters"], {"type": "object", "properties": {}})
+        self.assertEqual(result["tools"], [tool("list_workers", {"type": "object", "properties": {}}),
+                                           tool("standard", {"type": "object"})])
+        self.assertNotIn("type", body["tools"][0])
+
+    def test_named_choice_selects_a_function_entry_without_a_type(self):
+        body = {"model": "auto", "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"function": {"name": "list_workers", "parameters": {}}}],
+                "tool_choice": {"type": "function", "function": {"name": "list_workers"}}}
+        with patch.dict(converter.CONFIG, {"model_guard": False, "desensitize": False}):
+            result = converter._prepare_chat_body(body)
+        self.assertEqual(result["tools"], [tool("list_workers", {"type": "object", "properties": {}})])
+        self.assertEqual(result["tool_choice"], "required")
 
     def test_legacy_roots_and_pattern_escapes_are_normalized_together(self):
         fields = {"run_id": {"type": "string", "pattern": r"^agent\_run\_", "required": True}}

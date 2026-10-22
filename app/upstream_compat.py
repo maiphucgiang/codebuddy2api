@@ -12,19 +12,10 @@ _SCHEMA_ARRAYS = frozenset(("allOf", "anyOf", "oneOf", "prefixItems", "items"))
 _SCHEMA_CHILDREN = frozenset(("items", "additionalItems", "contains", "unevaluatedItems",
                               "additionalProperties", "unevaluatedProperties", "propertyNames",
                               "not", "if", "then", "else", "contentSchema"))
-# A root containing schema keywords is a standard schema unless those keys hold legacy fields.
-_SCHEMA_KEYWORDS = frozenset((
-    "$schema", "$id", "$ref", "$anchor", "$dynamicRef", "$dynamicAnchor", "$defs",
-    "$vocabulary", "$comment", "definitions", "type", "properties", "patternProperties",
-    "additionalProperties", "unevaluatedProperties", "propertyNames", "required",
-    "dependentRequired", "dependentSchemas", "dependencies", "minProperties", "maxProperties",
-    "allOf", "anyOf", "oneOf", "not", "if", "then", "else", "items", "prefixItems",
-    "additionalItems", "contains", "unevaluatedItems", "minItems", "maxItems", "uniqueItems",
-    "minContains", "maxContains", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
-    "multipleOf", "minLength", "maxLength", "pattern", "format", "contentEncoding",
-    "contentMediaType", "contentSchema", "enum", "const", "title", "description", "default",
-    "examples", "deprecated", "readOnly", "writeOnly",
-))
+# Keywords whose values are schemas cannot be told apart from fields by shape alone.
+_SCHEMA_VALUED = _SCHEMA_MAPS | _SCHEMA_CHILDREN
+# Keywords holding arbitrary instance data are ambiguous whatever their shape.
+_INSTANCE_KEYWORDS = frozenset(("const", "default"))
 # Backslashes allow the code to sit in JSON that upstream embedded as an escaped string.
 _CHANNEL_CODE = re.compile(r"""(['"])code\\*\1\s*:\s*\\*(['"]?)(?:11128|11-128)\\*\2(?!\d)""",
                            re.IGNORECASE)
@@ -86,16 +77,28 @@ def _has_underscore_escape(value) -> bool:
 
 
 def _looks_like_field(value) -> bool:
-    """A legacy field carries a boolean required flag or a field type."""
-    return type(value.get("required")) is bool or isinstance(value.get("type"), (str, list))
+    """A legacy field carries a boolean required flag, a field type or an enum."""
+    return (type(value.get("required")) is bool or isinstance(value.get("type"), (str, list))
+            or isinstance(value.get("enum"), list))
+
+
+def _holds_field(name: str, value: dict) -> bool:
+    """Whether an object under this root key is a legacy field rather than a schema keyword value."""
+    if name in _INSTANCE_KEYWORDS:
+        return False
+    if name in _SCHEMA_VALUED:
+        return _looks_like_field(value)
+    # Other keywords hold scalars or arrays, so an object under them can only be a field.
+    return True
 
 
 def _parameter_root(parameters):
     """Wrap an empty root or a field map with legacy boolean required flags in an object schema.
 
     A root is legacy only when every value is a field object and at least one field carries a boolean
-    ``required``. Schema keywords count as field names only when their value looks like a field, so a
-    ``pattern`` or ``description`` parameter no longer hides the map. Anything else is passed through.
+    ``required``. A keyword such as ``pattern`` or ``description`` holding an object is a field name;
+    schema-valued keywords must also look like a field, and ``const``/``default`` never count. Anything
+    else is passed through.
     """
     if not isinstance(parameters, dict):
         return parameters
@@ -105,8 +108,7 @@ def _parameter_root(parameters):
             or not all(isinstance(field, dict) and type(field.get("required", False)) is bool
                        for field in parameters.values())
             or not any("required" in field for field in parameters.values())
-            or any(name in _SCHEMA_KEYWORDS and not _looks_like_field(field)
-                   for name, field in parameters.items())):
+            or not all(_holds_field(name, field) for name, field in parameters.items())):
         return parameters
     properties, required = {}, []
     for name, field in parameters.items():
@@ -140,8 +142,9 @@ def _normalize_tool(tool, key: str):
     function = tool.get("function")
     if isinstance(function, dict) and tool.get("type", "function") == "function":
         normalized = _normalize_declaration(function, roots=True)
-        if normalized is not function:
-            tool = {**tool, "function": normalized}
+        if normalized is not function or "type" not in tool:
+            # An explicit type lets named tool_choice and upstream recognize the declaration.
+            tool = {**tool, "type": "function", "function": normalized}
     # Bare entries are not function declarations, but their patterns still reach the RE2 upstream.
     return _normalize_declaration(tool, roots=False)
 
