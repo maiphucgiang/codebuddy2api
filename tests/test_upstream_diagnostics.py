@@ -81,6 +81,16 @@ class UpstreamDiagnosticTests(unittest.TestCase):
         self.assertEqual(entry["upstream_code"], "11140")
         self.assertEqual(entry["upstream_msg"], "request illegal")
 
+    def test_nested_terminal_code_masks_generic_outer_code(self):
+        """A generic outer code must not hide a terminal nested restriction code."""
+        self.respond = lambda request: httpx.Response(
+            403, json={"code": "error", "msg": "forbidden",
+                       "error": {"code": "11140", "message": "request illegal"}})
+        self.client.post(ROUTE, json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]})
+        entry = next(a for a in self._attempts() if a.get("stage") == "upstream_error")
+        self.assertEqual(entry["upstream_code"], "11140")
+        self.assertEqual(entry["upstream_msg"], "request illegal")
+
     def test_non_json_body_records_no_diagnostic_but_keeps_the_status(self):
         self.respond = lambda request: httpx.Response(403, text="<html>blocked</html>")
         self.client.post(ROUTE, json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]})
@@ -119,6 +129,8 @@ class UpstreamDiagnosticTests(unittest.TestCase):
         entry = next(a for a in self._attempts() if a.get("stage") == "upstream_error")
         self.assertNotIn("synthetic-private-token", entry["upstream_body"])
         raw = b"".join(f.read_bytes() for f in Path(self.directory).glob("logs.sqlite3*"))
+        # Storage itself must never persist the secret, not only the record read path.
+        self.assertNotIn(b"synthetic-private-token", raw)
 
     def test_secrets_in_upstream_messages_are_dropped(self):
         self.respond = lambda request: httpx.Response(

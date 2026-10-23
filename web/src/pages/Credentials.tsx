@@ -140,8 +140,9 @@ function LastErrorJson({ code, at, body }: { code: unknown; at: unknown; body: u
           type="button"
           className={s.errorJsonTrigger}
           aria-expanded={open}
+          /* Touch toggles purely via the pin: hover only tracks mouse pointers,
+             so a tap never strands `hovered` open. */
           onClick={() => {
-            holdOpen();
             setPinned((value) => !value);
           }}
           {...hoverProps}

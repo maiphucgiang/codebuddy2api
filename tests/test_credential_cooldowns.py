@@ -421,6 +421,30 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
         self.assertIn("refresh token invalid", entry["last_error_body"])
         self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, entry))
 
+    def test_refresh_due_feeds_rejections_into_the_auto_disable_path(self):
+        """refresh_due itself must count TokenRefreshRejected; the helper is not enough."""
+        pool = self.pool(self.credential())
+        store = converter_local_ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(store.close)
+        identity = pool._entries[0]["account_key"]
+        store.set_credential(identity, True)
+        invalidated = []
+        management = SimpleNamespace(gateway=SimpleNamespace(
+            invalidate_model_table=lambda: invalidated.append(1)))
+        self.enterContext(patch.dict(converter.CONFIG, {"control_store": store, "management": management}))
+        entry = pool._entries[0]
+        error = converter.TokenRefreshRejected("刷新 token 失败：refresh token invalid",
+                                               code="10016", msg="refresh token invalid")
+        with patch.object(entry["cm"], "refresh_if_due", side_effect=error):
+            for _ in range(2):
+                pool.refresh_due(margin_s=10 ** 9, keepalive_s=0)
+                entry["fail_until"] = 0.0  # The rejection cooldown would skip the next pass.
+            self.assertEqual(entry["refresh_rejects"], 2)
+            pool.refresh_due(margin_s=10 ** 9, keepalive_s=0)
+        self.assertTrue(entry["auto_disabled"])
+        self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, entry))
+        self.assertEqual(invalidated, [1])
+
     def test_auth_circuit_breaker_survives_a_restart(self):
         first = self.pool(self.credential())
         first.cooldown(first._entries[0]["cm"], reason="backend HTTP 401")

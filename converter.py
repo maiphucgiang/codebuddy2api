@@ -557,10 +557,11 @@ def _diagnostic_from_payload(payload):
     """Extract (code, msg, bounded body) from an upstream JSON payload, for audit only."""
     if not isinstance(payload, dict):
         return None, None, None
-    nodes = [payload]
+    # The nested error envelope carries the business verdict; a generic outer
+    # code (e.g. "error") must not mask a terminal nested code such as 11140.
     inner = payload.get("error")
-    if isinstance(inner, dict):
-        nodes.append(inner)
+    nodes = [inner] if isinstance(inner, dict) else []
+    nodes.append(payload)
     code = msg = ""
     for node in nodes:
         for key in ("code", "errCode", "error_code"):
@@ -1426,13 +1427,18 @@ class CredentialPool:
         identity = entry.get("account_key") if entry else None
         if not identity or store is None or management is None:
             return
-        with self._lock, (cm._lock if generation is not None else nullcontext()):
-            if not self._lease_matches(cm, generation):
-                return
-            store.set_credential(identity, False)
-            self._sticky.clear()
-            entry["auto_disabled"] = True
-        management.gateway.invalidate_model_table()
+        try:
+            with self._lock, (cm._lock if generation is not None else nullcontext()):
+                if not self._lease_matches(cm, generation):
+                    return
+                store.set_credential(identity, False)
+                self._sticky.clear()
+                entry["auto_disabled"] = True
+            management.gateway.invalidate_model_table()
+        except Exception as error:
+            # A control-store outage must never replace the upstream rejection being reported.
+            _log(f"[cred] 自动禁用写入失败（{Path(cm.path).name}）: {sanitize_log_text(str(error), 200)}")
+            return
         _log(f"[cred] {reason}，账号已自动禁用: {Path(cm.path).name}")
 
     def _note_fresh_401(self, cm, *, generation=None):
@@ -1633,7 +1639,9 @@ class CredentialPool:
             if now < entry.get("fail_until", 0.0) or not model_policy.credential_enabled(CONFIG, entry):
                 continue
             cm = entry["cm"]
+            cm = entry["cm"]
             failure = None
+            refresh_reject = None
             refreshed = keepalive_due = False
             with cm._lock:
                 try:
@@ -1650,11 +1658,15 @@ class CredentialPool:
                     entry["keepalive_after"] = 0.0
                 except TokenRefreshRejected as error:
                     failure = (str(error), cm._generation)
-                    self._note_refresh_reject(entry, error)
+                    # Deferred past cm._lock: the third rejection reaches _auto_disable,
+                    # which takes the pool lock; pool paths acquire pool -> credential.
+                    refresh_reject = error
                 except Exception as error:
                     failure = (str(error), cm._generation)
                     if keepalive_due:
                         entry["keepalive_after"] = now + CRED_KEEPALIVE_RETRY_S
+            if refresh_reject is not None:
+                self._note_refresh_reject(entry, refresh_reject)
             if failure:
                 self.cooldown(cm, reason=failure[0], generation=failure[1])
             elif refreshed:
