@@ -66,6 +66,98 @@ function lastErrorLabel(value: unknown) {
   return lastErrorLabels[key] ?? key;
 }
 
+function prettyErrorJson(value: unknown) {
+  const raw = text(value);
+  if (raw === "") return "";
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+/** Last upstream error; hover (desktop) or tap (mobile) opens the recorded JSON. Click pins it open. */
+function LastErrorJson({ code, at, body }: { code: unknown; at: unknown; body: unknown }) {
+  const json = prettyErrorJson(body);
+  const [pinned, setPinned] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const leaveTimer = useRef<number | null>(null);
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  const tip = useRef<HTMLDivElement | null>(null);
+  const open = pinned || hovered;
+  const close = useCallback(() => {
+    setPinned(false);
+    setHovered(false);
+  }, []);
+  const placement = usePopover(open, close, trigger, tip, "start");
+  useEffect(
+    () => () => {
+      if (leaveTimer.current !== null) window.clearTimeout(leaveTimer.current);
+    },
+    [],
+  );
+  // A short grace period bridges the gap between the trigger and the portaled tip.
+  const scheduleClose = () => {
+    if (leaveTimer.current !== null) window.clearTimeout(leaveTimer.current);
+    leaveTimer.current = window.setTimeout(() => setHovered(false), 160);
+  };
+  const holdOpen = () => {
+    if (leaveTimer.current !== null) {
+      window.clearTimeout(leaveTimer.current);
+      leaveTimer.current = null;
+    }
+    setHovered(true);
+  };
+  const hoverProps = {
+    onPointerEnter: (event: { pointerType: string }) => {
+      if (event.pointerType === "mouse") holdOpen();
+    },
+    onPointerLeave: (event: { pointerType: string }) => {
+      if (event.pointerType === "mouse") scheduleClose();
+    },
+  };
+  const label = (
+    <>
+      最近错误：{text(lastErrorLabel(code))}
+      {number(at) !== null ? ` · ${expiry(at)}` : ""}
+    </>
+  );
+  if (json === "") return <small>{label}</small>;
+  return (
+    <>
+      <small>
+        <button
+          ref={trigger}
+          type="button"
+          className={s.errorJsonTrigger}
+          aria-expanded={open}
+          onClick={() => {
+            holdOpen();
+            setPinned((value) => !value);
+          }}
+          {...hoverProps}
+        >
+          {label}
+        </button>
+      </small>
+      {open &&
+        createPortal(
+          <div
+            ref={tip}
+            className={s.errorJsonTip}
+            style={
+              placement ? { top: placement.top, left: placement.left } : { visibility: "hidden" }
+            }
+            {...hoverProps}
+          >
+            {json}
+          </div>,
+          popoverHost(trigger.current),
+        )}
+    </>
+  );
+}
+
 export { safeOAuthUrl } from "../OAuth";
 
 function boundModels(credential: Credential): string[] {
@@ -778,10 +870,7 @@ export function Credentials() {
           ) : null}
         </div>
         {c.last_error_code != null && (
-          <small>
-            最近错误：{text(lastErrorLabel(c.last_error_code))}
-            {number(c.last_failure_at) !== null ? ` · ${expiry(c.last_failure_at)}` : ""}
-          </small>
+          <LastErrorJson code={c.last_error_code} at={c.last_failure_at} body={c.last_error_body} />
         )}
         {typeof c.sync_error === "string" && c.sync_error !== "" && (
           <small>失败原因：{text(c.sync_error)}</small>

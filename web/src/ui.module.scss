@@ -602,6 +602,36 @@ $white: var(--page);
   border-radius: 14px;
   white-space: normal;
 }
+
+.errorJsonTip {
+  /* Fixed beside the trigger so a scrolling table never clips it. */
+  position: fixed;
+  z-index: 40;
+  max-width: min(560px, calc(100vw - 16px));
+  max-height: min(420px, calc(100vh - 16px));
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  @include glass(0.92, 16px);
+  border-radius: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: var(--mono, ui-monospace, monospace);
+  cursor: text;
+}
+
+.errorJsonTrigger {
+  border: none;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: help;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
 .channelTrack button > span,
 .channelTrack small {
   font-size: 11px;

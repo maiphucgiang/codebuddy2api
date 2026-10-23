@@ -446,6 +446,8 @@ STICKY_MAX = 512            # Session binding capacity
 CRED_COOLDOWN = 300         # Credential cooldown in seconds
 MODEL_COOLDOWN = 600        # Model cooldown when a 429 omits reset time
 MODEL_COOLDOWN_MAX = 86400  # Maximum model cooldown in seconds
+UPSTREAM_BODY_AUDIT_LIMIT = 256 * 1024  # Bounded upstream error JSON kept per failed attempt.
+RESTRICTED_CODES = frozenset({"11140"})  # Upstream account-restriction codes; disable, never requeue.
 MODEL_SITE_BLOCK_S = 6 * 3600      # Initial unsupported-model backoff
 MODEL_SITE_BLOCK_MAX_S = 24 * 3600  # Maximum unsupported-model backoff
 # An unsupported model must be routed to a different backend.
@@ -537,6 +539,33 @@ def _parse_not_servable(raw: bytes, status: int):
     if code in MODEL_NOT_SERVABLE_CODES or _NOT_SERVABLE_MSG.search(msg):
         return code or "11102", msg[:200]
     return None
+
+
+def _upstream_diagnostic(raw: bytes):
+    """Extract the business code, message and bounded JSON body from an upstream error."""
+    if not raw:
+        return None, None, None
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, UnicodeError, RecursionError):
+        return None, None, None
+    if not isinstance(payload, dict):
+        return None, None, None
+    nodes = [payload]
+    inner = payload.get("error")
+    if isinstance(inner, dict):
+        nodes.append(inner)
+    code = msg = ""
+    for node in nodes:
+        for key in ("code", "errCode", "error_code"):
+            value = node.get(key)
+            if value is not None and str(value).strip():
+                code = code or str(value).strip()
+        for key in ("msg", "message"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                msg = msg or value.strip()
+    return (code[:64] or None), (msg[:256] or None), (format_log_body(payload, UPSTREAM_BODY_AUDIT_LIMIT) or None)
 
 
 def _block_model(model: str | None) -> str | None:
@@ -1346,6 +1375,34 @@ class CredentialPool:
             return generation == cm._generation
         return generation == cm._generation
 
+    def _note_error_body(self, cm, raw, *, generation=None):
+        """Keep the last upstream error JSON for the credentials tooltip; bounded, redacted."""
+        _, _, body = _upstream_diagnostic(raw or b"")
+        if not body:
+            return
+        with self._lock, (cm._lock if generation is not None else nullcontext()):
+            if not self._lease_matches(cm, generation):
+                return
+            entry = self._index_cm.get(cm)
+            if entry is not None:
+                entry["last_error_body"] = body[:8192]
+
+    def _disable_restricted(self, cm, code, *, generation=None):
+        """An upstream restriction is terminal: disable via the WebUI policy, not a cooldown."""
+        entry = self._index_cm.get(cm)
+        store = CONFIG.get("control_store")
+        management = CONFIG.get("management")
+        identity = entry.get("account_key") if entry else None
+        if not identity or store is None or management is None:
+            return
+        with self._lock, (cm._lock if generation is not None else nullcontext()):
+            if not self._lease_matches(cm, generation):
+                return
+            store.set_credential(identity, False)
+            self._sticky.clear()
+        management.gateway.invalidate_model_table()
+        _log(f"[cred] 上游限制 {code}，账号已禁用: {Path(cm.path).name}")
+
     def cooldown(self, cm: CredentialManager, reason: str = "", *, generation=None):
         with self._lock, (cm._lock if generation is not None else nullcontext()):
             if not self._lease_matches(cm, generation):
@@ -1366,6 +1423,10 @@ class CredentialPool:
             return
         if status in (401, 403):
             self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
+            self._note_error_body(cm, raw, generation=generation)
+            code, _, _ = _upstream_diagnostic(raw or b"")
+            if status == 403 and code in RESTRICTED_CODES:
+                self._disable_restricted(cm, code, generation=generation)
             return
         if status == 400 and is_channel_check_error(raw):
             # Only a rejection that survived the console retry is account-wide; endpoints without a
@@ -4105,6 +4166,9 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
 def _check_upstream_status(status, raw, cred, model, *, headers=None, from_channel_fallback=False):
     if status != 200:
         retry_after = parse_retry_after((headers or {}).get("Retry-After"))
+        code, message, error_body = _upstream_diagnostic(raw)
+        observe_attempt("upstream_error", status_code=status, upstream_code=code,
+                        upstream_msg=message, upstream_body=error_body)
         if not is_filter_error(raw):
             _note_cred_status(cred, status, model=model, raw=raw, retry_after=retry_after,
                               from_channel_fallback=from_channel_fallback)

@@ -44,6 +44,32 @@ def safe_agent(value: Any) -> str | None:
         return None
     return None if _SECRET.search(cleaned) else cleaned
 
+
+def safe_diagnostic(value: Any, limit: int = 256) -> str | None:
+    """Short printable upstream diagnostic text; collapsed to one line and secret-checked."""
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())[:limit]
+    if not cleaned or not cleaned.isprintable() or _SECRET.search(cleaned):
+        return None
+    return cleaned
+
+
+_UPSTREAM_BODY_LIMIT = 256 * 1024
+_JWT = re.compile(r"eyJ[A-Za-z0-9_-]{10,}")
+
+
+def safe_body(value: Any, limit: int = _UPSTREAM_BODY_LIMIT) -> str | None:
+    """Bounded upstream error JSON; redacted upstream, re-checked here for token leakage."""
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value) > limit:
+        value = value[:limit] + "...[truncated]"
+    if _JWT.search(value):
+        return None
+    return value
+
+
 def number(value: Any) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -59,8 +85,16 @@ def safe_attempt(value: Any) -> dict:
     result = {}
     for key in ("stage", "code", "error_code", "model", "upstream_model", "profile",
                 "credential", "usage_source", "outcome", "consent_source", "agreement_revision", "conversation_id", "request_id",
-                "attempt_id", "upstream_request_id", "session_source"):
+                "attempt_id", "upstream_request_id", "session_source", "upstream_code"):
         clean = safe_label(value.get(key))
+        if clean is not None:
+            result[key] = clean
+    for key in ("upstream_msg",):
+        clean = safe_diagnostic(value.get(key))
+        if clean is not None:
+            result[key] = clean
+    for key in ("upstream_body",):
+        clean = safe_body(value.get(key))
         if clean is not None:
             result[key] = clean
     for key in ("status_code", "duration_ms", "attempt", "retry_after", "max_attempts", "total_tokens",
@@ -142,7 +176,7 @@ class AuditStore:
     TRANSIENT_WINDOW_SECONDS = 3600
 
     def __init__(self, path, max_bytes=256 * 1024 * 1024, retention_days=30,
-                 preview_limit=8192):
+                 preview_limit=1536 * 1024):
         self._validate(max_bytes, retention_days, preview_limit)
         self.max_bytes, self.retention_days, self.preview_limit = max_bytes, retention_days, preview_limit
         self._lock = threading.Lock()
@@ -248,7 +282,7 @@ class AuditStore:
             raise ValueError("invalid max_bytes")
         if isinstance(retention_days, bool) or not isinstance(retention_days, int) or not 1 <= retention_days <= 36500:
             raise ValueError("invalid retention_days")
-        if isinstance(preview_limit, bool) or not isinstance(preview_limit, int) or not 0 <= preview_limit <= 65536:
+        if isinstance(preview_limit, bool) or not isinstance(preview_limit, int) or not 0 <= preview_limit <= 4 * 1024 * 1024:
             raise ValueError("invalid preview_limit")
 
     def _fault(self, exc, dropped=False):

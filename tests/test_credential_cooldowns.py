@@ -6,13 +6,16 @@ import os
 import sys
 import tempfile
 import time
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import converter
+from app.control_store import ControlStore as converter_local_ControlStore
 from app.credential_cooldowns import (AUTH_CEILING_S, MAX_ACCOUNTS, MAX_BYTES, MAX_MODELS,
                                       MODEL_CEILING_S, VERSION, CredentialCooldowns)
 
@@ -303,6 +306,50 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
     def pool(self, *paths):
         return converter.CredentialPool(list(paths), blocks_path=self.root / "blocks.json",
                                         cooldowns_path=self.path)
+
+
+    def test_auth_rejection_keeps_the_upstream_error_body_for_the_tooltip(self):
+        pool = self.pool(self.credential())
+        body = json.dumps({"code": 11140, "msg": "request illegal",
+                           "displayMsg": {"zh": "账号存在异常行为，已被限制使用"}}).encode()
+        pool.note_status(pool._entries[0]["cm"], 403, raw=body)
+        entry = pool._entries[0]
+        self.assertIn("11140", entry["last_error_body"])
+        self.assertIn("已被限制使用", entry["last_error_body"])
+        # Non-JSON rejections (WAF pages) must not leave a body behind.
+        pool.note_status(pool._entries[0]["cm"], 403, raw=b"<html>blocked</html>")
+        self.assertIn("11140", entry["last_error_body"])
+
+    def test_upstream_restriction_disables_the_account_through_the_webui_policy(self):
+        """11140 is a terminal account restriction: disable via the policy, not just a cooldown."""
+        path = self.credential()
+        pool = self.pool(path)
+        store = converter_local_ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(store.close)
+        identity = pool._entries[0]["account_key"]
+        store.set_credential(identity, True)
+        invalidated = []
+        management = SimpleNamespace(gateway=SimpleNamespace(
+            invalidate_model_table=lambda: invalidated.append(1)))
+        self.enterContext(patch.dict(converter.CONFIG, {"control_store": store, "management": management}))
+        body = json.dumps({"code": 11140, "msg": "request illegal"}).encode()
+        pool.note_status(pool._entries[0]["cm"], 403, raw=body)
+        self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, pool._entries[0]))
+        self.assertEqual(invalidated, [1])
+        # The policy survives a pool rebuild, matching a WebUI-initiated disable.
+        revived = self.pool(self.credential())
+        self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, revived._entries[0]))
+
+    def test_plain_403_cooldowns_without_disabling(self):
+        pool = self.pool(self.credential())
+        store = converter_local_ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(store.close)
+        identity = pool._entries[0]["account_key"]
+        store.set_credential(identity, True)
+        self.enterContext(patch.dict(converter.CONFIG, {"control_store": store, "management": None}))
+        pool.note_status(pool._entries[0]["cm"], 403, raw=b"forbidden")
+        self.assertTrue(converter.model_policy.credential_enabled(converter.CONFIG, pool._entries[0]))
+        self.assertFalse(pool._healthy(pool._entries[0]))
 
     def test_auth_circuit_breaker_survives_a_restart(self):
         first = self.pool(self.credential())
