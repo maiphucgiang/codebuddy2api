@@ -155,7 +155,8 @@ class ControlStoreTests(unittest.TestCase):
         self.assertEqual(items["image_policy"]["source"], "environment")
         self.assertIsNone(items["api_key"]["value"])
         self.assertIsNone(items["auth_dir"]["value"])
-        for invalid in ({"usd_rate": float("nan")}, {"port": 65536}, {"audit_diagnostic_bytes": 8193}):
+        for invalid in ({"usd_rate": float("nan")}, {"port": 65536},
+                        {"audit_diagnostic_bytes": 4 * 1024 * 1024 + 1}):
             with self.assertRaises(ValueError):
                 validate_settings(invalid)
 

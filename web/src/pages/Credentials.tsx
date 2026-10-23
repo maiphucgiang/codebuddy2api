@@ -823,17 +823,27 @@ export function Credentials() {
     </label>
   );
   const renderHealthBadge = (c: Credential) => {
+    const disabled = c.enabled === false;
     const until = number(c.fail_until);
-    const remaining = until === null ? null : Math.max(0, Math.ceil(until - now / 1000));
+    const remaining = disabled
+      ? null
+      : until === null
+        ? null
+        : Math.max(0, Math.ceil(until - now / 1000));
+    const label = disabled
+      ? c.auto_disabled
+        ? healthLabels.auto_disabled
+        : healthLabels.disabled
+      : remaining !== null && remaining > 0
+        ? `认证熔断 ${remaining}s`
+        : c.health === "ready"
+          ? "认证正常"
+          : (healthLabels[typeof c.health === "string" ? c.health : ""] ?? text(c.health));
     return (
       <Badge
         tone={remaining !== null && remaining > 0 ? "bad" : c.health === "ready" ? "good" : "warn"}
       >
-        {remaining !== null && remaining > 0
-          ? `认证熔断 ${remaining}s`
-          : c.health === "ready"
-            ? "认证正常"
-            : (healthLabels[typeof c.health === "string" ? c.health : ""] ?? text(c.health))}
+        {label}
       </Badge>
     );
   };
