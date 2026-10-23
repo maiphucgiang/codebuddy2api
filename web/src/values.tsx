@@ -169,6 +169,7 @@ const profiles: Record<string, string> = {
 const statuses: Record<string, string> = {
   ready: "就绪",
   disabled: "已停用",
+  auto_disabled: "自动禁用",
   error: "失败",
   success: "成功",
   cancelled: "已取消",

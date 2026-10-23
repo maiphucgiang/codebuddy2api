@@ -61,6 +61,15 @@ const lastErrorLabels: Record<string, string> = {
   credential_error: "凭证同步失败（详见操作结果）",
 };
 
+const healthLabels: Record<string, string> = {
+  ready: "就绪",
+  disabled: "已停用",
+  auto_disabled: "自动禁用",
+  circuit_open: "认证熔断",
+  expired: "已过期",
+  error: "错误",
+};
+
 function lastErrorLabel(value: unknown) {
   const key = text(value);
   return lastErrorLabels[key] ?? key;
@@ -824,7 +833,7 @@ export function Credentials() {
           ? `认证熔断 ${remaining}s`
           : c.health === "ready"
             ? "认证正常"
-            : text(c.health)}
+            : (healthLabels[typeof c.health === "string" ? c.health : ""] ?? text(c.health))}
       </Badge>
     );
   };

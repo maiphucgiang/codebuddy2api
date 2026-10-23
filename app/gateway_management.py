@@ -49,9 +49,12 @@ class Management:
                               "remaining_seconds": max(0, round(deadline - now))}
                              for (cid, model), deadline in pool._model_fail.items()
                              if cid == path and deadline > now]
-                state = ("disabled" if not enabled else "error" if row.get("error") else
+                auto_disabled = bool(entry.get("auto_disabled")) and not enabled
+                state = ("auto_disabled" if auto_disabled else
+                         "disabled" if not enabled else "error" if row.get("error") else
                          "circuit_open" if until > now else "expired" if row.get("token_expired") else "ready")
                 row.update(id=identity, name=Path(path).name, enabled=enabled, health=state,
+                           auto_disabled=auto_disabled,
                            auto_checkin=model_policy.credential_auto_checkin(self.CONFIG, entry),
                            checkin=checkin.view(balance.get("checkin") or {}),
                            auto_travel=model_policy.credential_auto_travel(self.CONFIG, entry),
@@ -101,6 +104,7 @@ class Management:
                 pool._queue_sync(entry["id"])
             else:
                 pool._sync_pending.discard(entry["id"])
+                entry["auto_disabled"] = None
                 pool._sync_retry.pop(entry["id"], None)
                 if not pool._sync_pending:
                     pool._sync_event.clear()

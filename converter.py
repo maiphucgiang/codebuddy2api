@@ -1051,6 +1051,7 @@ class CredentialPool:
             entry["last_error"] = None
             entry["last_failure_at"] = None
             entry["last_error_body"] = None
+            entry["auto_disabled"] = None
             for key in [k for k in self._model_fail if k[0] == entry["id"]]:
                 if self._model_fail[key] > now:
                     changed = True
@@ -1404,7 +1405,8 @@ class CredentialPool:
             store.set_credential(identity, False)
             self._sticky.clear()
         management.gateway.invalidate_model_table()
-        _log(f"[cred] 上游限制 {code}，账号已禁用: {Path(cm.path).name}")
+        entry["auto_disabled"] = True
+        _log(f"[cred] 上游限制 {code}，账号已自动禁用: {Path(cm.path).name}")
 
     def cooldown(self, cm: CredentialManager, reason: str = "", *, generation=None):
         with self._lock, (cm._lock if generation is not None else nullcontext()):

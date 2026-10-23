@@ -334,6 +334,7 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
         self.enterContext(patch.dict(converter.CONFIG, {"control_store": store, "management": management}))
         body = json.dumps({"code": 11140, "msg": "request illegal"}).encode()
         pool.note_status(pool._entries[0]["cm"], 403, raw=body)
+        self.assertTrue(pool._entries[0]["auto_disabled"])
         self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, pool._entries[0]))
         self.assertEqual(invalidated, [1])
         # The policy survives a pool rebuild, matching a WebUI-initiated disable.
@@ -361,10 +362,12 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
         self.assertIsNotNone(entry["last_error_body"])
         self.assertIsNotNone(entry["last_failure_at"])
         pool.reset_cooldowns_for(entry["account_key"])
+        pool.reset_cooldowns_for(entry["account_key"])
         self.assertEqual(entry["fail_until"], 0.0)
         self.assertIsNone(entry["last_error"])
         self.assertIsNone(entry["last_failure_at"])
         self.assertIsNone(entry["last_error_body"])
+        self.assertIsNone(entry["auto_disabled"])
         self.assertTrue(pool._healthy(entry))
 
     def test_auth_circuit_breaker_survives_a_restart(self):
