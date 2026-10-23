@@ -75,9 +75,6 @@ def credential_enabled(config, entry, policy=None):
     return _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("enabled", True)
 
 
-def credential_record(config, entry, policy=None):
-    """The whole stored credential record; carries the automatic-disable provenance."""
-    return _policy(config, policy)["credentials"].get(entry.get("account_key"), {})
 
 def credential_auto_checkin(config, entry, policy=None):
     """International accounts opt in explicitly; the preference is independent of routing."""

@@ -37,14 +37,14 @@ class Management:
         with pool._lock:
             entries = {entry["id"]: entry for entry in pool.entries()}
             result = []
-            policy = model_policy.snapshot(self.CONFIG)
+            policy = model_policy.view(self.CONFIG)
             for row in pool.snapshot():
                 path = row.pop("auth_file", "")
                 entry = entries[path]
                 identity = entry.get("account_key") or hashlib.sha256(path.encode()).hexdigest()
                 ledger = self.CONFIG.get("ledger")
                 balance = ledger.entry(path) if ledger else {}
-                record = model_policy.credential_record(self.CONFIG, entry, policy=policy)
+                record = policy.credential(entry)
                 enabled = record.get("enabled", True)
                 until = entry.get("fail_until", 0)
                 cooldowns = [{"model": model, "until": deadline,
