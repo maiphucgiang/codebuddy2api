@@ -347,7 +347,8 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         record = self.only_record(store)
         self.assertEqual(record["outcome"], "success", record)
         self.assertFalse(record.get("error_code"), record)
-        statuses = [attempt.get("status_code") for attempt in record["attempts"]]
+        statuses = [attempt.get("status_code") for attempt in record["attempts"]
+                    if attempt.get("stage") == "upstream_http"]
         self.assertEqual(statuses[:2], [429, 200], record["attempts"])
         self.assertIn("failover_recovered", json.dumps(record["attempts"], ensure_ascii=False))
         markers = [attempt for attempt in record["attempts"]

@@ -147,7 +147,7 @@ SCHEMA = {
                          env="CODEBUDDY2API_STREAM_MODE", choices=["compatible", "realtime"]),
     "audit_max_bytes": _item(256 * 1024 * 1024, "integer", "审计明细预算", minimum=1024**2, maximum=1024**4),
     "audit_retention_days": _item(30, "integer", "审计明细保留天数", minimum=1, maximum=36500),
-    "audit_diagnostic_bytes": _item(8192, "integer", "失败诊断最大字节", minimum=0, maximum=8192),
+    "audit_diagnostic_bytes": _item(1536 * 1024, "integer", "失败诊断最大字节", minimum=0, maximum=4 * 1024 * 1024),
     "trusted_proxies": _item("", "string", "可信代理地址（IP/CIDR，逗号分隔）",
                              env="CODEBUDDY2API_TRUSTED_PROXIES", allow_empty=True,
                              max_length=2000, validator=normalize_trusted_proxies),

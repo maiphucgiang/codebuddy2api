@@ -186,10 +186,16 @@ class ControlStore:
         for identity, metadata in data["credentials"].items():
             _identifier(identity, "账号指纹")
             growth = metadata.get("growth_auto")
+            growth = metadata.get("growth_auto")
             if (not isinstance(metadata, dict)
                     or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel",
-                                        "auto_daily_chat", "auto_growth", "growth_auto"}
+                                        "auto_daily_chat", "auto_growth", "growth_auto",
+                                        "auto_disabled", "auto_reason", "auto_body", "auto_at"}
                     or type(metadata.get("enabled")) is not bool
+                    or metadata.get("auto_disabled") is not None and type(metadata["auto_disabled"]) is not bool
+                    or metadata.get("auto_reason") is not None and not isinstance(metadata["auto_reason"], str)
+                    or metadata.get("auto_body") is not None and not isinstance(metadata["auto_body"], str)
+                    or metadata.get("auto_at") is not None and not isinstance(metadata["auto_at"], (int, float))
                     or metadata.get("auto_growth") is not None and type(metadata["auto_growth"]) is not bool
                     or any(key in metadata and type(metadata[key]) is not bool for key in
                            ("auto_checkin", "auto_travel", "auto_daily_chat"))
@@ -253,10 +259,32 @@ class ControlStore:
 
 
     def set_credential(self, account_key, enabled):
+        """Manual toggle: any operator action clears the automatic-disable provenance."""
         _identifier(account_key, "账号指纹")
         if type(enabled) is not bool:
             raise ValueError("enabled 必须为布尔值")
-        return self._update(None, lambda state: state["credentials"].setdefault(account_key, {}).update(enabled=enabled))
+
+        def change(state):
+            record = state["credentials"].setdefault(account_key, {})
+            record["enabled"] = enabled
+            record.pop("auto_disabled", None)  # Any manual toggle clears the provenance.
+        return self._update(None, change)
+
+    def disable_credential_auto(self, account_key, reason="", body=None, at=None):
+        """Record an automatic disable with its upstream evidence so it survives restarts."""
+        _identifier(account_key, "账号指纹")
+
+        def change(state):
+            record = state["credentials"].setdefault(account_key, {})
+            record.update(enabled=False, auto_disabled=True)
+            for key, value in (("auto_reason", str(reason or "")[:256] or None),
+                               ("auto_body", str(body)[:8192] if body else None),
+                               ("auto_at", at)):
+                if value is None:
+                    record.pop(key, None)
+                else:
+                    record[key] = value
+        return self._update(None, change)
 
     def unbind_credential(self, account_key):
         """Drop an account key from every rule, returning {source: old_ids} for rollback."""

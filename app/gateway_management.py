@@ -37,21 +37,27 @@ class Management:
         with pool._lock:
             entries = {entry["id"]: entry for entry in pool.entries()}
             result = []
+            policy = model_policy.view(self.CONFIG)
             for row in pool.snapshot():
                 path = row.pop("auth_file", "")
                 entry = entries[path]
                 identity = entry.get("account_key") or hashlib.sha256(path.encode()).hexdigest()
                 ledger = self.CONFIG.get("ledger")
                 balance = ledger.entry(path) if ledger else {}
-                enabled = model_policy.credential_enabled(self.CONFIG, entry)
+                record = policy.credential(entry)
+                enabled = record.get("enabled", True)
                 until = entry.get("fail_until", 0)
                 cooldowns = [{"model": model, "until": deadline,
                               "remaining_seconds": max(0, round(deadline - now))}
                              for (cid, model), deadline in pool._model_fail.items()
                              if cid == path and deadline > now]
-                state = ("disabled" if not enabled else "error" if row.get("error") else
+                # Provenance lives in the store so it survives restarts and cooldown resets.
+                auto_disabled = record.get("auto_disabled") is True and not enabled
+                state = ("auto_disabled" if auto_disabled else
+                         "disabled" if not enabled else "error" if row.get("error") else
                          "circuit_open" if until > now else "expired" if row.get("token_expired") else "ready")
                 row.update(id=identity, name=Path(path).name, enabled=enabled, health=state,
+                           auto_disabled=auto_disabled,
                            auto_checkin=model_policy.credential_auto_checkin(self.CONFIG, entry),
                            checkin=checkin.view(balance.get("checkin") or {}),
                            auto_travel=model_policy.credential_auto_travel(self.CONFIG, entry),
@@ -74,6 +80,7 @@ class Management:
                                             "http_403" if entry.get("last_error") == "backend HTTP 403" else
                                             "credential_error" if entry.get("last_error") else None),
                            last_failure_at=entry.get("last_failure_at"),
+                           last_error_body=entry.get("last_error_body"),
                            sync_error=(balance.get("error") or entry.get("last_error") or None),
                            cooldowns=cooldowns, credits=balance.get("credits") or None,
                            sync_pending=path in pool._sync_pending or path in pool._syncing or path in pool._sync_retry,
@@ -94,9 +101,16 @@ class Management:
             self.CONFIG["control_store"].set_credential(identity, enabled)
             pool._sticky.clear()
             if enabled:
+                # Re-enabling returns the credential to a fresh state: reset_cooldowns_for
+                # lifts every cooldown and drops the recorded failure evidence.
+                pool.reset_cooldowns_for(identity)
                 pool._queue_sync(entry["id"])
             else:
                 pool._sync_pending.discard(entry["id"])
+                # entries() hands out copies; clear the flag on the live entry.
+                live = pool.entry_by_id(entry["id"])
+                if live is not None:
+                    live["auto_disabled"] = None
                 pool._sync_retry.pop(entry["id"], None)
                 if not pool._sync_pending:
                     pool._sync_event.clear()

@@ -75,6 +75,7 @@ def credential_enabled(config, entry, policy=None):
     return _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("enabled", True)
 
 
+
 def credential_auto_checkin(config, entry, policy=None):
     """International accounts opt in explicitly; the preference is independent of routing."""
     default = entry.get("profile") in {"cn-cli", "cn-work"}
