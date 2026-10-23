@@ -37,19 +37,22 @@ class Management:
         with pool._lock:
             entries = {entry["id"]: entry for entry in pool.entries()}
             result = []
+            policy = model_policy.snapshot(self.CONFIG)
             for row in pool.snapshot():
                 path = row.pop("auth_file", "")
                 entry = entries[path]
                 identity = entry.get("account_key") or hashlib.sha256(path.encode()).hexdigest()
                 ledger = self.CONFIG.get("ledger")
                 balance = ledger.entry(path) if ledger else {}
-                enabled = model_policy.credential_enabled(self.CONFIG, entry)
+                record = model_policy.credential_record(self.CONFIG, entry, policy=policy)
+                enabled = record.get("enabled", True)
                 until = entry.get("fail_until", 0)
                 cooldowns = [{"model": model, "until": deadline,
                               "remaining_seconds": max(0, round(deadline - now))}
                              for (cid, model), deadline in pool._model_fail.items()
                              if cid == path and deadline > now]
-                auto_disabled = bool(entry.get("auto_disabled")) and not enabled
+                # Provenance lives in the store so it survives restarts and cooldown resets.
+                auto_disabled = record.get("auto_disabled") is True and not enabled
                 state = ("auto_disabled" if auto_disabled else
                          "disabled" if not enabled else "error" if row.get("error") else
                          "circuit_open" if until > now else "expired" if row.get("token_expired") else "ready")
@@ -104,7 +107,10 @@ class Management:
                 pool._queue_sync(entry["id"])
             else:
                 pool._sync_pending.discard(entry["id"])
-                entry["auto_disabled"] = None
+                # entries() hands out copies; clear the flag on the live entry.
+                live = pool.entry_by_id(entry["id"])
+                if live is not None:
+                    live["auto_disabled"] = None
                 pool._sync_retry.pop(entry["id"], None)
                 if not pool._sync_pending:
                     pool._sync_event.clear()

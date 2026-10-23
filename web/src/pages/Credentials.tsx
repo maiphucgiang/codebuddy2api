@@ -63,7 +63,7 @@ const lastErrorLabels: Record<string, string> = {
 
 const healthLabels: Record<string, string> = {
   ready: "就绪",
-  disabled: "已停用",
+  disabled: "人工停用",
   auto_disabled: "自动禁用",
   circuit_open: "认证熔断",
   expired: "已过期",
@@ -820,7 +820,7 @@ export function Credentials() {
           )
         }
       />
-      <span>{c.enabled === true ? "已启用" : c.enabled === false ? "人工停用" : "未知"}</span>
+      <span>{c.enabled === true ? "已启用" : c.enabled === false ? "停用" : "未知"}</span>
     </label>
   );
   const renderHealthBadge = (c: Credential) => {

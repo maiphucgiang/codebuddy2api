@@ -445,6 +445,83 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
         self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, entry))
         self.assertEqual(invalidated, [1])
 
+    def _auto_disable_fixture(self):
+        """A pool + store + management wired for auto-disable, with the live entry returned."""
+        pool = self.pool(self.credential())
+        store = converter_local_ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(store.close)
+        identity = pool._entries[0]["account_key"]
+        store.set_credential(identity, True)
+        invalidated = []
+        management = SimpleNamespace(gateway=SimpleNamespace(
+            invalidate_model_table=lambda: invalidated.append(1)))
+        self.enterContext(patch.dict(converter.CONFIG, {"control_store": store, "management": management}))
+        return pool, store, identity
+
+    def test_request_path_refresh_resets_the_rejection_count(self):
+        """A successful get_headers refresh between rejections proves the token alive."""
+        pool, store, identity = self._auto_disable_fixture()
+        entry = pool._entries[0]
+        error = converter.TokenRefreshRejected("刷新 token 失败：refresh token invalid")
+        pool._note_refresh_reject(entry, error)
+        pool._note_refresh_reject(entry, error)
+        self.assertEqual(entry["refresh_rejects"], 2)
+        # The last rejection predates a fresh token, as a request-path refresh would produce.
+        entry["refresh_reject_at"] = time.time() - 10
+        with patch.object(entry["cm"], "token_age_s", return_value=0.5):
+            pool._note_refresh_reject(entry, error)
+        self.assertEqual(entry["refresh_rejects"], 1)
+        self.assertIsNone(entry.get("auto_disabled"))
+
+    def test_stale_refresh_rejections_do_not_accumulate(self):
+        """Sporadic rejections days apart never reach the disable threshold."""
+        pool = self.pool(self.credential())
+        entry = pool._entries[0]
+        error = converter.TokenRefreshRejected("刷新 token 失败")
+        with patch.object(entry["cm"], "token_age_s", return_value=None):
+            for _ in range(5):
+                entry["refresh_reject_at"] = time.time() - converter.REFRESH_REJECT_WINDOW - 1
+                pool._note_refresh_reject(entry, error)
+        self.assertEqual(entry["refresh_rejects"], 1)
+        self.assertIsNone(entry.get("auto_disabled"))
+
+    def test_keepalive_rejection_backs_off_like_other_failures(self):
+        pool = self.pool(self.credential())
+        entry = pool._entries[0]
+        error = converter.TokenRefreshRejected("刷新 token 失败：refresh token invalid")
+        with patch.object(entry["cm"], "summary",
+                          return_value={"token_expires_at": (time.time() + 86400) * 1000,
+                                        "last_refresh_time": 0}), \
+                patch.object(entry["cm"], "refresh_if_due", side_effect=error):
+            pool.refresh_due(margin_s=600, keepalive_s=300)
+        self.assertGreater(entry["keepalive_after"], time.time())
+
+    def test_manual_toggle_clears_the_auto_provenance(self):
+        pool, store, identity = self._auto_disable_fixture()
+        body = json.dumps({"code": 11140, "msg": "request illegal"}).encode()
+        pool.note_status(pool._entries[0]["cm"], 403, raw=body)
+        self.assertTrue(store.snapshot()["credentials"][identity]["auto_disabled"])
+        store.set_credential(identity, False)  # The operator toggles the switch.
+        record = store.snapshot()["credentials"][identity]
+        self.assertFalse(record["enabled"])
+        self.assertNotIn("auto_disabled", record)
+
+    def test_auto_provenance_survives_a_restart_and_a_cooldown_reset(self):
+        pool, store, identity = self._auto_disable_fixture()
+        body = json.dumps({"code": 11140, "msg": "request illegal"}).encode()
+        pool.note_status(pool._entries[0]["cm"], 403, raw=body)
+        # A cooldown reset clears in-memory evidence but not the persisted label.
+        pool.reset_cooldowns_for(identity)
+        self.assertTrue(store.snapshot()["credentials"][identity]["auto_disabled"])
+        # A restart adopts the label and the tooltip body back from the store.
+        revived = self.pool(self.credential())
+        rentry = revived._entries[0]
+        self.assertTrue(rentry["auto_disabled"])
+        self.assertIn("11140", rentry["last_error_body"])
+        # Re-enabling clears the provenance for good.
+        store.set_credential(identity, True)
+        self.assertFalse(store.snapshot()["credentials"][identity].get("auto_disabled"))
+
     def test_auth_circuit_breaker_survives_a_restart(self):
         first = self.pool(self.credential())
         first.cooldown(first._entries[0]["cm"], reason="backend HTTP 401")

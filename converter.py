@@ -460,6 +460,7 @@ RESTRICTED_CODES = frozenset({"11140"})  # Upstream account-restriction codes; d
 FRESH_401_LIMIT = 3         # Fresh-token 401s inside the window before auto-disable
 FRESH_401_WINDOW = 3600     # Sliding window for fresh-token 401 counting
 REFRESH_REJECT_LIMIT = 3    # Consecutive business refresh rejections before auto-disable
+REFRESH_REJECT_WINDOW = 3600  # Rejections further apart than this are not consecutive
 MODEL_SITE_BLOCK_S = 6 * 3600      # Initial unsupported-model backoff
 MODEL_SITE_BLOCK_MAX_S = 24 * 3600  # Maximum unsupported-model backoff
 # An unsupported model must be routed to a different backend.
@@ -729,6 +730,7 @@ class CredentialPool:
                             # account's own breaker, which is hydrated just below.
                             self._forget_credential_cooldown(entry)
                         self._adopt_cooldowns(entry)
+                        self._adopt_auto_state(entry)
                         if entry.get("uid"):
                             have_uids[identity] = cid
                         self._queue_sync(cid)
@@ -764,6 +766,7 @@ class CredentialPool:
                          "account_key": identity_key, "catalog_dirty": True}
                 self._bind_entry(entry)
                 self._adopt_cooldowns(entry)
+                self._adopt_auto_state(entry)
                 self._entries.append(entry)
                 by_id[cid] = entry
                 self._ignored_duplicates.discard(cid)
@@ -968,6 +971,26 @@ class CredentialPool:
         for model, until in (state.get("models") or {}).items():
             key = (entry["id"], model)
             self._model_fail[key] = max(self._model_fail.get(key, 0.0), until)
+
+
+    def _adopt_auto_state(self, entry):
+        """Restore the persisted auto-disable provenance so a restart keeps the label."""
+        store = CONFIG.get("control_store")
+        if store is None or not entry.get("account_key"):
+            return
+        try:
+            record = store.snapshot()["credentials"].get(entry["account_key"]) or {}
+        except Exception:
+            return
+        if record.get("auto_disabled") is not True or record.get("enabled", True):
+            return
+        entry["auto_disabled"] = True
+        if record.get("auto_reason"):
+            entry["last_error"] = record["auto_reason"]
+        if record.get("auto_body"):
+            entry["last_error_body"] = record["auto_body"][:8192]
+        if record.get("auto_at"):
+            entry["last_failure_at"] = record["auto_at"]
 
     def _durable_identity(self, entry) -> bool:
         """Whether this account's identity is complete enough to key durable state.
@@ -1407,9 +1430,9 @@ class CredentialPool:
             return generation == cm._generation
         return generation == cm._generation
 
-    def _note_error_body(self, cm, raw, *, generation=None):
+    def _note_error_body(self, cm, body, *, generation=None):
         """Keep the last upstream error JSON for the credentials tooltip; bounded, redacted."""
-        _, _, body = _upstream_diagnostic(raw or b"")
+        # The diagnostic arrives pre-parsed from note_status; never re-parse under the lock.
         if not body:
             return
         with self._lock, (cm._lock if generation is not None else nullcontext()):
@@ -1431,7 +1454,9 @@ class CredentialPool:
             with self._lock, (cm._lock if generation is not None else nullcontext()):
                 if not self._lease_matches(cm, generation):
                     return
-                store.set_credential(identity, False)
+                store.disable_credential_auto(
+                    identity, reason, body=entry.get("last_error_body") if entry else None,
+                    at=time.time())
                 self._sticky.clear()
                 entry["auto_disabled"] = True
             management.gateway.invalidate_model_table()
@@ -1467,6 +1492,18 @@ class CredentialPool:
                                generation=generation)
     def _note_refresh_reject(self, entry, error):
         """Count consecutive upstream refresh rejections; the refresh token itself is dead."""
+        now = time.time()
+        # A request-path refresh (get_headers -> _refresh) succeeding between rejections
+        # proves the token alive; a long gap alone is not "consecutive" either.
+        try:
+            age = entry["cm"].token_age_s()
+        except Exception:
+            age = None
+        refreshed_after = now - age if age is not None else 0.0
+        if refreshed_after > entry.get("refresh_reject_at", 0.0) or \
+                now - entry.get("refresh_reject_at", 0.0) > REFRESH_REJECT_WINDOW:
+            entry["refresh_rejects"] = 0
+        entry["refresh_reject_at"] = now
         rejects = entry.get("refresh_rejects", 0) + 1
         entry["refresh_rejects"] = rejects
         if error.body:
@@ -1497,8 +1534,9 @@ class CredentialPool:
             return
         if status in (401, 403):
             self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
-            self._note_error_body(cm, raw, generation=generation)
-            code, _, _ = _upstream_diagnostic(raw or b"")
+            # One parse feeds the audit body, the restriction check and the tooltip.
+            code, _, body = _upstream_diagnostic(raw or b"")
+            self._note_error_body(cm, body, generation=generation)
             if status == 403 and code in RESTRICTED_CODES:
                 self._auto_disable(cm, f"上游限制 {code}", generation=generation)
             elif status == 401:
@@ -1658,6 +1696,10 @@ class CredentialPool:
                     entry["keepalive_after"] = 0.0
                 except TokenRefreshRejected as error:
                     failure = (str(error), cm._generation)
+                    # Keepalive rejections back off like every other keepalive failure;
+                    # without this a 5-minute cadence stacks 3 strikes in ~10 minutes.
+                    if keepalive_due:
+                        entry["keepalive_after"] = now + CRED_KEEPALIVE_RETRY_S
                     # Deferred past cm._lock: the third rejection reaches _auto_disable,
                     # which takes the pool lock; pool paths acquire pool -> credential.
                     refresh_reject = error
