@@ -351,6 +351,22 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
         self.assertTrue(converter.model_policy.credential_enabled(converter.CONFIG, pool._entries[0]))
         self.assertFalse(pool._healthy(pool._entries[0]))
 
+
+    def test_reset_returns_the_account_to_a_fresh_state(self):
+        """An operator reset (or re-enable) lifts cooldowns and drops every failure record."""
+        pool = self.pool(self.credential())
+        body = json.dumps({"code": 11140, "msg": "request illegal"}).encode()
+        entry = pool._entries[0]
+        pool.note_status(entry["cm"], 403, raw=body)
+        self.assertIsNotNone(entry["last_error_body"])
+        self.assertIsNotNone(entry["last_failure_at"])
+        pool.reset_cooldowns_for(entry["account_key"])
+        self.assertEqual(entry["fail_until"], 0.0)
+        self.assertIsNone(entry["last_error"])
+        self.assertIsNone(entry["last_failure_at"])
+        self.assertIsNone(entry["last_error_body"])
+        self.assertTrue(pool._healthy(entry))
+
     def test_auth_circuit_breaker_survives_a_restart(self):
         first = self.pool(self.credential())
         first.cooldown(first._entries[0]["cm"], reason="backend HTTP 401")

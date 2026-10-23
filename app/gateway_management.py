@@ -95,6 +95,9 @@ class Management:
             self.CONFIG["control_store"].set_credential(identity, enabled)
             pool._sticky.clear()
             if enabled:
+                # Re-enabling returns the credential to a fresh state: reset_cooldowns_for
+                # lifts every cooldown and drops the recorded failure evidence.
+                pool.reset_cooldowns_for(identity)
                 pool._queue_sync(entry["id"])
             else:
                 pool._sync_pending.discard(entry["id"])

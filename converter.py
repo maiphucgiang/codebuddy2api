@@ -1047,7 +1047,10 @@ class CredentialPool:
             now = time.time()
             changed = entry["fail_until"] > now
             entry["fail_until"] = 0.0
+            entry["fail_until"] = 0.0
             entry["last_error"] = None
+            entry["last_failure_at"] = None
+            entry["last_error_body"] = None
             for key in [k for k in self._model_fail if k[0] == entry["id"]]:
                 if self._model_fail[key] > now:
                     changed = True
