@@ -370,6 +370,57 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
         self.assertIsNone(entry["auto_disabled"])
         self.assertTrue(pool._healthy(entry))
 
+    def test_fresh_token_401s_auto_disable(self):
+        """401 against a just-refreshed token, three times, means the account was revoked."""
+        pool = self.pool(self.credential())
+        store = converter_local_ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(store.close)
+        identity = pool._entries[0]["account_key"]
+        store.set_credential(identity, True)
+        invalidated = []
+        management = SimpleNamespace(gateway=SimpleNamespace(
+            invalidate_model_table=lambda: invalidated.append(1)))
+        self.enterContext(patch.dict(converter.CONFIG, {"control_store": store, "management": management}))
+        entry = pool._entries[0]
+        for _ in range(2):
+            pool.note_status(entry["cm"], 401, raw=b"unauthorized")
+        self.assertIsNone(entry.get("auto_disabled"))
+        pool.note_status(entry["cm"], 401, raw=b"unauthorized")
+        self.assertTrue(entry["auto_disabled"])
+        self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, entry))
+        self.assertEqual(invalidated, [1])
+        # A stale token never counts toward the strikes.
+        fresh = self.pool(self.credential(name="stale.info", uid="stale-uid"))
+        with patch.object(fresh._entries[0]["cm"], "token_age_s", return_value=9999.0):
+            for _ in range(5):
+                fresh.note_status(fresh._entries[0]["cm"], 401, raw=b"unauthorized")
+        self.assertTrue(converter.model_policy.credential_enabled(converter.CONFIG, fresh._entries[0]))
+
+    def test_consecutive_refresh_rejections_auto_disable(self):
+        """Upstream keeps rejecting the refresh token: disable after the third rejection."""
+        pool = self.pool(self.credential())
+        store = converter_local_ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(store.close)
+        identity = pool._entries[0]["account_key"]
+        store.set_credential(identity, True)
+        invalidated = []
+        management = SimpleNamespace(gateway=SimpleNamespace(
+            invalidate_model_table=lambda: invalidated.append(1)))
+        self.enterContext(patch.dict(converter.CONFIG, {"control_store": store, "management": management}))
+        entry = pool._entries[0]
+        body = json.dumps({"code": 10016, "msg": "refresh token invalid"}).encode()
+        error = converter.TokenRefreshRejected("刷新 token 失败：refresh token invalid",
+                                               code="10016", msg="refresh token invalid",
+                                               body=body.decode())
+        for _ in range(2):
+            pool._note_refresh_reject(entry, error)
+        self.assertEqual(entry["refresh_rejects"], 2)
+        pool._note_refresh_reject(entry, error)
+        self.assertTrue(entry["auto_disabled"])
+        self.assertEqual(entry["refresh_rejects"], 0)
+        self.assertIn("refresh token invalid", entry["last_error_body"])
+        self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, entry))
+
     def test_auth_circuit_breaker_survives_a_restart(self):
         first = self.pool(self.credential())
         first.cooldown(first._entries[0]["cm"], reason="backend HTTP 401")

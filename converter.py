@@ -371,7 +371,9 @@ class CredentialManager:
         except Exception as e:
             raise RuntimeError(f"刷新 token 网络失败：{e}")
         if data.get("code") != 0 or not data.get("data"):
-            raise RuntimeError(f"刷新 token 失败：{data.get('msg', data)}")
+            code, msg, body = _diagnostic_from_payload(data)
+            raise TokenRefreshRejected(f"刷新 token 失败：{data.get('msg', data)}",
+                                       code=code, msg=msg, body=body)
         new_auth = dict(data["data"])
         if not isinstance(new_auth.get("accessToken"), str) or not new_auth["accessToken"]:
             raise RuntimeError("刷新接口未返回有效的 accessToken")
@@ -414,6 +416,13 @@ class CredentialManager:
             self._generation += 1
 
 
+    def token_age_s(self) -> float | None:
+        """Seconds since the stored token was last refreshed; None when unknown."""
+        with self._lock:
+            auth = self._session().get("auth") or {}
+            last = auth.get("lastRefreshTime")
+            return None if not last else max(0.0, time.time() - last / 1000)
+
     def summary(self) -> dict:
         perf_metrics.inc("credential_summary_calls")
         with self._lock:
@@ -448,6 +457,9 @@ MODEL_COOLDOWN = 600        # Model cooldown when a 429 omits reset time
 MODEL_COOLDOWN_MAX = 86400  # Maximum model cooldown in seconds
 UPSTREAM_BODY_AUDIT_LIMIT = 256 * 1024  # Bounded upstream error JSON kept per failed attempt.
 RESTRICTED_CODES = frozenset({"11140"})  # Upstream account-restriction codes; disable, never requeue.
+FRESH_401_LIMIT = 3         # Fresh-token 401s inside the window before auto-disable
+FRESH_401_WINDOW = 3600     # Sliding window for fresh-token 401 counting
+REFRESH_REJECT_LIMIT = 3    # Consecutive business refresh rejections before auto-disable
 MODEL_SITE_BLOCK_S = 6 * 3600      # Initial unsupported-model backoff
 MODEL_SITE_BLOCK_MAX_S = 24 * 3600  # Maximum unsupported-model backoff
 # An unsupported model must be routed to a different backend.
@@ -541,14 +553,8 @@ def _parse_not_servable(raw: bytes, status: int):
     return None
 
 
-def _upstream_diagnostic(raw: bytes):
-    """Extract the business code, message and bounded JSON body from an upstream error."""
-    if not raw:
-        return None, None, None
-    try:
-        payload = json.loads(raw.decode("utf-8", "replace"))
-    except (ValueError, UnicodeError, RecursionError):
-        return None, None, None
+def _diagnostic_from_payload(payload):
+    """Extract (code, msg, bounded body) from an upstream JSON payload, for audit only."""
     if not isinstance(payload, dict):
         return None, None, None
     nodes = [payload]
@@ -566,6 +572,25 @@ def _upstream_diagnostic(raw: bytes):
             if isinstance(value, str) and value.strip():
                 msg = msg or value.strip()
     return (code[:64] or None), (msg[:256] or None), (format_log_body(payload, UPSTREAM_BODY_AUDIT_LIMIT) or None)
+
+
+def _upstream_diagnostic(raw: bytes):
+    """Extract the business code, message and bounded JSON body from an upstream error."""
+    if not raw:
+        return None, None, None
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, UnicodeError, RecursionError):
+        return None, None, None
+    return _diagnostic_from_payload(payload)
+
+
+class TokenRefreshRejected(RuntimeError):
+    """The upstream refresh endpoint answered with a business rejection, not a network fault."""
+
+    def __init__(self, message, *, code=None, msg=None, body=None):
+        super().__init__(message)
+        self.code, self.msg, self.body = code, msg, body
 
 
 def _block_model(model: str | None) -> str | None:
@@ -1052,6 +1077,8 @@ class CredentialPool:
             entry["last_failure_at"] = None
             entry["last_error_body"] = None
             entry["auto_disabled"] = None
+            entry["fresh_401s"] = []
+            entry["refresh_rejects"] = 0
             for key in [k for k in self._model_fail if k[0] == entry["id"]]:
                 if self._model_fail[key] > now:
                     changed = True
@@ -1391,8 +1418,8 @@ class CredentialPool:
             if entry is not None:
                 entry["last_error_body"] = body[:8192]
 
-    def _disable_restricted(self, cm, code, *, generation=None):
-        """An upstream restriction is terminal: disable via the WebUI policy, not a cooldown."""
+    def _auto_disable(self, cm, reason, *, generation=None):
+        """A terminal upstream verdict: disable via the WebUI policy, not a cooldown."""
         entry = self._index_cm.get(cm)
         store = CONFIG.get("control_store")
         management = CONFIG.get("management")
@@ -1404,9 +1431,45 @@ class CredentialPool:
                 return
             store.set_credential(identity, False)
             self._sticky.clear()
+            entry["auto_disabled"] = True
         management.gateway.invalidate_model_table()
-        entry["auto_disabled"] = True
-        _log(f"[cred] 上游限制 {code}，账号已自动禁用: {Path(cm.path).name}")
+        _log(f"[cred] {reason}，账号已自动禁用: {Path(cm.path).name}")
+
+    def _note_fresh_401(self, cm, *, generation=None):
+        """A 401 against a just-refreshed token means the account was revoked server-side."""
+        try:
+            age = cm.token_age_s()
+        except Exception:
+            return
+        if age is None or age > 120:
+            return
+        with self._lock, (cm._lock if generation is not None else nullcontext()):
+            if not self._lease_matches(cm, generation):
+                return
+            entry = self._index_cm.get(cm)
+            if entry is None:
+                return
+            now = time.time()
+            strikes = [t for t in entry.get("fresh_401s", []) if now - t < FRESH_401_WINDOW]
+            strikes.append(now)
+            entry["fresh_401s"] = strikes
+            fresh = len(strikes) >= FRESH_401_LIMIT
+            if fresh:
+                entry["fresh_401s"] = []
+        if fresh:
+            self._auto_disable(cm, f"新令牌 {FRESH_401_WINDOW}s 内 {FRESH_401_LIMIT} 次被拒（401）",
+                               generation=generation)
+    def _note_refresh_reject(self, entry, error):
+        """Count consecutive upstream refresh rejections; the refresh token itself is dead."""
+        rejects = entry.get("refresh_rejects", 0) + 1
+        entry["refresh_rejects"] = rejects
+        if error.body:
+            entry["last_error_body"] = error.body[:8192]
+        if rejects < REFRESH_REJECT_LIMIT:
+            return
+        entry["refresh_rejects"] = 0
+        self._auto_disable(entry["cm"], "刷新令牌被上游连续拒绝")
+
 
     def cooldown(self, cm: CredentialManager, reason: str = "", *, generation=None):
         with self._lock, (cm._lock if generation is not None else nullcontext()):
@@ -1431,7 +1494,9 @@ class CredentialPool:
             self._note_error_body(cm, raw, generation=generation)
             code, _, _ = _upstream_diagnostic(raw or b"")
             if status == 403 and code in RESTRICTED_CODES:
-                self._disable_restricted(cm, code, generation=generation)
+                self._auto_disable(cm, f"上游限制 {code}", generation=generation)
+            elif status == 401:
+                self._note_fresh_401(cm, generation=generation)
             return
         if status == 400 and is_channel_check_error(raw):
             # Only a rejection that survived the console retry is account-wide; endpoints without a
@@ -1583,6 +1648,9 @@ class CredentialPool:
                         continue
                     refreshed = cm.refresh_if_due(margin_s, keepalive_s if keepalive_due else 0)
                     entry["keepalive_after"] = 0.0
+                except TokenRefreshRejected as error:
+                    failure = (str(error), cm._generation)
+                    self._note_refresh_reject(entry, error)
                 except Exception as error:
                     failure = (str(error), cm._generation)
                     if keepalive_due:
@@ -1590,6 +1658,7 @@ class CredentialPool:
             if failure:
                 self.cooldown(cm, reason=failure[0], generation=failure[1])
             elif refreshed:
+                entry["refresh_rejects"] = 0
                 _log(f"[cred] {'每日保活刷新' if keepalive_due else '已主动刷新'}并回写: {Path(entry['id']).name}")
 
     def remove_file(self, name: str) -> bool:
