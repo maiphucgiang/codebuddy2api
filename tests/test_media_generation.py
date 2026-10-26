@@ -699,6 +699,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
             {"model": "hunyuan-image-v3.0"},
             {"prompt": "x", "seconds": 0},
             {"prompt": "x", "resolution": "1080P"},
+            {"prompt": "x", "enable_audio": "false"},
             {"seconds": 4},
             {},
         ]
@@ -776,17 +777,17 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertEqual(error["upstream_code"], 10001)
         self.assertIn("route refused", error["message"])
         self.assertEqual(len(self.media_requests), 1)
-        # A video query envelope error leaves the task untouched for the next poll.
+        # A real video query error terminates the task; later polls do not hit upstream again.
         self.image_envelope_error = False
         task_id = self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
         self.video_envelope_error = True
         refused = self.client.get(f"/v1/videos/{task_id}")
         self.assertEqual(refused.status_code, 502)
         self.assertEqual(refused.json()["error"]["upstream_code"], 10005)
-        self.assertEqual(self.store.get_task(task_id)["status"], "queued")
+        self.assertEqual(self.store.get_task(task_id)["status"], "failed")
         self.video_envelope_error = False
         recovered = self.client.get(f"/v1/videos/{task_id}").json()
-        self.assertEqual(recovered["status"], "completed")
+        self.assertEqual(recovered["status"], "failed")
 
     def test_video_whitelist_failure_is_terminal_and_downloads_once(self):
         task_id = self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
@@ -990,6 +991,11 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertEqual(len(self.media_requests), 2)
         for uid in ("cn-cli", "cn2"):
             self.assertLess(self.entry_state(uid)["fail_until"], time.time(), uid)
+        # A model route refusal is account-specific for media and can move to the next account.
+        self.media_replies = [(400, {"error": {"message": "route config not found"}})]
+        result = self.client.post("/v1/images/generations", json={"prompt": "x"})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(len(self.media_requests), 4)
         # A 401 replays the same way and does cool the first account down.
         self.image_statuses = [401]
         first_uid = self.media_requests[-2].headers["x-user-id"]  # First attempt of the 401 pair.
@@ -1007,13 +1013,13 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
     def restricted_pair(self):
         """Two eligible accounts with failover on, so a replay shows up as a second request."""
         self.add_account("cn2", "cn-cli")
-        self.configure_media(profiles=("cn-cli", "cn2", "cn-work", "intl-cli", "intl-work"))
         # A real control store lets a restriction disable the account instead of only cooling it.
         store = ControlStore(self.root / f"control-{self.fixture_sequence}.sqlite3")
         self.addCleanup(store.close)
         management = SimpleNamespace(gateway=SimpleNamespace(invalidate_model_table=lambda: None))
         self.enterContext(patch.dict(converter.CONFIG, {
             "failover_max": 2, "control_store": store, "management": management}))
+        self.configure_media(profiles=("cn-cli", "cn2", "cn-work", "intl-cli", "intl-work"))
         self.media_requests.clear()
 
     def assert_health(self, restricted=None):
@@ -1053,7 +1059,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
                 self.assertEqual(len(self.media_requests), 1)
                 self.assert_health(self.media_requests[0].headers["x-user-id"])
 
-    def test_bound_video_query_records_the_restriction_and_keeps_the_task(self):
+    def test_bound_video_query_records_the_restriction_and_stops_the_task(self):
         self.restricted_pair()
         self.video_task_status = "processing"
         task_id = self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
@@ -1063,7 +1069,9 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertEqual(result.status_code, 403, result.text)
         self.assertEqual([r.headers["x-user-id"] for r in self.media_requests], [bound, bound])
         self.assert_health(bound)
-        self.assertEqual(self.store.get_task(task_id)["status"], "queued")
+        self.assertEqual(self.store.get_task(task_id)["status"], "failed")
+        self.assertEqual(self.client.get(f"/v1/videos/{task_id}").json()["status"], "failed")
+        self.assertEqual([r.headers["x-user-id"] for r in self.media_requests], [bound, bound])
 
     def test_model_scoped_codes_are_not_replayed_and_do_not_cool(self):
         for status, code in ((429, 11129), (403, 11129), (403, 11148)):

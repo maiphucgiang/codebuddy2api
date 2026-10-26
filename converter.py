@@ -5159,6 +5159,7 @@ MEDIA_IMAGE_GENERATE = _MediaAction("image-generate", "/v2/images/generations", 
 MEDIA_IMAGE_EDIT = _MediaAction("image-edit", "/v2/images/edits", MEDIA_IMAGE_TIMEOUT)
 MEDIA_VIDEO_SUBMIT = _MediaAction("video-submit", "/v2/videos/generations", MEDIA_VIDEO_SUBMIT_TIMEOUT)
 MEDIA_VIDEO_QUERY = _MediaAction("video-query", "/v2/videos/tasks", MEDIA_VIDEO_QUERY_TIMEOUT)
+_MEDIA_ROUTE_REFUSED = re.compile(r"route config not found|model .{0,80}(?:not found|not supported|not served)", re.I)
 
 
 def _media_store():
@@ -5325,6 +5326,10 @@ def _media_replayable(error) -> bool:
     if isinstance(error, UpstreamHTTPError):
         # Restricted and model-scoped refusals would fail the same way on another account.
         code = _upstream_diagnostic(error.raw)[0]
+        if error.status in (400, 404):
+            raw = error.raw.decode("utf-8", "replace") if error.raw else ""
+            return (_parse_not_servable(error.raw, error.status) is not None
+                    or bool(_MEDIA_ROUTE_REFUSED.search(raw)))
         return error.status in (401, 403, 429) and code not in NO_FAILOVER_UPSTREAM_CODES
     return isinstance(error, REPLAYABLE_TRANSPORT)
 
@@ -5473,9 +5478,20 @@ async def _media_video_refresh(task_id: str, rid: str) -> dict:
         if task["status"] in ("completed", "failed"):
             return task
         cred, headers = await run_in_threadpool(_media_bound_cred, task["account_key"])
-        status, urls, credit, message = await _media_call(
-            MEDIA_VIDEO_QUERY, {"task_id": task_id}, rid, model=task["model"],
-            parse=media_generation.parse_video_task, cred=cred, headers=headers, allow_failover=False)
+        try:
+            status, urls, credit, message = await _media_call(
+                MEDIA_VIDEO_QUERY, {"task_id": task_id}, rid, model=task["model"],
+                parse=media_generation.parse_video_task, cred=cred, headers=headers, allow_failover=False)
+        except HTTPException as error:
+            detail = error.detail.get("error") if isinstance(error.detail, dict) else None
+            message = detail.get("message") if isinstance(detail, dict) else None
+            message = sanitize_log_text(str(message or "视频任务轮询失败"), 500)
+            try:
+                await run_in_threadpool(store.update_task, task_id, status="failed", error=message)
+            except Exception as store_error:
+                _log(f"[{rid}] ✗ 视频任务失败状态写入失败 | {task_id} | "
+                     f"{type(store_error).__name__}")
+            raise
         media_id = None
         if status == "failed":
             await run_in_threadpool(store.update_task, task_id, status="failed",

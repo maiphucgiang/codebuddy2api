@@ -175,6 +175,8 @@ def video_request_body(model: str, *, prompt=None, seconds=None, resolution=None
     if aspect_ratio is not None:
         extra["aspect_ratio"] = _clean_text(aspect_ratio, "aspect_ratio", 32)
     if enable_audio is not None:
+        if type(enable_audio) is not bool:
+            raise ValueError("enable_audio 必须是布尔值")
         extra["enable_audio"] = bool(enable_audio)
     if extra:
         body["extra_parameters"] = extra
