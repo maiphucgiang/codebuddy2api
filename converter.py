@@ -35,11 +35,14 @@ from starlette.concurrency import run_in_threadpool
 import uvicorn as uvicorn  # Keep the existing embedding/test hook.
 
 try:
-    from app.desensitize import desensitize_body
+    from app.desensitize import desensitize_body, desensitize_channel_body
 except ImportError:  # Disable desensitization when its module is unavailable.
     def desensitize_body(body, roles=("system",), desensitize_harness_user=False,
                          desensitize_tools=False, compact_harness=False,
                          strip_tool_metadata=False):
+        return body
+
+    def desensitize_channel_body(body):
         return body
 
 from app.adapters.responses_adapter import (
@@ -4955,6 +4958,7 @@ def _note_content_filter(rid, model_name, *, final):
 
 
 def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
+    body = desensitize_channel_body(body)
     if not CONFIG.get("desensitize"):
         return body
     return desensitize_body(

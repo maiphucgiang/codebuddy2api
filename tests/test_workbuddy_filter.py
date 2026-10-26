@@ -441,6 +441,22 @@ class EndpointFilterTests(unittest.TestCase):
                 observability._current.reset(token)
 
 
+    def test_channel_identity_guard_is_independent_of_template_switch(self):
+        source = "You are an AI agent powered by DeepSeek Harness."
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch.dict(converter.CONFIG, {
+                "desensitize": enabled, "no_compact": True, "keep_tool_metadata": False,
+            }):
+                body = {"model": "auto", "messages": [
+                    {"role": "system", "content": source},
+                    {"role": "assistant", "content": source},
+                    {"role": "user", "content": source},
+                ]}
+                out = converter._chat_body_desensitize(body)
+                self.assertEqual(out["messages"][0]["content"], "You are a helpful AI assistant.")
+                self.assertEqual(out["messages"][1]["content"], "You are a helpful AI assistant.")
+                self.assertEqual(out["messages"][2]["content"], source)
+
     def test_short_template_is_not_expanded_for_filter_retry(self):
         self.respond = lambda req: reply()
         for route in ROUTES:

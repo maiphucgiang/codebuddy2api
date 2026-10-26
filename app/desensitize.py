@@ -127,6 +127,8 @@ _TEMPLATE_REPLACEMENTS = tuple(
     )
 )
 _WORKBUDDY_IDENTITY_PATTERN = _template_pattern(_WORKBUDDY_IDENTITY)
+_CHANNEL_IDENTITY_PATTERN = _template_pattern("You are an AI agent powered by DeepSeek Harness")
+_CHANNEL_IDENTITY_FIXED = "You are a helpful AI assistant"
 _GIT_STATUS_CONTEXT = re.compile(
     r"^\s*(?:gitStatus:\s*|#\s*gitStatus\s*\n)"
     r"This is the git status at the start of the conversation\.", re.IGNORECASE | re.MULTILINE,
@@ -224,6 +226,13 @@ def desensitize_text(text: str) -> str:
         return desensitize_text(text[:context.start()]) + _replace_git_status_text(text[context.start():])[0]
     text = _replace_workbuddy_templates(text)
     return _PATTERN.sub(lambda m: _zero_width_split(m.group(0)), text)
+
+
+def desensitize_channel_text(text: str) -> str:
+    """Replace only the known DSH channel identity sentence."""
+    if not text:
+        return text
+    return _CHANNEL_IDENTITY_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
 
 
 def _iter_text_blocks(content):
@@ -398,6 +407,30 @@ def desensitize_body(body: dict, roles: tuple[str, ...] = ("system",),
         nb["tools"] = _desensitize_tool_value(body["tools"], strip_metadata=strip_tool_metadata)
         changed = True
     return nb if changed else body
+
+
+def desensitize_channel_body(body: dict) -> dict:
+    """Remove the known channel identity from instruction and assistant text."""
+    if not body.get("messages"):
+        return body
+    messages = []
+    for message in body["messages"]:
+        if not isinstance(message, dict) or message.get("role") not in ("system", "developer", "assistant"):
+            messages.append(message)
+            continue
+        adapted = dict(message)
+        content = message.get("content")
+        if isinstance(content, str):
+            adapted["content"] = desensitize_channel_text(content)
+        elif isinstance(content, list):
+            adapted["content"] = [
+                {**block, "text": desensitize_channel_text(block["text"])}
+                if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+                else block
+                for block in content
+            ]
+        messages.append(adapted)
+    return {**body, "messages": messages}
 
 
 # ---------------------------------------------------------------------------

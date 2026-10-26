@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app import desensitize as desensitize_module
 from app.desensitize import desensitize_body, desensitize_text
 
 
@@ -137,6 +138,49 @@ class WorkBuddyBodyTests(unittest.TestCase):
                                 ),
                                 out,
                             )
+
+    def test_channel_identity_guard_covers_instruction_and_assistant_roles(self):
+        source = "You are an AI agent powered by DeepSeek Harness"
+        expected = "You are a helpful AI assistant"
+        variants = (
+            source,
+            source.upper(),
+            re.sub(r" +", "\t \n", source),
+            re.sub(r"([A-Za-z])([A-Za-z]+)", rf"\1{ZWSP}\2", source),
+        )
+        for role in ("system", "developer", "assistant"):
+            for blocks in (False, True):
+                for variant in variants:
+                    for suffix in ("", ".", "\nNext instruction."):
+                        with self.subTest(role=role, blocks=blocks, suffix=suffix):
+                            body = {"messages": [{"role": role, "content": text_content(variant + suffix, blocks)}]}
+                            before = copy.deepcopy(body)
+                            out = desensitize_module.desensitize_channel_body(body)
+                            self.assertEqual(out["messages"][0]["content"], text_content(expected + suffix, blocks))
+                            self.assertEqual(body, before)
+                            self.assertEqual(desensitize_module.desensitize_channel_body(out), out)
+
+    def test_channel_identity_guard_is_narrow_and_preserves_message_fields(self):
+        source = "You are an AI agent powered by DeepSeek Harness."
+        quoted = CLAUDE_CLI + ". You are a coding agent powered by the deepseek-v4.1-flash model."
+        body = {"messages": [
+            {"role": "user", "content": source},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": source, "cache_control": {"type": "ephemeral"}},
+                {"type": "other", "text": source},
+            ], "tool_calls": [{"id": "call_1", "function": {"arguments": source}}]},
+            {"role": "assistant", "content": quoted},
+            {"role": "tool", "content": source},
+        ]}
+        before = copy.deepcopy(body)
+        out = desensitize_module.desensitize_channel_body(body)
+        self.assertEqual(out["messages"][0], before["messages"][0])
+        self.assertEqual(out["messages"][1]["content"][0]["text"], "You are a helpful AI assistant.")
+        self.assertEqual(out["messages"][1]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(out["messages"][1]["content"][1], before["messages"][1]["content"][1])
+        self.assertEqual(out["messages"][1]["tool_calls"], before["messages"][1]["tool_calls"])
+        self.assertEqual(out["messages"][2:], before["messages"][2:])
+        self.assertEqual(body, before)
 
     def test_separate_system_messages_are_each_adapted(self):
         for compact in (False, True):
