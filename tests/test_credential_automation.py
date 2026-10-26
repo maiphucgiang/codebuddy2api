@@ -4,9 +4,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import converter
-from app import checkin, credits, model_policy
+from app import checkin, credits, daily_chat, growth_tasks, model_policy
 from app.control_store import ControlStore
 from tests import test_credential_actions as fixtures
 
@@ -15,7 +16,10 @@ class AutomationTests(unittest.TestCase):
     add_account = fixtures.CredentialActionTests.add_account
     configure = fixtures.CredentialActionTests.configure
     handle_upstream = fixtures.CredentialActionTests.handle_upstream
-    setUp = fixtures.CredentialActionTests.setUp
+    def setUp(self):
+        fixtures.CredentialActionTests.setUp(self)
+        management = SimpleNamespace(gateway=SimpleNamespace(invalidate_model_table=lambda: None))
+        self.enterContext(patch.dict(converter.CONFIG, {"management": management}))
 
     def preference(self, entry, field, enabled):
         response = self.client.patch('/admin/credentials/' + entry['account_key'], json={field: enabled})
@@ -175,6 +179,60 @@ class AutomationTests(unittest.TestCase):
             balance.assert_not_called()
             trial.assert_not_called()
 
+
+    def test_checkin_restriction_disables_account_and_stops_followup(self):
+        entry = self.entry
+        self.status_query.return_value = {"state": "available"}
+        with patch.object(credits, "daily_checkin", return_value={"ok": False, "code": 11140}),              patch.object(growth_tasks, "sweep_account") as growth,              patch.object(credits, "fetch_credits") as balance:
+            result = converter._sync_credits(self.pool, self.ledger, entry, checkin=True, failed=set())
+        self.assertIsNone(result)
+        self.assertTrue(self.pool._index_cm[entry["cm"]]["auto_disabled"])
+        self.assertFalse(model_policy.credential_enabled(converter.CONFIG, entry))
+        self.travel_mock.assert_not_called()
+        growth.assert_not_called()
+        balance.assert_not_called()
+
+    def test_daily_chat_restriction_disables_account_and_skips_balance(self):
+        entry = self.entries["intl-work"]
+        self.preference(entry, "auto_daily_chat", True)
+        with patch.object(daily_chat, "is_due", return_value=True),              patch.object(daily_chat, "perform", return_value={
+                 "ok": False, "state": "rejected", "http_status": 403, "code": 11140}),              patch.object(credits, "fetch_credits") as balance:
+            result = converter._sync_credits(self.pool, self.ledger, entry, checkin=True, failed=set())
+        self.assertIsNone(result)
+        self.assertTrue(self.pool._index_cm[entry["cm"]]["auto_disabled"])
+        self.assertFalse(model_policy.credential_enabled(converter.CONFIG, entry))
+        balance.assert_not_called()
+
+    def test_growth_exception_restriction_disables_account_and_skips_balance(self):
+        entry = self.entry
+        self.preference(entry, "auto_checkin", False)
+        self.preference(entry, "auto_travel", False)
+        self.preference(entry, "auto_growth", True)
+        with patch.object(growth_tasks, "sweep_account",
+                          side_effect=growth_tasks.Failure("business", 403, 11140)) as growth,              patch.object(credits, "fetch_credits") as balance:
+            result = converter._sync_credits(self.pool, self.ledger, entry, checkin=True, failed=set())
+        self.assertIsNone(result)
+        self.assertTrue(self.pool._index_cm[entry["cm"]]["auto_disabled"])
+        self.assertFalse(model_policy.credential_enabled(converter.CONFIG, entry))
+        growth.assert_called_once()
+        balance.assert_not_called()
+
+    def test_background_nonrestriction_errors_do_not_disable_or_cool(self):
+        entry = self.entry
+        self.preference(entry, "auto_checkin", False)
+        self.preference(entry, "auto_travel", False)
+        self.preference(entry, "auto_growth", True)
+        for code in (1001, 11134):
+            with self.subTest(code=code), \
+                 patch.object(growth_tasks, "sweep_account",
+                              side_effect=growth_tasks.Failure("business", 403, code)), \
+                 patch.object(credits, "fetch_credits", return_value={"credits": 10, "intl": False}):
+                result = converter._sync_credits(self.pool, self.ledger, entry, checkin=True, failed=set())
+            self.assertIsNotNone(result)
+            internal = self.pool._index_cm[entry["cm"]]
+            self.assertIsNone(internal.get("auto_disabled"))
+            self.assertEqual(internal["fail_until"], 0.0)
+            self.assertTrue(model_policy.credential_enabled(converter.CONFIG, entry))
 
     def test_cookie_preferences_require_csrf(self):
         self.client.headers.pop('authorization')

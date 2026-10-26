@@ -168,6 +168,25 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(summary["errors"], 1)
         self.assertFalse(summary["ok"])
 
+    def test_account_restriction_aborts_remaining_claims(self):
+        default_tasks = [raw_task("chat_5", current=5, target=5),
+                         raw_task("create_canvas", current=1, target=1)]
+        fake = FakeGrowth(default_tasks, [])
+        original_transport = fake.transport
+
+        def restricted(request):
+            if request.url.path.endswith("/chat_5/claim"):
+                return httpx.Response(403, json=envelope({}, code=11140))
+            return original_transport(request)
+
+        fake.transport = restricted
+        summary = with_fake(fake, growth_tasks.sweep_account, "tok")
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["error"]["code"], 11140)
+        self.assertEqual(summary["claimed"], [])
+        self.assertEqual(fake.requests_to("/activity/growth/tasks/create_canvas/claim"), [])
+
     def test_idempotent_second_pass_makes_no_write(self):
         tasks = [raw_task("chat_5", current=5, target=5, accept="claimed")]
         first = FakeGrowth([raw_task("chat_5", current=5, target=5, accept="accepted")], [])

@@ -242,6 +242,23 @@ class EnvironmentConfigTests(unittest.TestCase):
                          ('passthrough', 0))
         self.assertTrue(all(items[key]['source'] == 'cli' and items[key]['locked']
                             for key in ('responses_projection_mode', 'responses_projection_max_bytes')))
+    def test_prompt_mode_precedence_and_validation(self):
+        _, items, config = self.start(saved={'prompt_mode': 'prepend'})
+        self.assertEqual(config['prompt_mode'], 'prepend')
+        self.assertEqual(items['prompt_mode']['source'], 'management')
+        self.assertEqual(items['prompt_mode']['choices'], ['empty', 'prepend'])
+        _, items, config = self.start({'CODEBUDDY2API_PROMPT_MODE': 'prepend'})
+        self.assertEqual(config['prompt_mode'], 'prepend')
+        self.assertTrue(items['prompt_mode']['locked'])
+        _, items, config = self.start({'CODEBUDDY2API_PROMPT_MODE': 'invalid'},
+                                      cli=('--prompt-mode=prepend',), saved={'prompt_mode': 'empty'})
+        self.assertEqual(config['prompt_mode'], 'prepend')
+        self.assertEqual(items['prompt_mode']['source'], 'cli')
+        with self.assertRaises(ValueError):
+            self.start({'CODEBUDDY2API_PROMPT_MODE': 'invalid'})
+        _, _, config = self.start()
+        self.assertEqual(config['prompt_mode'], 'empty')
+
     def test_request_context_mode_precedence_and_validation(self):
         _, items, config = self.start(saved={'request_context_mode': 'scoped'})
         self.assertEqual(config['request_context_mode'], 'scoped')

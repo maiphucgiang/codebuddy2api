@@ -341,6 +341,39 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
         revived = self.pool(self.credential())
         self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, revived._entries[0]))
 
+    def test_model_restriction_cools_only_the_model_and_survives_restart(self):
+        path = self.credential()
+        pool = self.pool(path)
+        entry = pool._entries[0]
+        body = json.dumps({"code": 11148, "msg": "model forbidden"}).encode()
+        before = time.time()
+        pool.note_status(entry["cm"], 403, model=MODEL, raw=body)
+        self.assertTrue(pool._healthy(entry))
+        self.assertIsNone(entry.get("auto_disabled"))
+        self.assertFalse(pool._model_healthy(entry, MODEL))
+        self.assertTrue(pool._model_healthy(entry, "another-model"))
+        self.assertAlmostEqual(pool._model_fail[(entry["id"], MODEL)] - before, 1800, delta=2)
+        revived = self.pool(self.credential())
+        self.assertTrue(revived._healthy(revived._entries[0]))
+        self.assertFalse(revived._model_healthy(revived._entries[0], MODEL))
+
+    def test_model_scoped_errors_do_not_penalize_account_or_model(self):
+        for status, code in ((500, 11134), (503, 11134), (400, 11129),
+                             (400, 11150), (400, 11158)):
+            with self.subTest(status=status, code=code):
+                pool = self.pool(self.credential(name=f"{code}-{status}.info",
+                                                 uid=f"synthetic-{code}-{status}"))
+                entry = pool._entries[0]
+                message = "model [shared-model] not supported" if code == 11150 else "synthetic model failure"
+                body = json.dumps({"code": code, "msg": message}).encode()
+                pool.note_status(entry["cm"], status, model=MODEL, raw=body)
+                self.assertTrue(pool._healthy(entry))
+                self.assertTrue(pool._model_healthy(entry, MODEL))
+                self.assertIsNone(entry.get("auto_disabled"))
+                self.assertEqual(entry["fail_until"], 0.0)
+                self.assertEqual(pool._model_fail, {})
+                self.assertEqual(pool._blocks.view(), {})
+
     def test_plain_403_cooldowns_without_disabling(self):
         pool = self.pool(self.credential())
         store = converter_local_ControlStore(self.root / "control.sqlite3")

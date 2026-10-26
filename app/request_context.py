@@ -62,8 +62,30 @@ def _content_parts(content):
 @dataclass(frozen=True)
 class Attempt:
     id: str
+    request_id: str
+    trace_id: str
     index: int
     span: str
+
+
+_WORKBUDDY_PROFILES = frozenset({"cn-work", "intl-work"})
+
+
+def _uuid_text(value):
+    return str(uuid.UUID(hex=value)) if isinstance(value, str) and len(value) == 32 else str(value)
+
+
+def build_attempt_headers(headers, profile, *, root, message_id, request_id, trace_id, span, parent):
+    """Build one upstream attempt with profile-specific ID relationships."""
+    if profile in _WORKBUDDY_PROFILES:
+        message_id, request_id = _uuid_text(message_id), _uuid_text(request_id)
+    else:
+        request_id, trace_id = message_id, root
+    return {**headers, "X-Request-ID": request_id, "X-Conversation-Message-ID": message_id,
+            "X-Conversation-Request-ID": root, "X-Root-Request-ID": root, "X-Trace-ID": trace_id,
+            "traceparent": f"00-{trace_id}-{span}-01", "b3": f"{trace_id}-{span}-1-{parent}",
+            "X-B3-TraceId": trace_id, "X-B3-SpanId": span, "X-B3-ParentSpanId": parent,
+            "X-B3-Sampled": "1"}
 
 
 class RequestContext:
@@ -119,18 +141,19 @@ class RequestContext:
     def start_attempt(self):
         with self._lock:
             self._attempt_index += 1
-            self.attempt = Attempt(uuid.uuid4().hex, self._attempt_index, secrets.token_hex(8))
+            self.attempt = Attempt(id=uuid.uuid4().hex, request_id=uuid.uuid4().hex,
+                                   trace_id=uuid.uuid4().hex, index=self._attempt_index,
+                                   span=secrets.token_hex(8))
             return self.attempt
 
-    def attempt_headers(self, headers, attempt):
+    def attempt_headers(self, headers, attempt, profile=None):
         if not self.scoped:
             return dict(headers)
-        root, span = self.request_id, attempt.span
-        return {**headers, "X-Request-ID": attempt.id, "X-Conversation-Message-ID": attempt.id,
-                "X-Conversation-Request-ID": root, "X-Root-Request-ID": root, "X-Trace-ID": root,
-                "traceparent": f"00-{root}-{span}-01", "b3": f"{root}-{span}-1-{self._root_span}",
-                "X-B3-TraceId": root, "X-B3-SpanId": span, "X-B3-ParentSpanId": self._root_span,
-                "X-B3-Sampled": "1"}
+        return build_attempt_headers(
+            headers, profile, root=self.request_id, message_id=attempt.id,
+            request_id=attempt.request_id, trace_id=attempt.trace_id,
+            span=attempt.span, parent=self._root_span,
+        )
 
     def attempt_metadata(self):
         data = {"request_id": self.request_id, "session_source": self.session_source}

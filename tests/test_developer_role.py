@@ -63,12 +63,11 @@ class DeveloperRoleNormalization(unittest.TestCase):
         ])
         self.assertNotIn("developer", [m["role"] for m in body["messages"]])
 
-    def test_missing_system_still_gets_placeholder(self):
-        """Retain placeholder instructions when no system or developer message exists."""
+    def test_missing_system_has_no_gateway_default(self):
+        """Do not add a gateway prompt when prompt mode is empty."""
         body = _prepare([{"role": "user", "content": "hi"}])
-        self.assertEqual(body["messages"][0]["role"], "system")
-        self.assertEqual(body["messages"][0]["content"], "You are a helpful assistant.")
-
+        self.assertEqual([m["role"] for m in body["messages"]], ["user"])
+        self.assertNotIn("system", [m["role"] for m in body["messages"]])
 
 class CallerPayloadNotMutated(unittest.TestCase):
     """Normalize upstream copies without mutating caller-owned payloads."""
