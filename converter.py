@@ -35,7 +35,8 @@ from starlette.concurrency import run_in_threadpool
 import uvicorn as uvicorn  # Keep the existing embedding/test hook.
 
 try:
-    from app.desensitize import apply_system_prompt_mode, desensitize_body, desensitize_channel_body
+    from app.desensitize import (apply_system_prompt_mode, desensitize_body,
+                                 desensitize_channel_body, system_as_user_body)
 except ImportError:  # Disable desensitization when its module is unavailable.
     def desensitize_body(body, roles=("system",), desensitize_harness_user=False,
                          desensitize_tools=False, compact_harness=False,
@@ -43,6 +44,9 @@ except ImportError:  # Disable desensitization when its module is unavailable.
         return body
 
     def desensitize_channel_body(body):
+        return body
+
+    def system_as_user_body(body):
         return body
 
     def apply_system_prompt_mode(body, profile, mode):
@@ -462,10 +466,12 @@ USAGE_CACHE_MAX_AGE_S = 7 * 24 * 3600   # A cached usage snapshot older than thi
 STICKY_TTL = 30 * 60        # Idle session binding lifetime in seconds
 STICKY_MAX = 512            # Session binding capacity
 CRED_COOLDOWN = 300         # Credential cooldown in seconds
+RESTRICTED_REST = 2 * 3600  # WorkBuddy account restrictions rest for two hours.
 MODEL_COOLDOWN = 600        # Model cooldown when a 429 omits reset time
 MODEL_COOLDOWN_MAX = 86400  # Maximum model cooldown in seconds
 UPSTREAM_BODY_AUDIT_LIMIT = 256 * 1024  # Bounded upstream error JSON kept per failed attempt.
 RESTRICTED_CODES = frozenset({"11140"})  # Upstream account-restriction codes; disable, never requeue.
+RESTRICTED_REASON = "上游限制 11140"
 MODEL_RESTRICTED_CODES = frozenset({"11148"})
 MODEL_SCOPED_ERROR_CODES = frozenset({"11102", "11129", "11134", "11150", "11158"})
 # 11102 keeps its dedicated console-confirmed model failover.
@@ -984,9 +990,22 @@ class CredentialPool:
             record = store.snapshot()["credentials"].get(entry["account_key"]) or {}
         except Exception:
             return
-        if record.get("auto_disabled") is not True or record.get("enabled", True):
+        if record.get("auto_disabled") is not True:
             return
-        entry["auto_disabled"] = True
+        reason = record.get("auto_reason")
+        if reason == RESTRICTED_REASON:
+            at = record.get("auto_at")
+            try:
+                until = float(at) + RESTRICTED_REST
+            except (TypeError, ValueError):
+                until = 0.0
+            entry.update(restricted=True, restricted_until=until, auto_disabled=True)
+            if until > 0:
+                entry["fail_until"] = max(entry.get("fail_until") or 0.0, until)
+        elif record.get("enabled", True):
+            return
+        else:
+            entry["auto_disabled"] = True
         if record.get("auto_reason"):
             entry["last_error"] = record["auto_reason"]
         if record.get("auto_body"):
@@ -1103,6 +1122,8 @@ class CredentialPool:
             entry["last_failure_at"] = None
             entry["last_error_body"] = None
             entry["auto_disabled"] = None
+            entry["restricted"] = None
+            entry["restricted_until"] = None
             entry["fresh_401s"] = []
             entry["refresh_rejects"] = 0
             for key in [k for k in self._model_fail if k[0] == entry["id"]]:
@@ -1116,6 +1137,59 @@ class CredentialPool:
                 durable = self._cooldowns.forget(entry["account_key"])["durable"]
             self._warn_storage("cooldown", durable)
             return {"changed_in_memory": changed, "durable": durable}
+
+    def expire_restrictions(self) -> int:
+        """Release WorkBuddy restrictions whose two-hour local rest has elapsed."""
+        now = time.time()
+        with self._lock:
+            identities = [entry.get("account_key") for entry in self._entries
+                          if entry.get("restricted") is True
+                          and float(entry.get("restricted_until") or 0.0) <= now]
+        released = 0
+        for identity in identities:
+            if not identity:
+                continue
+            try:
+                self.release_restriction(identity, automatic=True)
+            except Exception as error:
+                _log(f"[cred] 官方限制到期解除失败: {sanitize_log_text(str(error), 200)}")
+                continue
+            released += 1
+        return released
+
+    def release_restriction(self, identity: str, *, automatic=False) -> dict:
+        """Release one restricted account after expiry or an operator appeal."""
+        with self._lock:
+            entry = next((item for item in self._entries if item.get("account_key") == identity), None)
+            if entry is None:
+                raise KeyError(identity)
+            if not entry.get("restricted"):
+                return {"changed": False, "durable": True}
+            store = CONFIG.get("control_store")
+            if store is not None:
+                store.set_credential(identity, True)
+            entry["fail_until"] = 0.0
+            entry["last_error"] = None
+            entry["last_failure_at"] = None
+            entry["last_error_body"] = None
+            entry["auto_disabled"] = None
+            entry["restricted"] = None
+            entry["restricted_until"] = None
+            entry["fresh_401s"] = []
+            entry["refresh_rejects"] = 0
+            for key in [key for key in self._model_fail if key[0] == entry["id"]]:
+                del self._model_fail[key]
+            if self._durable_identity(entry):
+                durable = self._cooldowns.forget(entry["account_key"])["durable"]
+            else:
+                durable = True
+            self._sticky.clear()
+            self._queue_sync(entry["id"])
+        management = CONFIG.get("management")
+        if management is not None:
+            management.gateway.invalidate_model_table()
+        _log(f"[cred] {'官方限制到期' if automatic else '申诉后'}解除: {Path(entry['id']).name}")
+        return {"changed": True, "durable": durable}
 
     def entries(self) -> list[dict]:
         """Return credential snapshots for account maintenance."""
@@ -1131,6 +1205,7 @@ class CredentialPool:
         # Explicit mode retries configured paths, including rejected or evicted ones.
         paths = find_auth_files() if self._scan else [Path(cid) for cid in self._configured]
         self.reload(paths, reset=False)
+        self.expire_restrictions()
 
     def fingerprint(self):
         """Return a cheap directory fingerprint so reconcile only runs after a real change."""
@@ -1533,9 +1608,18 @@ class CredentialPool:
         code = str(code or "")
         if cm is None or code not in RESTRICTED_CODES:
             return False
-        self.cooldown(cm, reason=f"上游限制 {code}", generation=generation)
+        now = time.time()
+        with self._lock, (cm._lock if generation is not None else nullcontext()):
+            if not self._lease_matches(cm, generation):
+                return False
+            entry = self._index_cm.get(cm)
+            if entry is None:
+                return False
+            entry.update(last_error=RESTRICTED_REASON, last_failure_at=now,
+                         restricted=True, restricted_until=now + RESTRICTED_REST,
+                         fail_until=now + RESTRICTED_REST)
         self._note_error_body(cm, body, generation=generation)
-        self._auto_disable(cm, f"上游限制 {code}", generation=generation)
+        self._auto_disable(cm, RESTRICTED_REASON, generation=generation)
         return True
 
     def note_status(self, cm: CredentialManager | None, status: int,
@@ -1575,10 +1659,8 @@ class CredentialPool:
                 self._note_fresh_401(cm, generation=generation)
             return
         if status == 400 and is_channel_check_error(raw):
-            # Only a rejection that survived the console retry is account-wide; endpoints without a
-            # console fallback (search, MCP) are left to request-scoped failover.
-            if channel_fallback:
-                self.cooldown(cm, reason="backend channel check (HTTP 400)", generation=generation)
+            # Channel refusal is request-scoped. The chat caller may already have tried /console;
+            # neither endpoint is evidence that this account should leave the routing pool.
             return
         if status != 429 or not model:
             return
@@ -1821,6 +1903,7 @@ def _reconcile_loop(pool: CredentialPool):
     while True:
         time.sleep(CRED_RECONCILE_INTERVAL_S)
         try:
+            pool.expire_restrictions()
             previous = pool.reconcile(previous)
         except Exception as e:
             _log(f"[cred] 目录变更处理异常: {_network_error_text(e)}")
@@ -4395,10 +4478,12 @@ def _check_upstream_status(status, raw, cred, model, *, headers=None, from_chann
 
 
 @asynccontextmanager
-async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred):
-    """Open a chat stream that is HTTP 200, retrying once on /console after a v2 channel rejection."""
+async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred,
+                               on_channel_body=None):
+    """Open a chat stream with one same-account console and role fallback."""
     fallback_url = channel_fallback_url(url)
     from_channel_fallback = False
+    channel_body_retried = False
     while True:
         async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
             if response.status_code == 200:
@@ -4412,6 +4497,23 @@ async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred):
                 _log(f"[{rid}] 上游渠道校验，切换 /console 端点重试 | {model_name}")
                 url, fallback_url, from_channel_fallback = fallback_url, None, True
                 continue
+            if (from_channel_fallback and not channel_body_retried
+                    and response.status_code == 400 and is_channel_check_error(raw)):
+                transformed = system_as_user_body(body)
+                if transformed != body:
+                    try:
+                        _guard_request_size(transformed)
+                    except HTTPException:
+                        transformed = body
+                    if transformed != body:
+                        channel_body_retried = True
+                        body = transformed
+                        if on_channel_body is not None:
+                            on_channel_body(transformed)
+                        observe_attempt("channel_system_as_user_retry", status_code=response.status_code,
+                                        profile=profile_for_headers(headers), upstream_model=body.get("model"))
+                        _log(f"[{rid}] 渠道拒绝，system 指令降级为 user 后同账号重试 | {model_name}")
+                        continue
             _check_upstream_status(response.status_code, raw, cred, body.get("model"),
                                    headers=response.headers, from_channel_fallback=from_channel_fallback)
 
@@ -4459,13 +4561,17 @@ async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *,
     """Collect with bounded repair and one eligible filter retry using a frozen request budget."""
     tool_attempt = 0
     filter_retried = False
+    def update_channel_body(updated):
+        nonlocal body
+        body = updated
+
     collection_limit = (CONFIG.get("max_collect_bytes", 0) if max_collect_bytes is None
                         else max_collect_bytes)
     while True:
         accumulator = ChatSSEAccumulator(max_collect_bytes=collection_limit)
         rejection = None
         async with _checked_chat_stream(url, headers, body, rid=rid, model_name=model_name,
-                                        cred=cred) as response:
+                                        cred=cred, on_channel_body=update_channel_body) as response:
             try:
                 result = await _collect_stream(response, accumulator=accumulator)
             except UpstreamResponseError as error:

@@ -226,7 +226,7 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual([request.url.path for request in self.requests], ["/v2/chat/completions"])
 
-    def test_rejection_on_both_endpoints_cools_the_account_without_failover(self):
+    def test_rejection_on_both_endpoints_does_not_cool_the_account_or_fail_over(self):
         self.configure_profiles("cn-cli", "cn-work")
         self.channel_mode = "always"
         with patch.dict(converter.CONFIG, {"failover_max": 2}):
@@ -236,7 +236,23 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
                          ["/v2/chat/completions", "/console/chat/completions"])
         first_uid = self.requests[0].headers["x-user-id"]
         self.assertEqual(self.requests[1].headers["x-user-id"], first_uid)
-        self.assertGreater(self.current_entry(first_uid)["fail_until"], time.time())
+        self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
+
+    def test_channel_rejection_moves_system_to_user_once_on_same_account(self):
+        self.configure_profiles("cn-cli")
+        self.channel_mode = "always"
+        body = self.payload()
+        body["messages"].insert(0, {"role": "system", "content": "private system instructions"})
+        response = self.client.post("/v1/chat/completions", json=body)
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual([request.url.path for request in self.requests], [
+            "/v2/chat/completions", "/console/chat/completions", "/console/chat/completions"])
+        self.assertEqual(len({request.headers["x-user-id"] for request in self.requests}), 1)
+        moved = json.loads(self.requests[-1].content)
+        self.assertEqual(moved["messages"][0], {"role": "system", "content": "You are a helpful assistant."})
+        self.assertEqual(moved["messages"][1]["role"], "user")
+        self.assertIn("<instructions>\nprivate system instructions", moved["messages"][1]["content"])
+        self.assertLessEqual(self.current_entry(self.requests[0].headers["x-user-id"])["fail_until"], time.time())
     def test_console_model_missing_cools_only_this_account_model(self):
         self.configure_profiles("cn-cli")
         self.channel_mode = "model_missing"

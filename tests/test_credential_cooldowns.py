@@ -341,6 +341,32 @@ class PoolCooldownPersistenceTests(unittest.TestCase):
         revived = self.pool(self.credential())
         self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, revived._entries[0]))
 
+    def test_restriction_uses_two_hour_rest_and_releases_after_expiry(self):
+        path = self.credential()
+        pool = self.pool(path)
+        store = converter_local_ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(store.close)
+        identity = pool._entries[0]["account_key"]
+        store.set_credential(identity, True)
+        management = SimpleNamespace(gateway=SimpleNamespace(
+            invalidate_model_table=lambda: None))
+        self.enterContext(patch.dict(converter.CONFIG, {"control_store": store, "management": management}))
+        before = time.time()
+        pool.note_status(pool._entries[0]["cm"], 403,
+                         raw=json.dumps({"code": 11140, "msg": "request illegal"}).encode())
+        entry = pool._entries[0]
+        self.assertTrue(entry["restricted"])
+        self.assertAlmostEqual(entry["restricted_until"] - before, converter.RESTRICTED_REST, delta=2)
+        self.assertEqual(pool.cooldown_detail(), [])
+        revived = self.pool(self.credential())._entries[0]
+        self.assertTrue(revived["restricted"])
+        self.assertFalse(converter.model_policy.credential_enabled(converter.CONFIG, revived))
+        entry["restricted_until"] = time.time() - 1
+        pool.expire_restrictions()
+        self.assertIsNone(entry.get("restricted"))
+        self.assertTrue(store.snapshot()["credentials"][identity]["enabled"])
+        self.assertTrue(converter.model_policy.credential_enabled(converter.CONFIG, entry))
+
     def test_model_restriction_cools_only_the_model_and_survives_restart(self):
         path = self.credential()
         pool = self.pool(path)
