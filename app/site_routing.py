@@ -146,6 +146,8 @@ def chat_url_for_headers(headers: dict) -> str:
 def search_url_for_headers(headers: dict) -> str:
     return PROFILE_ENDPOINTS[profile_for_headers(headers)] + "/agenttool/v1/search"
 
+def fetch_url_for_headers(headers: dict) -> str:
+    return PROFILE_ENDPOINTS[profile_for_headers(headers)] + "/agenttool/v1/webfetch"
 
 def refresh_url_for_auth(auth: dict) -> str:
     return PROFILE_ENDPOINTS[profile_for_auth(auth)] + _REFRESH_PATH

@@ -40,7 +40,7 @@ Everything below the gateway is simulated; everything in it is the real code. Re
 | Inference | Chat Completions, Responses and Anthropic Messages stream a simulated reply that quotes your message, with reasoning where the model supports it |
 | Automation | Check-in, Buddy travel (a trip takes three minutes), growth tasks, trial credits and the international active check-in |
 | Sign-in | Adding an account signs in a new synthetic account by itself after four seconds; the official login link it shows never needs to be opened |
-| Search and MCP | `/v1/search` and the MCP `web_search` tool return results on `example.com` |
+| Search, fetch and MCP | `/v1/search`, `/v1/fetch` and the MCP `web_search` / `web_fetch` tools return simulated results on `example.com` |
 | Updates | The release list holds only the current version, the mirror speed test downloads a simulated archive, and installing is disabled |
 
 Upstream state lives in memory and starts over on every launch, while the gateway's own data stays in the data directory.

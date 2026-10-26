@@ -40,7 +40,7 @@ CODEBUDDY_WEBUI_PROXY=http://127.0.0.1:8790 vp dev   # http://127.0.0.1:5174
 | 推理 | Chat Completions、Responses 和 Anthropic Messages 都会流式返回引用你消息的模拟回复，支持推理的模型带推理内容 |
 | 自动化 | 签到、Buddy 旅行（一趟 3 分钟）、成长任务、体验积分和国际站活跃打卡 |
 | 登录 | 添加账号会在 4 秒后自动登录一个新的合成账号；界面上显示的官方登录链接无需打开 |
-| 搜索与 MCP | `/v1/search` 和 MCP 的 `web_search` 工具返回 `example.com` 上的结果 |
+| 搜索、抓取与 MCP | `/v1/search`、`/v1/fetch` 及 MCP 的 `web_search`／`web_fetch` 工具返回 `example.com` 上的模拟结果 |
 | 更新 | 发布列表只有当前版本，镜像测速下载的是模拟发布包，安装已停用 |
 
 上游状态保存在内存里，每次启动都会重置；网关自己的数据保存在数据目录中。

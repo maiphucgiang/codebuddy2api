@@ -7,6 +7,7 @@ import os
 import time
 from typing import Any
 
+from app import server_tools
 from app.reasoning import extract_reasoning_text, map_reasoning_controls
 from app.upstream_io import (StreamOutputBudget, merge_tool_call_delta, new_tool_state,
                              seal_tool_identities, tool_identity_complete)
@@ -63,10 +64,17 @@ def anthropic_request_to_chat(body: dict) -> dict:
     if "max_tokens" in body:
         chat["max_tokens"] = body["max_tokens"]
 
-    # tools
+    # tools; Anthropic server-side web tools are executed by the gateway itself.
     tools = body.get("tools")
-    if tools:
-        chat["tools"] = _convert_anthropic_tools(tools)
+    if isinstance(tools, list) and tools:
+        plain, spec = server_tools.split_server_tools(tools)
+        converted = _convert_anthropic_tools(plain)
+        if spec:
+            taken = {t.get("name") for t in plain if isinstance(t, dict)}
+            converted = converted + server_tools.injected_chat_tools(spec, taken)
+            chat["_server_tools"] = spec
+        if converted:
+            chat["tools"] = converted
 
     if "tool_choice" in body:
         tc = body["tool_choice"]
@@ -263,8 +271,11 @@ class AnthropicStreamConverter:
         self.created_at = int(time.time())
 
         # Stream state
+        # Stream state
         self._emitted_start = False
-
+        # Executed gateway web tools to prepend as protocol-native blocks.
+        self._server_tool_seeds: list[dict] = []
+        self._seed_blocks: list[dict] = []
         # Text block state
         self._text_content = ""
         self._text_block_open = False
@@ -382,6 +393,59 @@ class AnthropicStreamConverter:
                 raise ValueError("validated tool metadata does not match stream items")
             slot["validated"] = True
 
+    def seed_server_tools(self, records) -> None:
+        """Queue executed gateway web-tool records; emitted as leading blocks."""
+        self._server_tool_seeds = list(records or [])
+
+    def _seed_events(self) -> list[str]:
+        """Emit server_tool_use plus web tool result blocks for executed calls."""
+        events: list[str] = []
+        blocks: list[dict] = []
+        for record in self._server_tool_seeds:
+            use_idx = self._next_block_idx
+            self._next_block_idx += 1
+            res_idx = self._next_block_idx
+            self._next_block_idx += 1
+            use_block = {"type": "server_tool_use",
+                         "id": record.get("id") or _rand_id("srvtoolu_"),
+                         "name": record.get("name") or "web_search",
+                         "input": record.get("input") or {}}
+            events.append(self._evt("content_block_start",
+                                    {"index": use_idx, "content_block": use_block}))
+            events.append(self._evt("content_block_stop", {"index": use_idx}))
+            result_block = self._tool_result_block(record)
+            events.append(self._evt("content_block_start",
+                                    {"index": res_idx, "content_block": result_block}))
+            events.append(self._evt("content_block_stop", {"index": res_idx}))
+            blocks.append(use_block)
+            blocks.append(result_block)
+        self._server_tool_seeds = []
+        self._seed_blocks = blocks
+        return events
+
+    def _tool_result_block(self, record: dict) -> dict:
+        tool_use_id = record.get("id") or ""
+        if record.get("error"):
+            error_type = record["error"] if record["error"] == "max_uses_exceeded" else (
+                "web_search_error" if record.get("kind") == "search" else "web_fetch_error")
+            return {"type": f"{record.get('name')}_tool_result", "tool_use_id": tool_use_id,
+                    "content": None, "error": {"type": error_type, "message": record["error"]}}
+        if record.get("kind") == "search":
+            results = []
+            for item in record.get("results") or []:
+                entry = {"type": "web_search_result", "url": item.get("url"),
+                         "title": item.get("title"), "encrypted_content": ""}
+                if item.get("page_age"):
+                    entry["page_age"] = item["page_age"]
+                results.append(entry)
+            return {"type": "web_search_tool_result", "tool_use_id": tool_use_id,
+                    "content": results}
+        fetched = record.get("content") or {}
+        page = {"type": "web_result",
+                "url": fetched.get("url") or (record.get("input") or {}).get("url"),
+                "title": fetched.get("title"), "content": fetched.get("content") or ""}
+        return {"type": "web_fetch_tool_result", "tool_use_id": tool_use_id, "content": [page]}
+
     def get_nonstream_response(self) -> dict:
         """Return the complete non-streaming Message response."""
         content = self._build_content_blocks()
@@ -427,6 +491,7 @@ class AnthropicStreamConverter:
                 }
             }))
             self._emitted_start = True
+            events.extend(self._seed_events())
 
         if chunk.get("usage"):
             self._usage = chunk["usage"]
@@ -686,8 +751,8 @@ class AnthropicStreamConverter:
 
     def _build_content_blocks(self) -> list[dict]:
         """Build content blocks for a non-streaming response."""
-        blocks: list[dict] = []
-
+        """Build content blocks for a non-streaming response."""
+        blocks: list[dict] = list(self._seed_blocks)
         # Thinking must precede text.
         if self._thinking_content:
             blocks.append({"type": "thinking", "thinking": self._thinking_content})

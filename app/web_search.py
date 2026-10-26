@@ -7,9 +7,18 @@ MAX_RESULTS = 10
 QUERY_TIMEOUT = 20
 
 
-def request_body(query: str, max_results: int = DEFAULT_RESULTS) -> dict:
+def request_body(query: str, max_results: int = DEFAULT_RESULTS, *,
+                 allowed_domains=None, freshness: str = "") -> dict:
     count = max(1, min(int(max_results or DEFAULT_RESULTS), MAX_RESULTS))
-    return {"query": query, "type": "text2text", "max_results": count}
+    body = {"query": query, "type": "text2text", "max_results": count}
+    if isinstance(allowed_domains, (list, tuple)):
+        domains = [str(domain).strip() for domain in allowed_domains
+                   if str(domain).strip()]
+        if domains:
+            body["allowed_domains"] = domains
+    if isinstance(freshness, str) and freshness.strip():
+        body["freshness"] = freshness.strip()
+    return body
 
 
 def parse_results(payload) -> list:

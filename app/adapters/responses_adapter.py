@@ -10,6 +10,7 @@ import re
 import time
 from typing import Any
 
+from app import server_tools
 from app.reasoning import extract_reasoning_text, map_reasoning_controls
 from app.upstream_io import (StreamOutputBudget, merge_tool_call_delta, new_tool_state,
                              seal_tool_identities, tool_identity_complete)
@@ -61,8 +62,13 @@ def responses_request_to_chat(body: dict) -> dict:
             if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list):
                 raw_tools.extend(item["tools"])
 
+    # OpenAI hosted web_search tools are executed by the gateway itself.
+    plain_tools, server_spec = server_tools.split_server_tools(raw_tools, openai_types=True)
     registry, chat_tools = _build_tool_registry_and_chat_tools(
-        raw_tools, input_items=inp if isinstance(inp, list) else None)
+        plain_tools, input_items=inp if isinstance(inp, list) else None)
+    if server_spec:
+        taken = {t.get("name") for t in plain_tools if isinstance(t, dict)}
+        chat_tools = chat_tools + server_tools.injected_chat_tools(server_spec, taken)
 
     messages: list[dict] = []
 
@@ -88,6 +94,8 @@ def responses_request_to_chat(body: dict) -> dict:
         chat["tools"] = chat_tools
     if registry.upstream_to_identity:
         chat["_tool_registry"] = registry.to_dict()
+    if server_spec:
+        chat["_server_tools"] = server_spec
     if "tool_choice" in body:
         chat["tool_choice"] = _convert_tool_choice_for_chat(body["tool_choice"], tool_registry=registry)
 
@@ -553,6 +561,37 @@ class ResponsesStreamConverter:
         self._usage: dict | None = None
         self._content_filter = False
         self._seq = 0  # Monotonic emitted-event sequence
+        # Executed gateway web searches to prepend as web_search_call items.
+        self._seed_search_calls: list[dict] = []
+        self._seeds_emitted = False
+
+    def seed_web_search_calls(self, records) -> None:
+        """Queue executed gateway web-search records; emitted as leading items."""
+        self._seed_search_calls = [record for record in (records or [])
+                                   if record.get("kind") == "search"]
+        self._seeds_emitted = False
+
+    def _search_call_item(self, record: dict) -> dict:
+        query = (record.get("input") or {}).get("query") or ""
+        return {"type": "web_search_call", "id": record.get("id") or _rand_id("ws_"),
+                "action": {"type": "search", "queries": [query] if query else []}}
+
+    def _seed_events(self) -> list[str]:
+        """Emit web_search_call items for executed gateway searches."""
+        if self._seeds_emitted:
+            return []
+        self._seeds_emitted = True
+        events: list[str] = []
+        for record in self._seed_search_calls:
+            item = self._search_call_item(record)
+            index = self._next_output_idx
+            self._next_output_idx += 1
+            events.append(self._evt("response.output_item.added",
+                                    {"output_index": index, "item": item}))
+            events.append(self._evt("response.output_item.done",
+                                    {"output_index": index, "item": item}))
+        return events
+
     # Public methods
 
     def feed_line(self, line: str) -> str:
@@ -722,6 +761,7 @@ class ResponsesStreamConverter:
             events.append(self._evt("response.created", {"response": resp}))
             events.append(self._evt("response.in_progress", {"response": resp}))
             self._emitted_created = True
+            events.extend(self._seed_events())
 
         # usage
         if chunk.get("usage"):
@@ -965,7 +1005,8 @@ class ResponsesStreamConverter:
         return item
 
     def _response_obj(self, status: str, incomplete_reason: str | None = None) -> dict:
-        output = []
+        output = [self._search_call_item(record)
+                  for record in self._seed_search_calls]
         if self._realtime:
             for kind, index in self._output_order:
                 if kind == "reasoning" and self._emitted_reasoning_item:
