@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import desensitize as desensitize_module
-from app.desensitize import desensitize_body, desensitize_text
+from app.desensitize import desensitize_body, desensitize_text, system_as_user_body
 
 
 ZWSP = "\u200b"
@@ -195,12 +195,38 @@ class WorkBuddyBodyTests(unittest.TestCase):
                 "You are interacting with the user through the DeepSeek Harness Web GUI at http://127.0.0.1:3100.",
                 "You are interacting with the user through the WorkBuddy Web GUI at http://127.0.0.1:3100.",
             ),
+            "web-surface-followup": (
+                "There is a Web GUI whose URL the runtime context names.\n"
+                "When the user refers to this page, use this GUI.",
+                "There is a Web GUI whose URL the runtime context names. The interface, when the user refers to this page, use this GUI.",
+            ),
         }
         for mode, (source, expected) in cases.items():
             with self.subTest(mode=mode):
                 actual = desensitize_module.desensitize_channel_text(source)
                 self.assertEqual(actual, expected)
                 self.assertEqual(desensitize_module.desensitize_channel_text(actual), actual)
+
+    def test_channel_system_as_user_retry_preserves_blocks_and_is_idempotent(self):
+        image = {"type": "image_url", "image_url": {"url": "https://example.invalid/image.png"}}
+        body = {"model": "auto", "messages": [
+            {"role": "system", "content": "system rules"},
+            {"role": "system", "content": [{"type": "text", "text": "more rules"}, image]},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "answer"},
+        ]}
+        before = copy.deepcopy(body)
+        out = system_as_user_body(body)
+        self.assertEqual(body, before)
+        self.assertEqual(out["messages"][0], {"role": "system", "content": "You are a helpful assistant."})
+        self.assertEqual(out["messages"][1]["role"], "user")
+        content = out["messages"][1]["content"]
+        self.assertIn("<instructions>\n", content[0]["text"])
+        self.assertIn("system rules", "".join(block.get("text", "") for block in content if block.get("type") == "text"))
+        self.assertIn("more rules", "".join(block.get("text", "") for block in content if block.get("type") == "text"))
+        self.assertIn(image, content)
+        self.assertEqual(content[-1]["text"], "hello")
+        self.assertEqual(system_as_user_body(out), out)
 
         for source in (
             "You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode.",

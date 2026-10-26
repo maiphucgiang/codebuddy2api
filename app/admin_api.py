@@ -68,7 +68,7 @@ def _public_credential(item):
               "trial_supported", "trial",
               "daily_chat_supported", "auto_daily_chat", "daily_chat",
               "growth_supported", "auto_growth", "growth_auto",
-              "token_expired", "token_expires_at", "last_refresh_time", "sessions", "sticky_sessions", "last_error_code", "last_error_body", "auto_disabled", "usage_stats"}
+              "token_expired", "token_expires_at", "last_refresh_time", "sessions", "sticky_sessions", "last_error_code", "last_error_body", "auto_disabled", "restricted", "restricted_until", "usage_stats"}
     result = {key: value for key, value in item.items() if key in fields}
     identity = item.get("account_key") or item.get("id")
     if identity and ("/" in str(identity) or "\\" in str(identity)):

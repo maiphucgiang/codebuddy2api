@@ -47,17 +47,21 @@ class Management:
                 record = policy.credential(entry)
                 enabled = record.get("enabled", True)
                 until = entry.get("fail_until", 0)
+                restricted = entry.get("restricted") is True
+                restricted_until = entry.get("restricted_until") if restricted else None
                 cooldowns = [{"model": model, "until": deadline,
                               "remaining_seconds": max(0, round(deadline - now))}
                              for (cid, model), deadline in pool._model_fail.items()
                              if cid == path and deadline > now]
                 # Provenance lives in the store so it survives restarts and cooldown resets.
-                auto_disabled = record.get("auto_disabled") is True and not enabled
-                state = ("auto_disabled" if auto_disabled else
+                auto_disabled = record.get("auto_disabled") is True and not enabled and not restricted
+                state = ("restricted" if restricted else
+                         "auto_disabled" if auto_disabled else
                          "disabled" if not enabled else "error" if row.get("error") else
                          "circuit_open" if until > now else "expired" if row.get("token_expired") else "ready")
                 row.update(id=identity, name=Path(path).name, enabled=enabled, health=state,
-                           auto_disabled=auto_disabled,
+                           auto_disabled=auto_disabled, restricted=restricted,
+                           restricted_until=restricted_until,
                            auto_checkin=model_policy.credential_auto_checkin(self.CONFIG, entry),
                            checkin=checkin.view(balance.get("checkin") or {}),
                            auto_travel=model_policy.credential_auto_travel(self.CONFIG, entry),
@@ -76,7 +80,8 @@ class Management:
                                              if daily_chats else {}) or {}).get("growth_auto") or {},
                            fail_until=until, cooldown_until=until,
                            cooldown_remaining=max(0, round(until - now)),
-                           last_error_code=("http_401" if entry.get("last_error") == "backend HTTP 401" else
+                           last_error_code=("restricted" if restricted else
+                                            "http_401" if entry.get("last_error") == "backend HTTP 401" else
                                             "http_403" if entry.get("last_error") == "backend HTTP 403" else
                                             "credential_error" if entry.get("last_error") else None),
                            last_failure_at=entry.get("last_failure_at"),

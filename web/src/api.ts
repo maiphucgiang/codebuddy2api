@@ -377,6 +377,8 @@ export function credentialResponse(value: unknown): Credential[] {
     ])
       if (c[field] !== undefined && typeof c[field] !== "boolean")
         throw new Error("自动任务状态必须为布尔值");
+    if (c.restricted !== undefined && typeof c.restricted !== "boolean")
+      throw new Error("官方限制状态必须为布尔值");
     for (const field of ["checkin", "travel", "trial", "daily_chat"])
       if (c[field] !== undefined && c[field] !== null) object(c[field], "自动任务结果");
     if (c.growth_auto !== undefined && c.growth_auto !== null)

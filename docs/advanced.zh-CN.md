@@ -144,7 +144,7 @@ scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` 
 自动签到与 Buddy 旅行是按账号设置的开关（WebUI 凭证页）：国内个人账号默认开启，国际默认关闭，保存即生效，无需重启。成长中心仅面向个人账号，企业账号不参与旅行（也不再显示上游 403）。
 
 成长中心补领（`auto_growth`，国内个人账号默认开启）随每小时维护扫描执行，只做接取与领取：领取已完成任务的积分与能量，自身不启动任何行为链。任务级 `growth_auto` 开关（默认全部关闭）把指定任务纳入自动化，扫描随后驱动对应行为链——可能消耗积分的真实对话、应用体验或专家召唤。凭证页展示实时任务列表，支持单任务与已开开关任务的一键手动执行，任务开关可复制到已选账号（`POST /admin/credentials/growth-batch`）；面板由 `GET /admin/credentials/{id}/growth-tasks`、`.../growth-tasks/auto` 与 `.../auto-all` 支撑。手动执行是服务端后台任务（每个账号同时只有一个）：请求立即返回任务，关闭抽屉或页面不影响执行，运行中再次发起会返回当前任务；`GET /admin/growth-jobs` 列出各账号当前或最近一次任务及正在执行的任务，供页面横幅显示。手动执行与扫描领取均入审计；企业与国际账号不显示该面板。
-签到、旅行、成长和活跃打卡的结果或异常携带 11140 时，与推理共用持久账号禁用。当前扫描立即停止，包括剩余成长领取，后续扫描跳过该账号；其他业务码保持原有日志和重试行为。
+签到、旅行、成长和活跃打卡的结果或异常携带 11140 时，与推理共用持久两小时官方限制状态。当前扫描立即停止，包括剩余成长领取；限制到期或人工解除前，后续扫描跳过该账号；其他业务码保持原有日志和重试行为。
 
 `CODEBUDDY2API_AUTO_ACCEPT_BUDDY` 仅启动读取，默认 `false`；预授权已启用国内账号完成首次领猫任务、协议及旅行，自动旅行仍受账号开关控制。`first_buddy` 无需单独接取，包含 `not_accepted` 在内的待完成状态可直接发起一次本账号的真实国内 WorkBuddy 对话；优先可用零倍率模型，否则取最低已知倍率，最多请求 32 个输出 token，可能消耗少量积分。不执行其他奖励任务、不付费开盒、不切猫、不领取国际试用积分。
 
@@ -295,7 +295,7 @@ Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 
 
 - 三个生成协议统一将 `developer` 归一为 `system`，已有 system 移到首位；归一化不修改调用方 payload。可选的 [Responses 投影](#responses-投影)和脱敏会另行处理内容，因此默认链路并非逐字透传。
 - `prompt_mode` 热生效，可在 WebUI、CLI 或环境变量配置。默认 `empty` 不附加网关 system 提示词，也不清空客户端已有指令。`prepend` 在选路后仅插入一次前缀：WorkBuddy 后端使用 `You are WorkBuddy, a powerful AI assistant.` 及官方任务目标，CLI 后端使用 `You are CodeBuddy Code.` 及官方 CLI 任务说明。前缀提炼自官方模板，重试不重复插入；DSH 适配不受此开关控制。
-- 独立 DSH 适配始终将官方固定身份、共享 coding persona（保留模型 ID）、minimal persona、`You are DeepSeek Harness.` 及当前／旧版 DSH Web GUI 角色语境转换为 WorkBuddy 表述，覆盖 system、developer、assistant 文本及文本块。适配 standard／PTC／Cordis／minimal／headless／web／SDK／ACP，保留 plan 指令、源码 checkout 说明和普通品牌引用，关闭脱敏也生效；不对 user/tool 内容做全局替换。
+- 独立 DSH 适配始终将官方固定身份、共享 coding persona（保留模型 ID）、minimal persona、`You are DeepSeek Harness.` 及当前／旧版 DSH Web GUI 角色语境转换为 WorkBuddy 表述，覆盖 system、developer、assistant 文本及文本块；同时改写已确认的 `Web GUI whose URL the runtime context names. When the user refers` 指纹，包括 assistant 引用。适配 standard／PTC／Cordis／minimal／headless／web／SDK／ACP，保留 plan 指令、源码 checkout 说明和普通品牌引用，关闭脱敏也生效；不对 user/tool 内容做全局替换。
 - 图片计入全部历史和工具结果，重复图片逐次计数，按消息与内容块数组顺序判断新旧。默认保留最新 16 张，只移除超额图片并保留文本和消息结构；图片清空的内容用文本占位。
 - `--image-policy error` 在本地返回 `413 / too_many_images`。处理后仍超过字节上限则返回 `413 / request_too_large`，不为满足预算继续截断文本。
 - 图片数量合规不保证单图大小或模型视觉能力满足上游要求。URL/base64 图片可转换，Responses 图片 `file_id` 不支持。
@@ -326,8 +326,8 @@ Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 
 | WebUI 无法登录 | 确认设置了 API key；更换 key 后重新登录并重新发起未完成的 OAuth。HTTPS 反代后经域名登录失败时，用 `admin_allowed_origins` 信任对外来源（见上文） |
 | 本地 401 | 客户端密钥与网关不一致 |
 | 上游 401 / 403 | 凭证级认证熔断；在 WebUI 检查并重新登录 |
-| 渠道校验（11128） | 可用时仅在同账号 `/console` 回退一次，不跨账号重放。聊天回退仍失败会冷却该账号；搜索/MCP 不冷却账号 |
-| 账号限制（11140） | 持久禁用当前账号，当前请求不换账号重放 |
+| 渠道校验（11128） | 可用时仅在同账号 `/console` 回退一次；第二次渠道拒绝可把 system 指令降为 user 后在同账号重试一次。最终仍拒绝则直接返回，不冷却任何账号；搜索/MCP 没有回退端点，账号保持可用 |
+| 账号限制（11140） | 标记账号为官方限制并休眠 2 小时，保留证据且暂时移出选路；申诉通过后可在凭证页一键重新启用。当前请求不换账号重放 |
 | 模型限制（11148） | 仅冷却当前账号×模型 30 分钟，不冷却整个账号，当前请求不重放 |
 | 模型级 11129/11134/11150/11158 | 业务码优先于 HTTP 状态（包括 500/503）；不冷却账号或模型，不换账号重放，返回上游响应 |
 | 429 | 对该凭证的上游模型冷却，后续请求自动换绑；全部候选都在冷却时仍返回 429。设了 `--failover-max` 时，当前请求就地换凭证重放 |
