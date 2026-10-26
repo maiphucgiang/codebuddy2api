@@ -2603,8 +2603,8 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
         media = CONFIG.get("media_store")
         if media is not None:
             try:
-                removed = media.cleanup(ttl_hours=CONFIG.get("media_ttl_hours", 72),
-                                        max_total_bytes=int(CONFIG.get("media_max_total_mb") or 1024) << 20)
+                removed = media.cleanup(ttl_hours=_media_ttl_hours(),
+                                        max_total_bytes=_media_max_bytes())
                 if removed.get("expired_or_evicted"):
                     _log(f"[housekeeper] 媒体清理：移除 {removed['expired_or_evicted']} 项资产、"
                          f"{removed.get('removed_files', 0)} 个文件")
@@ -5023,14 +5023,7 @@ def _media_public_url(meta: dict) -> str:
 def _media_dynamic_kinds(model) -> list:
     """Media kinds declared for this model in account root tables (serves scope)."""
     index = _catalog_index()
-    if index is not None:
-        return list(index.media_kinds.get(model, ()))
-    kinds: list = []  # No index yet: scan the published catalogs once.
-    for account in (CONFIG.get("account_catalogs") or {}).values():
-        for item in ((account or {}).get("serves") or []) if isinstance(account, dict) else []:
-            if isinstance(item, dict) and item.get("id") == model:
-                kinds.extend(kind for kind in media_generation.catalog_kinds(item) if kind not in kinds)
-    return kinds
+    return list(index.media_kinds.get(model, ())) if index is not None else []
 
 
 def _media_all_kinds(model) -> list:
@@ -5237,15 +5230,16 @@ async def _media_download_bytes(url: str, rid: str) -> bytes:
         try:
             async with client.stream("GET", url) as response:
                 if response.status_code != 200:
-                    if response.status_code >= 500:
-                        raise MediaDownloadRetryable(f"资源下载失败（HTTP {response.status_code}）")
-                    detail = "，签名可能已过期" if response.status_code in (403, 404) else ""
-                    raise MediaDownloadError(
-                        f"资源下载失败（HTTP {response.status_code}{detail}）")
+                    if response.status_code in (403, 404, 410):  # Signature expired or gone.
+                        raise MediaDownloadError(
+                            f"资源下载失败（HTTP {response.status_code}，签名可能已过期）")
+                    raise MediaDownloadRetryable(f"资源下载失败（HTTP {response.status_code}）")
                 async for chunk in response.aiter_bytes(64 * 1024):
                     data.extend(chunk)
                     if len(data) > limit:
                         raise MediaDownloadError("单个资源超过媒体容量上限")
+        except httpx.InvalidURL:  # Not an HTTPError, and a malformed URL will not fix itself.
+            raise MediaDownloadError("资源地址无效") from None
         except httpx.HTTPError as error:
             raise MediaDownloadRetryable(f"资源下载失败：{type(error).__name__}") from None
     return bytes(data)
@@ -5262,7 +5256,8 @@ async def _media_save(kind: str, data: bytes, *, model, rid: str) -> dict:
     except ValueError:
         raise
     except Exception as error:
-        raise MediaDownloadError(f"媒体存储写入失败：{type(error).__name__}") from None
+        # A full disk or locked database may clear up; do not fail a paid video for it.
+        raise MediaDownloadRetryable(f"媒体存储写入失败：{type(error).__name__}") from None
 
 
 async def _media_video_refresh(task_id: str, rid: str) -> dict:
@@ -5274,19 +5269,17 @@ async def _media_video_refresh(task_id: str, rid: str) -> dict:
     store = _media_store()
 
     async def load():
-        return await run_in_threadpool(store.get_task, task_id)
+        task = await run_in_threadpool(store.get_task, task_id)
+        if task is None:  # Also covers a task swept while this refresh was running.
+            raise HTTPException(status_code=404, detail={"error": {
+                "message": "视频任务不存在或已过期", "type": "not_found_error", "code": "task_not_found"}})
+        return task
 
     task = await load()
-    if task is None:
-        raise HTTPException(status_code=404, detail={"error": {
-            "message": "视频任务不存在或已过期", "type": "not_found_error", "code": "task_not_found"}})
     if task["status"] in ("completed", "failed"):
         return task  # Repeated queries keep returning the same resource or error.
     async with _media_task_lock(task_id):
         task = await load()
-        if task is None:
-            raise HTTPException(status_code=404, detail={"error": {
-                "message": "视频任务不存在或已过期", "type": "not_found_error", "code": "task_not_found"}})
         if task["status"] in ("completed", "failed"):
             return task
         cred, headers = await run_in_threadpool(_media_bound_cred, task["account_key"])
@@ -5344,8 +5337,8 @@ def _media_video_response(task: dict, meta) -> dict:
             body["message"] = "视频资源已删除或过期，不再重新下载"
     elif task["status"] == "failed":
         body["error"] = {"message": task["error"] or "视频生成失败"}
-    else:
-        body["message"] = task["error"]  # A retryable download hint, if any.
+    elif task["error"]:
+        body["message"] = task["error"]  # A retryable download hint.
     if task["credit"] is not None:
         body["usage"] = {"credit": task["credit"]}
     return body
@@ -5371,53 +5364,54 @@ def _media_optional_text(value, field: str, limit: int = media_generation.MAX_PR
     if value is None:
         return None
     if (not isinstance(value, str) or len(value) > limit
-            or any(ord(c) < 32 and c not in "\n\r\t" for c in value)):
+            or media_generation.has_control_chars(value)):
         raise _media_bad_request(f"{field} 必须是不超过 {limit} 字符的字符串")
     return value
 
 
 async def _media_image_item(item: dict, model, rid: str, *, persist: bool):
-    """Convert one upstream item; returns (payload, persisted_id, error)."""
+    """Convert one upstream item; returns (payload, error)."""
     revised = {"revised_prompt": item["revised_prompt"]} if item.get("revised_prompt") else {}
     try:
         if item.get("b64_json"):
             if persist:
                 meta = await _media_save("image", base64.b64decode(item["b64_json"]),
                                          model=model, rid=rid)
-                return {"url": _media_public_url(meta), **revised}, meta["id"], None
-            return {"b64_json": item["b64_json"], **revised}, None, None
+                return {"url": _media_public_url(meta), **revised}, None
+            return {"b64_json": item["b64_json"], **revised}, None
         data = await _media_download_bytes(item["url"], rid)
         if persist:
             meta = await _media_save("image", data, model=model, rid=rid)
-            return {"url": _media_public_url(meta), **revised}, meta["id"], None
-        return {"b64_json": base64.b64encode(data).decode("ascii"), **revised}, None, None
+            return {"url": _media_public_url(meta), **revised}, None
+        return {"b64_json": base64.b64encode(data).decode("ascii"), **revised}, None
     except (MediaDownloadError, MediaDownloadRetryable, ValueError) as error:
-        return None, None, str(error)
+        return None, str(error)
 
 
 async def _media_image_reply(items: list, model, rid: str, *, persist: bool) -> list:
-    """Download all image items concurrently; keep successes and never orphan files."""
+    """Download all image items concurrently; keep every success and fail only when none survive."""
+    selected = items[:media_generation.MAX_IMAGE_ITEMS]
     results = await asyncio.gather(*(_media_image_item(item, model, rid, persist=persist)
-                                     for item in items[:media_generation.MAX_IMAGE_ITEMS]))
-    out, persisted, failures, first_error = [], [], 0, ""
-    for payload, asset_id, error in results:
+                                     for item in selected), return_exceptions=True)
+    out, failures, first_error = [], 0, ""
+    for result in results:
+        if isinstance(result, BaseException):
+            # Anything unexpected still counts as one failed item; the others keep their results.
+            payload, error = None, f"处理异常：{type(result).__name__}"
+            _log(f"[{rid}] ✗ 图片条目处理异常 | {type(result).__name__}")
+        else:
+            payload, error = result
         if error is None:
             out.append(payload)
-            if asset_id:
-                persisted.append(asset_id)
         else:
             failures += 1
             first_error = first_error or error
-    if failures == len(items):
-        store = CONFIG.get("media_store")
-        if store is not None and persisted:
-            await run_in_threadpool(
-                lambda: [store.delete_asset(asset_id) for asset_id in persisted])
+    if failures == len(selected):
         raise HTTPException(status_code=502, detail={"error": {
-            "message": f"全部 {len(items)} 张图片下载或保存失败：{first_error}",
+            "message": f"全部 {len(selected)} 张图片下载或保存失败：{first_error}",
             "type": "upstream_error"}})
     if failures:
-        _log(f"[{rid}] ✗ 图片部分失败 {failures}/{len(items)} | {first_error}")
+        _log(f"[{rid}] ✗ 图片部分失败 {failures}/{len(selected)} | {first_error}")
         observe_failure("image_item_failed")
     return out
 
@@ -5452,16 +5446,8 @@ def admin_media_models() -> list:
                          ("video", media_generation.VIDEO_MODELS)):
         for model in models:
             static_kinds.setdefault(model, []).append(kind)
-    catalog_kinds_map = _catalog_index().media_kinds if _catalog_index() is not None else None
-    if catalog_kinds_map is None:
-        catalog_kinds_map = {}  # No index yet: derive kinds from the published serves scan.
-        for account in (CONFIG.get("account_catalogs") or {}).values():
-            for item in ((account or {}).get("serves") or []) if isinstance(account, dict) else []:
-                if (isinstance(item, dict) and isinstance(item.get("id"), str)
-                    and media_generation.catalog_kinds(item)):
-                    known = catalog_kinds_map.setdefault(item["id"], ())
-                    catalog_kinds_map[item["id"]] = tuple(
-                        dict.fromkeys(known + media_generation.catalog_kinds(item)))
+    index = _catalog_index()
+    catalog_kinds_map = index.media_kinds if index is not None else {}
     table = {model: {"kinds": tuple(kinds), "catalog": False}
              for model, kinds in static_kinds.items()}
     for model, kinds in catalog_kinds_map.items():
@@ -5916,7 +5902,7 @@ async def images_generations(request: Request,
     payload = await _media_json(request)
     model = payload.get("model") or media_generation.DEFAULT_IMAGE_MODEL
     _media_check_model(model, "image")
-    if not isinstance(payload.get("prompt"), str) or not payload["prompt"]:
+    if not isinstance(payload.get("prompt"), str) or not payload["prompt"].strip():
         raise _media_bad_request("prompt 必须是非空字符串")
     n, problem = _validated_count(payload.get("n"), 1, 1, media_generation.MAX_IMAGE_ITEMS, "n")
     if problem:
@@ -5952,7 +5938,7 @@ async def images_edits(request: Request,
     payload = await _media_json(request)
     model = payload.get("model") or media_generation.DEFAULT_IMAGE_EDIT_MODEL
     _media_check_model(model, "edit")
-    if not isinstance(payload.get("prompt"), str) or not payload["prompt"]:
+    if not isinstance(payload.get("prompt"), str) or not payload["prompt"].strip():
         raise _media_bad_request("prompt 必须是非空字符串")
     raw_images = payload.get("images")
     if not isinstance(raw_images, list) or not raw_images:
@@ -6014,7 +6000,8 @@ async def create_video(request: Request,
             resolution=_media_optional_text(payload.get("resolution"), "resolution", 16),
             aspect_ratio=_media_optional_text(payload.get("aspect_ratio"), "aspect_ratio", 32),
             enable_audio=payload.get("enable_audio"),
-            image_url=_media_optional_text(payload.get("image_url"), "image_url"))
+            image_url=_media_optional_text(payload.get("image_url"), "image_url",
+                                           media_generation.MAX_IMAGE_REF_CHARS))
     except ValueError as error:
         raise _media_bad_request(str(error)) from None
     store = _media_store()

@@ -1,7 +1,9 @@
 """Read-only indexes over published account catalogs, built once per catalog revision."""
 from __future__ import annotations
+
 from .media_generation import catalog_kinds
 from .model_catalog_view import INTERNATIONAL, share_models
+
 
 def account_scope(account, scope="models"):
     """Merge root candidates into selector models while retaining selector metadata."""

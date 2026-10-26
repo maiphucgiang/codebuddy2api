@@ -5,6 +5,7 @@ administration API; nothing here touches FastAPI, the network or configuration.
 """
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 # Profiles verified against the paid media endpoints; extend only after live checks.
@@ -25,7 +26,8 @@ DEFAULT_IMAGE_EDIT_MODEL = "hunyuan-image-v2.0-general-edit"
 DEFAULT_VIDEO_MODEL = "minimax-video-h3"
 
 MAX_IMAGE_ITEMS = 4          # Public n bound; the upstream contract allows 1..4.
-MAX_PROMPT_CHARS = 32000     # Shared by image and video prompts and image references.
+MAX_PROMPT_CHARS = 32000     # Shared by image and video prompts.
+MAX_IMAGE_REF_CHARS = 20 * 1024 * 1024   # OpenAI's image_url maxLength; data: URIs run long.
 DEFAULT_IMAGE_SIZE = "1024x1024"
 VIDEO_RESOLUTIONS = ("768P", "2K")
 MAX_VIDEO_SECONDS = 60
@@ -101,20 +103,29 @@ def normalize_media_base_url(value):
     return value.rstrip("/")
 
 
+# C0 controls except \t \n \r; a compiled regex scans a 20 MiB data URI without a Python-level loop.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def has_control_chars(value: str) -> bool:
+    """Report C0 control characters other than tab, newline and carriage return."""
+    return _CONTROL_CHARS.search(value) is not None
+
+
 def _clean_text(value, field, limit: int) -> str:
     """Trim a short field, allowing whitespace controls and rejecting other C0 chars."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} 必须是非空字符串")
-    if len(value) > limit or any(ord(char) < 32 and char not in "\n\r\t" for char in value):
+    if len(value) > limit or has_control_chars(value):
         raise ValueError(f"{field} 长度或字符无效")
     return value.strip()
 
 
 def _clean_prompt(value, field: str) -> str:
-    """Accept a prompt as-is: non-empty, within the shared bound, no odd control chars."""
-    if not isinstance(value, str) or not value:
+    """Accept a prompt as-is: not blank, within the shared bound, no odd control chars."""
+    if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} 必须是非空字符串")
-    if len(value) > MAX_PROMPT_CHARS or any(ord(char) < 32 and char not in "\n\r\t" for char in value):
+    if len(value) > MAX_PROMPT_CHARS or has_control_chars(value):
         raise ValueError(f"{field} 长度或字符无效")
     return value
 
@@ -137,7 +148,7 @@ def image_request_body(model: str, prompt: str, *, size=None, n=1, quality=None,
     if images is not None:
         if not isinstance(images, (list, tuple)) or not images:
             raise ValueError("images 必须是非空数组")
-        body["image"] = [_clean_text(item, "image_url", MAX_PROMPT_CHARS) for item in images]
+        body["image"] = [_clean_text(item, "image_url", MAX_IMAGE_REF_CHARS) for item in images]
         if input_fidelity is not None:
             body["input_fidelity"] = _clean_text(input_fidelity, "input_fidelity", 64)
     return body
@@ -168,7 +179,7 @@ def video_request_body(model: str, *, prompt=None, seconds=None, resolution=None
     if extra:
         body["extra_parameters"] = extra
     if image_url is not None:
-        body["image_url"] = _clean_text(image_url, "image_url", MAX_PROMPT_CHARS)
+        body["image_url"] = _clean_text(image_url, "image_url", MAX_IMAGE_REF_CHARS)
     if "prompt" not in body and "image_url" not in body:
         raise ValueError("prompt 与 image_url 至少提供一个")
     return body

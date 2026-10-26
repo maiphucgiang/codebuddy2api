@@ -106,15 +106,21 @@ export function normalizeMediaSummary(value: unknown): MediaSummary {
 /** Remaining retention as a short label; under six hours it turns warning-coloured. */
 export function remainingLabel(
   expires: unknown,
+  t: (key: string, vars?: Record<string, string | number>) => string,
   now = Date.now(),
 ): { text: string; warn: boolean } {
   const end = number(expires);
   if (end === null) return { text: "—", warn: false };
   const seconds = Math.max(0, end - now / 1000);
   const hours = seconds / 3600;
-  if (hours >= 48) return { text: `${Math.round(hours / 24)} 天`, warn: false };
-  if (hours >= 1) return { text: `${hours.toFixed(1)} 小时`, warn: hours < 6 };
-  return { text: `${Math.max(1, Math.round(seconds / 60))} 分钟`, warn: true };
+  if (hours >= 48)
+    return { text: t("media.remaining.days", { count: Math.round(hours / 24) }), warn: false };
+  if (hours >= 1)
+    return { text: t("media.remaining.hours", { count: hours.toFixed(1) }), warn: hours < 6 };
+  return {
+    text: t("media.remaining.minutes", { count: Math.max(1, Math.round(seconds / 60)) }),
+    warn: true,
+  };
 }
 
 export function taskStatusTone(status: unknown): "good" | "bad" | "neutral" {
@@ -519,7 +525,7 @@ export function Media() {
             (assets.data.items.length ? (
               <div className={s.mediaGrid}>
                 {assets.data.items.map((item) => {
-                  const remaining = remainingLabel(item.expires_at);
+                  const remaining = remainingLabel(item.expires_at, t);
                   const isVideo = item.kind === "video";
                   return (
                     <button
@@ -649,6 +655,12 @@ export function Media() {
                                       : "media.status.failed",
                               )}
                             </Badge>
+                            {active && item.error ? (
+                              <>
+                                {" "}
+                                <Badge tone="warn">{t("media.tasks.retrying")}</Badge>
+                              </>
+                            ) : null}
                             {item.error ? (
                               <small title={text(item.error)}>
                                 {text(item.error).length > 40

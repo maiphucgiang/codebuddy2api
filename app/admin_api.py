@@ -19,7 +19,6 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from . import auth_oauth
 from . import perf_metrics
 from . import media_store as media_store_module
-from . import perf_metrics
 from .admin_auth import AdminAuth, AdminMiddleware, COOKIE_NAME, SESSION_TTL, error_response, same_origin
 from .control_store import ConflictError, validate_model
 from .credential_io import CredentialFileError, MAX_CREDENTIAL_BYTES, _valid_name, read_import_file
@@ -762,8 +761,13 @@ def install_admin(app, config, gateway):
                     return await function(request)
                 except _MediaUnavailable:
                     return error_response(503, "媒体存储不可用，请检查数据目录权限或重启网关")
+                except HTTPException as exc:
+                    detail = exc.detail.get("error", {}).get("message") if isinstance(exc.detail, dict) else None
+                    return error_response(exc.status_code, detail or "媒体操作不符合当前状态，请刷新后重试")
                 except ValueError:
                     return error_response(400, "媒体请求参数无效，请检查 kind/status/limit/cursor")
+                except Exception:
+                    return error_response(500, "管理操作失败，请检查存储状态后重试")
             guarded.__name__ = function.__name__
             app.add_api_route(path, guarded, methods=[method])
             return function
@@ -796,11 +800,11 @@ def install_admin(app, config, gateway):
             return JSONResponse({
                 "configured": bool(base), "base_url": base,
                 "locked": bool(resolved.get("media_public_base_url", {}).get("locked")),
-                "usage": store.usage() if store else {"total_bytes": 0,
-                                                      "images": {"count": 0, "bytes": 0},
-                                                      "videos": {"count": 0, "bytes": 0}},
-                "limit_bytes": int(config.get("media_max_total_mb") or 1024) * 1048576,
-                "ttl_hours": config.get("media_ttl_hours", 72),
+                "usage": store.usage(ttl_hours=gateway._media_ttl_hours()) if store else {
+                    "total_bytes": 0, "images": {"count": 0, "bytes": 0},
+                    "videos": {"count": 0, "bytes": 0}},
+                "limit_bytes": gateway._media_max_bytes(),
+                "ttl_hours": gateway._media_ttl_hours(),
                 "tasks": store.task_counts() if store else {"active": 0, "failed": 0},
                 "models": gateway.admin_media_models(),
                 "available": store is not None,
@@ -810,17 +814,24 @@ def install_admin(app, config, gateway):
     def media_asset_row(item, base):
         entry = dict(item)
         entry["created_at"] = item["created"]
-        entry["expires_at"] = item["created"] + float(config.get("media_ttl_hours", 72) or 72) * 3600
+        entry["expires_at"] = item["created"] + gateway._media_ttl_hours() * 3600
         if base:
             entry["public_url"] = f"{base}/v1/media/{'videos' if item['kind'] == 'video' else 'images'}/{item['id']}"
         return entry
+
+    def live_asset(asset_id):
+        """Return an asset still inside the current TTL; expired ones vanish before the sweep."""
+        meta = media_store().get_asset(asset_id)
+        if meta is not None and media_store_module.is_expired(meta, gateway._media_ttl_hours()):
+            return None
+        return meta
 
     @media_route("GET", "/admin/media/assets")
     async def media_assets(request):
         kind, cursor, limit = media_page_params(request)
 
         def build():
-            page = media_store().list_assets(kind, cursor, limit)
+            page = media_store().list_assets(kind, cursor, limit, ttl_hours=gateway._media_ttl_hours())
             base = str(config.get("media_public_base_url") or "")
             items = [media_asset_row(item, base) for item in page["items"]]
             return JSONResponse({**page, "items": items})
@@ -829,7 +840,7 @@ def install_admin(app, config, gateway):
     @media_route("GET", "/admin/media/assets/{asset_id}")
     async def media_asset_meta(request):
         def build():
-            meta = media_store().get_asset(request.path_params["asset_id"])
+            meta = live_asset(request.path_params["asset_id"])
             if meta is None:
                 return error_response(404, "媒体资源不存在或已清理")
             return JSONResponse(media_asset_row(meta, str(config.get("media_public_base_url") or "")))
@@ -838,12 +849,8 @@ def install_admin(app, config, gateway):
     @media_route("GET", "/admin/media/assets/{asset_id}/content")
     async def media_asset_content(request):
         def build():
-            store = media_store()
-            meta = store.get_asset(request.path_params["asset_id"])
-            if meta is not None and media_store_module.is_expired(
-                    meta, float(config.get("media_ttl_hours", 72) or 72)):
-                meta = None  # Expired assets disappear now, not at the next hourly sweep.
-            file = store.asset_file(meta) if meta else None
+            meta = live_asset(request.path_params["asset_id"])
+            file = media_store().asset_file(meta) if meta else None
             if file is None:
                 return error_response(404, "媒体资源不存在或已清理")
             headers = media_store_module.security_headers(meta)
@@ -876,11 +883,7 @@ def install_admin(app, config, gateway):
     @media_route("POST", "/admin/media/tasks/{task_id}/refresh")
     async def media_task_refresh(request):
         task_id = request.path_params["task_id"]
-        try:
-            task = await gateway._media_video_refresh(task_id, gateway._request_id())
-        except HTTPException as exc:
-            detail = exc.detail.get("error", {}).get("message") if isinstance(exc.detail, dict) else None
-            return error_response(exc.status_code, detail or "视频任务不存在或无法刷新")
+        task = await gateway._media_video_refresh(task_id, gateway._request_id())
         event("media.task_refreshed", {"task": task_id})
         meta = None
         if task["status"] == "completed" and task["media_id"]:

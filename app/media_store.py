@@ -90,6 +90,7 @@ class MediaStore:
         self.path = self.root / DB_NAME
         self.directory.mkdir(parents=True, exist_ok=True)
         (self.directory / INCOMING_DIR).mkdir(exist_ok=True)
+        self.sweep_incoming()
         self._lock = threading.RLock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -225,16 +226,32 @@ class MediaStore:
 
     @staticmethod
     def _unlink(paths) -> None:
+        """Best-effort: this runs after the metadata commit and must not fail a committed change."""
         for file in paths:
-            file.unlink(missing_ok=True)
             try:
-                file.parent.rmdir()
+                file.unlink(missing_ok=True)
             except OSError:
                 pass
 
-    def list_assets(self, kind=None, cursor=None, limit=DEFAULT_PAGE_SIZE) -> dict:
+    def sweep_incoming(self, max_age_seconds: float = 3600) -> None:
+        """Drop staged payloads that a crashed save left behind; fresh ones may still be in flight."""
+        cutoff = time.time() - max_age_seconds
+        try:
+            staged = list((self.directory / INCOMING_DIR).iterdir())
+        except OSError:
+            return
+        for file in staged:
+            try:
+                if file.stat().st_mtime < cutoff:
+                    file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def list_assets(self, kind=None, cursor=None, limit=DEFAULT_PAGE_SIZE, *,
+                    ttl_hours: float) -> dict:
+        """List live assets newest first; rows past the current TTL stay hidden until swept."""
         limit = max(1, min(int(limit), MAX_PAGE_SIZE))
-        clauses, params = [], []
+        clauses, params = ["created>?"], [time.time() - float(ttl_hours) * 3600]
         if kind in KIND_MIMES:
             clauses.append("kind=?")
             params.append(kind)
@@ -247,7 +264,7 @@ class MediaStore:
                 raise ValueError("invalid cursor") from None
             clauses.append("(created<? OR (created=? AND id<?))")
             params.extend((stamp, stamp, row_id))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = " WHERE " + " AND ".join(clauses)
         with self._lock:
             rows = self._db.execute(
                 f"SELECT * FROM assets{where} ORDER BY created DESC, id DESC LIMIT ?",
@@ -257,10 +274,12 @@ class MediaStore:
         return {"items": [_row_to_asset(row) for row in rows], "has_more": more,
                 "next_cursor": json.dumps([rows[-1][6], rows[-1][0]]) if more and rows else None}
 
-    def usage(self) -> dict:
+    def usage(self, *, ttl_hours: float) -> dict:
+        """Count live assets only, matching what reads still serve."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT kind, COUNT(*), COALESCE(SUM(size),0) FROM assets GROUP BY kind").fetchall()
+                "SELECT kind, COUNT(*), COALESCE(SUM(size),0) FROM assets WHERE created>? "
+                "GROUP BY kind", (time.time() - float(ttl_hours) * 3600,)).fetchall()
         by_kind = {name: {"count": 0, "bytes": 0} for name in KIND_MIMES}
         total = 0
         for kind, count, size in rows:
@@ -291,6 +310,7 @@ class MediaStore:
             paths = self._cleanup_locked(ttl_hours=ttl_hours, max_total_bytes=max_total_bytes)
             after = self._db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
         self._unlink(paths)
+        self.sweep_incoming()
         return {"expired_or_evicted": before - after, "removed_files": len(paths)}
 
     # -- video tasks --------------------------------------------------------------------

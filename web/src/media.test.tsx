@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { api, useResource } from "./api";
+import { translate } from "./i18n";
 import {
   Media,
   normalizeMediaSummary,
@@ -73,7 +74,7 @@ const assets = {
   next_cursor: null,
 };
 
-function mockResources(overrides: { summary?: object } = {}) {
+function mockResources(overrides: { summary?: object; tasks?: object } = {}) {
   vi.mocked(useResource).mockImplementation(((path: string) => {
     if (path === "/media")
       return {
@@ -85,6 +86,14 @@ function mockResources(overrides: { summary?: object } = {}) {
       };
     if (path.startsWith("/media/assets"))
       return { data: assets, loading: false, refreshing: false, error: null, reload: vi.fn() };
+    if (path.startsWith("/media/tasks") && overrides.tasks)
+      return {
+        data: overrides.tasks,
+        loading: false,
+        refreshing: false,
+        error: null,
+        reload: vi.fn(),
+      };
     return {
       data: { items: [], has_more: false, next_cursor: null },
       loading: false,
@@ -135,10 +144,27 @@ describe("asset base url validation", () => {
 describe("retention and status mapping", () => {
   it("labels remaining time and warns under six hours", () => {
     const now = Date.now();
-    expect(remainingLabel(null)).toEqual({ text: "—", warn: false });
-    expect(remainingLabel(now / 1000 + 90 * 3600, now)).toEqual({ text: "4 天", warn: false });
-    expect(remainingLabel(now / 1000 + 3 * 3600, now)).toEqual({ text: "3.0 小时", warn: true });
-    expect(remainingLabel(now / 1000 + 20 * 60, now)).toEqual({ text: "20 分钟", warn: true });
+    expect(remainingLabel(null, translate)).toEqual({ text: "—", warn: false });
+    expect(remainingLabel(now / 1000 + 90 * 3600, translate, now)).toEqual({
+      text: "4 天",
+      warn: false,
+    });
+    expect(remainingLabel(now / 1000 + 3 * 3600, translate, now)).toEqual({
+      text: "3.0 小时",
+      warn: true,
+    });
+    expect(remainingLabel(now / 1000 + 20 * 60, translate, now)).toEqual({
+      text: "20 分钟",
+      warn: true,
+    });
+  });
+
+  it("routes the remaining-time units through the translator", () => {
+    const now = Date.now();
+    const echo = (key: string, vars?: Record<string, string | number>) => `${key}|${vars?.count}`;
+    expect(remainingLabel(now / 1000 + 90 * 3600, echo, now).text).toBe("media.remaining.days|4");
+    expect(remainingLabel(now / 1000 + 3 * 3600, echo, now).text).toBe("media.remaining.hours|3.0");
+    expect(remainingLabel(now / 1000 + 20 * 60, echo, now).text).toBe("media.remaining.minutes|20");
   });
 
   it("maps task statuses to badge tones", () => {
@@ -199,6 +225,42 @@ describe("media page", () => {
     await waitFor(() =>
       expect(screen.getByRole("dialog").textContent).toContain("复制失败，请手动复制链接"),
     );
+  });
+
+  it("flags active tasks whose download is deferred", () => {
+    const task = (id: string, status: string, error: string | null) => ({
+      task_id: id,
+      status,
+      model: "minimax-video-h3",
+      profile: "cn-cli",
+      account_key: "acct",
+      created: 1789000000,
+      error,
+      credit: null,
+      media_id: null,
+    });
+    mockResources({
+      tasks: {
+        items: [
+          task(
+            "task-deferred",
+            "in_progress",
+            "资源下载暂缓，下次查询重试：资源下载失败（HTTP 429）",
+          ),
+          task("task-queued", "queued", null),
+          task(
+            "task-failed",
+            "failed",
+            "视频资源下载失败：资源下载失败（HTTP 404，签名可能已过期）",
+          ),
+        ],
+        has_more: false,
+        next_cursor: null,
+      },
+    });
+    render(<Media />);
+    fireEvent.click(screen.getByRole("tab", { name: "视频任务" }));
+    expect(screen.getAllByText("下载暂缓，查询时重试")).toHaveLength(1);
   });
 
   it("labels catalog-only model sources", () => {

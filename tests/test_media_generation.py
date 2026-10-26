@@ -9,6 +9,7 @@ import asyncio
 import base64
 import concurrent.futures
 import json
+import os
 import sqlite3
 import struct
 import tempfile
@@ -128,6 +129,39 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             media_generation.image_request_body("hunyuan-image-v3.0", "x" * (media_generation.MAX_PROMPT_CHARS + 1))
 
+    def test_control_character_check(self):
+        for allowed in ("plain", "tab\tnewline\ncarriage\r", "中文 ~\x7f"):
+            self.assertFalse(media_generation.has_control_chars(allowed), repr(allowed))
+        for rejected in ("\x00", "a\x01b", "tail\x1f", "\x08", "\x0b", "\x0c", "\x0e"):
+            self.assertTrue(media_generation.has_control_chars(rejected), repr(rejected))
+
+    def test_blank_prompts_are_rejected_but_text_is_kept_verbatim(self):
+        for blank in ("   ", "\n\t ", " \r\n"):
+            with self.assertRaises(ValueError, msg=repr(blank)):
+                media_generation.image_request_body("hunyuan-image-v3.0", blank)
+            with self.assertRaises(ValueError, msg=repr(blank)):
+                media_generation.video_request_body("minimax-video-h3", prompt=blank)
+        padded = "  a cat\nwith a hat \n"
+        self.assertEqual(media_generation.image_request_body("hunyuan-image-v3.0", padded)["prompt"], padded)
+        self.assertEqual(media_generation.video_request_body("minimax-video-h3", prompt=padded)["prompt"],
+                         padded)
+
+    def test_image_references_have_their_own_bound(self):
+        uri = "data:image/png;base64," + base64.b64encode(b"\x00" * 30000).decode("ascii")
+        self.assertGreater(len(uri), media_generation.MAX_PROMPT_CHARS)
+        body = media_generation.image_request_body(
+            "hunyuan-image-v2.0-general-edit", "edit", images=[uri])
+        self.assertEqual(body["image"], [uri])
+        self.assertEqual(
+            media_generation.video_request_body("minimax-video-h3", image_url=uri)["image_url"], uri)
+        with patch.object(media_generation, "MAX_IMAGE_REF_CHARS", len(uri) - 1):
+            with self.assertRaises(ValueError):
+                media_generation.image_request_body("hunyuan-image-v2.0-general-edit", "edit", images=[uri])
+            with self.assertRaises(ValueError):
+                media_generation.video_request_body("minimax-video-h3", image_url=uri)
+        with self.assertRaises(ValueError):  # Prompts keep the smaller bound.
+            media_generation.image_request_body("hunyuan-image-v3.0", "x" * len(uri))
+
     def test_video_body_shapes(self):
         body = media_generation.video_request_body(
             "minimax-video-h3", prompt="dance", seconds=4, resolution="2K",
@@ -239,10 +273,10 @@ class StoreTests(unittest.TestCase):
     def test_eviction_keeps_quota(self):
         size = len(PNG_BYTES)
         self.save("image", PNG_BYTES, max_total_bytes=2 * size)
-        first = self.store.list_assets()["items"][0]["id"]
+        first = self.store.list_assets(ttl_hours=72)["items"][0]["id"]
         self.save("image", PNG_BYTES, max_total_bytes=2 * size)
         self.save("image", PNG_BYTES, max_total_bytes=2 * size)
-        usage = self.store.usage()
+        usage = self.store.usage(ttl_hours=72)
         self.assertLessEqual(usage["total_bytes"], 2 * size + size)  # New write fits after eviction.
         self.assertEqual(usage["images"]["count"], 2)
         self.assertIsNone(self.store.get_asset(first))
@@ -259,6 +293,50 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(removed["expired_or_evicted"], 1)
         self.assertIsNone(self.store.get_asset(meta["id"]))
         self.assertIsNone(self.store.get_task("t1"))
+
+    def test_expired_assets_leave_listing_and_usage_immediately(self):
+        meta = self.save("image", PNG_BYTES)
+        self.store._db.execute("UPDATE assets SET created=?", (time.time() - 2 * 3600,))
+        self.store._db.commit()
+        self.assertEqual(len(self.store.list_assets(ttl_hours=72)["items"]), 1)
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 1)
+        # Shrinking the TTL hides the row before any sweep, while the file stays for it.
+        self.assertEqual(self.store.list_assets(ttl_hours=1)["items"], [])
+        self.assertEqual(self.store.list_assets(kind="image", ttl_hours=1)["items"], [])
+        usage = self.store.usage(ttl_hours=1)
+        self.assertEqual(usage["total_bytes"], 0)
+        self.assertEqual(usage["images"], {"count": 0, "bytes": 0})
+        self.assertIsNotNone(self.store.get_asset(meta["id"]))
+
+    def test_sweep_incoming_removes_only_stale_files(self):
+        incoming = self.store.directory / media_store.INCOMING_DIR
+        stale, fresh = incoming / "stale.png", incoming / "fresh.png"
+        for file in (stale, fresh):
+            file.write_bytes(PNG_BYTES)
+        old = time.time() - 2 * 3600
+        os.utime(stale, (old, old))
+        self.store.sweep_incoming()
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.exists())
+        # Housekeeping and a restart reclaim leftovers too.
+        os.utime(fresh, (old, old))
+        self.store.cleanup(ttl_hours=72, max_total_bytes=1 << 30)
+        self.assertFalse(fresh.exists())
+        stale.write_bytes(PNG_BYTES)
+        os.utime(stale, (old, old))
+        reopened = MediaStore(self.root)
+        self.addCleanup(reopened.close)
+        self.assertFalse(stale.exists())
+
+    def test_unlink_is_best_effort_and_keeps_shard_directories(self):
+        meta = self.save("image", PNG_BYTES)
+        shard = self.store.asset_file(meta).parent
+        self.assertTrue(self.store.delete_asset(meta["id"]))
+        self.assertTrue(shard.is_dir())  # Empty shards stay: removing them races with new saves.
+        broken, healthy = Mock(), Mock()
+        broken.unlink.side_effect = OSError("read-only filesystem")
+        MediaStore._unlink([broken, healthy])
+        healthy.unlink.assert_called_once()
 
     def test_is_expired_follows_current_ttl(self):
         meta = self.save("image", PNG_BYTES)
@@ -289,7 +367,7 @@ class StoreTests(unittest.TestCase):
         release.set()
         worker.join(5)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(stalled.usage()["images"]["count"], 2)
+        self.assertEqual(stalled.usage(ttl_hours=72)["images"]["count"], 2)
 
     def test_v0_database_drops_expires_and_keeps_rows(self):
         self.store.close()
@@ -313,13 +391,13 @@ class StoreTests(unittest.TestCase):
                          media_store.SCHEMA_VERSION)
         meta = reopened.get_asset("img_old")
         self.assertEqual(meta["size"], 3)
-        self.assertEqual(reopened.usage()["images"]["count"], 1)
+        self.assertEqual(reopened.usage(ttl_hours=72)["images"]["count"], 1)
 
     def test_incoming_residue_is_not_counted(self):
-        before = self.store.usage()
+        before = self.store.usage(ttl_hours=72)
         stray = self.store.directory / media_store.INCOMING_DIR / "leftover.png"
         stray.write_bytes(PNG_BYTES)
-        self.assertEqual(self.store.usage(), before)
+        self.assertEqual(self.store.usage(ttl_hours=72), before)
         stray.unlink()
 
     def test_delete_clears_bound_tasks(self):
@@ -335,16 +413,16 @@ class StoreTests(unittest.TestCase):
     def test_pagination_cursors(self):
         for _ in range(3):
             self.save("image", PNG_BYTES)
-        page = self.store.list_assets(limit=2)
+        page = self.store.list_assets(limit=2, ttl_hours=72)
         self.assertEqual(len(page["items"]), 2)
         self.assertTrue(page["has_more"])
-        second = self.store.list_assets(kind="image", cursor=page["next_cursor"], limit=2)
+        second = self.store.list_assets(kind="image", cursor=page["next_cursor"], limit=2, ttl_hours=72)
         self.assertEqual(len(second["items"]), 1)
         self.assertFalse(second["has_more"])
         ids = [item["id"] for item in page["items"]] + [item["id"] for item in second["items"]]
         self.assertEqual(len(set(ids)), 3)
         with self.assertRaises(ValueError):
-            self.store.list_assets(cursor="not-json")
+            self.store.list_assets(cursor="not-json", ttl_hours=72)
         with self.assertRaises(ValueError):
             self.store.list_tasks(status="bogus")
 
@@ -435,7 +513,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertIn("b64_json", item)
         self.assertEqual(item["revised_prompt"], "synthetic")
         self.assertTrue(base64.b64decode(item["b64_json"]).startswith(b"\x89PNG"))
-        self.assertEqual(self.store.usage()["images"]["count"], 0)  # No local writes without a base URL.
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 0)  # No local writes without a base URL.
 
     def test_image_generation_persists_with_base_url(self):
         self.enterContext(patch.dict(converter.CONFIG, {"media_public_base_url": "https://media.example.com/"}))
@@ -457,7 +535,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         explicit = self.client.post("/v1/images/generations",
                                     json={"prompt": "a cat", "response_format": "b64_json"})
         self.assertIn("b64_json", explicit.json()["data"][0])
-        self.assertEqual(self.store.usage()["images"]["count"], 1)
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 1)
 
     def test_image_edit_shapes_upstream_body(self):
         result = self.client.post("/v1/images/edits", json={
@@ -467,6 +545,42 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertEqual(sent["model"], media_generation.DEFAULT_IMAGE_EDIT_MODEL)
         self.assertEqual(sent["image"], [f"{COS}/source.png"])
         self.assertEqual(self.media_requests[-1].url.path, "/v2/images/edits")
+
+    def test_data_uri_references_pass_and_oversized_ones_fail(self):
+        uri = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 30000).decode("ascii")
+        self.assertGreater(len(uri), media_generation.MAX_PROMPT_CHARS)
+        edited = self.client.post("/v1/images/edits", json={
+            "prompt": "make it blue", "images": [{"image_url": uri}]})
+        self.assertEqual(edited.status_code, 200, edited.text[:200])
+        self.assertEqual(json.loads(self.media_requests[-1].read())["image"], [uri])
+        video = self.client.post("/v1/videos", json={"image_url": uri})
+        self.assertEqual(video.status_code, 200, video.text[:200])
+        self.assertEqual(json.loads(self.media_requests[-1].read())["image_url"], uri)
+        sent = len(self.media_requests)
+        with patch.object(media_generation, "MAX_IMAGE_REF_CHARS", len(uri) - 1):
+            for path, payload in (
+                    ("/v1/images/edits", {"prompt": "x", "images": [{"image_url": uri}]}),
+                    ("/v1/videos", {"image_url": uri})):
+                result = self.client.post(path, json=payload)
+                self.assertEqual(result.status_code, 400, (path, result.text[:200]))
+        self.assertEqual(len(self.media_requests), sent)
+
+    def test_blank_prompts_never_reach_the_upstream(self):
+        source = [{"image_url": f"{COS}/source.png"}]
+        for blank in ("   ", "\n \t"):
+            for path, payload in (
+                    ("/v1/images/generations", {"prompt": blank}),
+                    ("/v1/images/edits", {"prompt": blank, "images": source}),
+                    ("/v1/videos", {"prompt": blank}),
+                    ("/v1/videos", {"prompt": blank, "image_url": f"{COS}/source.png"})):
+                result = self.client.post(path, json=payload)
+                self.assertEqual(result.status_code, 400, (path, blank, result.text[:200]))
+        self.assertEqual(self.media_requests, [])
+        # Multi-line prompts keep their whitespace verbatim.
+        prompt = "  line one\nline two \n"
+        result = self.client.post("/v1/images/generations", json={"prompt": prompt})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(json.loads(self.media_requests[-1].read())["prompt"], prompt)
 
     def test_image_validation_errors(self):
         cases = [
@@ -524,7 +638,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertNotIn("video", completed)  # No base URL configured yet.
         self.assertIn("media_public_base_url", completed["message"])
         self.assertEqual(completed["usage"], {"credit": 62.85})
-        self.assertEqual(self.store.usage()["videos"]["count"], 1)  # Video downloads always persist.
+        self.assertEqual(self.store.usage(ttl_hours=72)["videos"]["count"], 1)  # Video downloads always persist.
 
         # Configuring the base URL later surfaces the link without another upstream query.
         self.enterContext(patch.dict(converter.CONFIG, {"media_public_base_url": "https://media.example.com"}))
@@ -701,7 +815,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
                 results = [future.result() for future in futures]
         self.assertTrue(all(result.status_code == 200 for result in results), results)
         self.assertEqual(len(calls), 1)  # The per-task lock keeps one download.
-        self.assertEqual(self.store.usage()["videos"]["count"], 1)
+        self.assertEqual(self.store.usage(ttl_hours=72)["videos"]["count"], 1)
 
     def test_retryable_download_failure_recovers_on_next_query(self):
         task_id = self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
@@ -716,16 +830,77 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertIn("message", done)  # No base URL: the hint stays, no link.
         self.assertNotIn("error", done)
 
-    def test_cos_signature_expiry_is_terminal(self):
+    def new_video_task(self):
+        """Submit a video; the simulated upstream reuses one task id, so drop the old row first."""
+        self.store._db.execute("DELETE FROM tasks")
+        self.store._db.commit()
+        self.downloads = 0
+        self.cos_handlers = []
+        return self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
+
+    def test_cos_signature_gone_is_terminal(self):
+        for status in (403, 404, 410):
+            with self.subTest(status=status):
+                task_id = self.new_video_task()
+                self.cos_handlers = [(".mp4", status)]
+                first = self.client.get(f"/v1/videos/{task_id}").json()
+                self.assertEqual(first["status"], "failed")
+                self.assertIn("签名可能已过期", first["error"]["message"])
+                self.assertEqual(self.downloads, 1)
+                repeat = self.client.get(f"/v1/videos/{task_id}").json()
+                self.assertEqual(repeat, first)
+                self.assertEqual(self.downloads, 1)  # Terminal: no further download.
+
+    def test_other_download_statuses_stay_retryable(self):
+        for status in (408, 429, 400, 502):
+            with self.subTest(status=status):
+                task_id = self.new_video_task()
+                self.cos_handlers = [(".mp4", status)]
+                held = self.client.get(f"/v1/videos/{task_id}").json()
+                self.assertNotIn(held["status"], ("completed", "failed"))
+                self.assertIn("重试", held["message"])
+                self.assertEqual(self.downloads, 1)
+                self.cos_handlers = []
+                done = self.client.get(f"/v1/videos/{task_id}").json()
+                self.assertEqual(done["status"], "completed")
+                self.assertEqual(self.downloads, 2)
+
+    def test_store_write_failures_keep_the_paid_task_retryable(self):
+        for error in (OSError("disk full"), sqlite3.OperationalError("database is locked"),
+                      RuntimeError("busy")):
+            with self.subTest(error=type(error).__name__):
+                task_id = self.new_video_task()
+                with patch.object(self.store, "save_asset", side_effect=error):
+                    held = self.client.get(f"/v1/videos/{task_id}").json()
+                self.assertNotIn(held["status"], ("completed", "failed"))
+                self.assertIn("重试", held["message"])
+                done = self.client.get(f"/v1/videos/{task_id}").json()
+                self.assertEqual(done["status"], "completed")
+
+    def test_malformed_download_url_is_terminal(self):
+        with self.assertRaises(converter.MediaDownloadError):
+            asyncio.run(converter._media_download_bytes("http://[::1/video.mp4", "rid"))
+
+    def test_in_progress_task_has_no_message_without_a_hint(self):
+        self.video_task_status = "processing"
         task_id = self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
-        self.cos_handlers = [(".mp4", 403)]
-        first = self.client.get(f"/v1/videos/{task_id}").json()
-        self.assertEqual(first["status"], "failed")
-        self.assertIn("签名可能已过期", first["error"]["message"])
-        self.assertEqual(self.downloads, 1)
-        repeat = self.client.get(f"/v1/videos/{task_id}").json()
-        self.assertEqual(repeat, first)
-        self.assertEqual(self.downloads, 1)
+        body = self.client.get(f"/v1/videos/{task_id}").json()
+        self.assertEqual(body["status"], "in_progress")
+        self.assertNotIn("message", body)
+
+    def test_task_swept_during_refresh_answers_404(self):
+        task_id = self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
+        update = self.store.update_task
+
+        def update_then_sweep(*args, **kwargs):
+            update(*args, **kwargs)
+            self.store._db.execute("DELETE FROM tasks")
+            self.store._db.commit()
+
+        with patch.object(self.store, "update_task", side_effect=update_then_sweep):
+            result = self.client.get(f"/v1/videos/{task_id}")
+        self.assertEqual(result.status_code, 404, result.text)
+        self.assertEqual(result.json()["error"]["code"], "task_not_found")
 
     def test_partial_image_failure_returns_survivors(self):
         self.enterContext(patch.dict(converter.CONFIG, {"media_public_base_url": "https://media.example.com"}))
@@ -736,7 +911,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         data = result.json()["data"]
         self.assertEqual(len(data), 1)              # The surviving item still serves a link.
         self.assertTrue(data[0]["url"].startswith("https://media.example.com/v1/media/images/"))
-        self.assertEqual(self.store.usage()["images"]["count"], 1)
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 1)
 
     def test_total_image_failure_leaves_no_orphans(self):
         self.enterContext(patch.dict(converter.CONFIG, {"media_public_base_url": "https://media.example.com"}))
@@ -745,7 +920,34 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         result = self.client.post("/v1/images/generations", json={"prompt": "x", "n": 2})
         self.assertEqual(result.status_code, 502)
         self.assertIn("全部 2 张", result.json()["error"]["message"])
-        self.assertEqual(self.store.usage()["images"]["count"], 0)
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 0)
+
+    def test_extra_upstream_items_do_not_mask_a_total_failure(self):
+        self.image_urls = [f"{COS}/{name}.png" for name in "abcde"]
+        self.cos_handlers = [(".png", 404)]
+        result = self.client.post("/v1/images/generations", json={"prompt": "x", "n": 4})
+        self.assertEqual(result.status_code, 502, result.text[:200])
+        self.assertIn("全部 4 张", result.json()["error"]["message"])
+        self.assertEqual(self.downloads, 4)  # Only the first MAX_IMAGE_ITEMS are processed.
+
+    def test_unexpected_item_error_keeps_the_survivors(self):
+        self.enterContext(patch.dict(converter.CONFIG, {"media_public_base_url": "https://media.example.com"}))
+        self.image_urls = [f"{COS}/a.png", f"{COS}/b.png"]
+        download = converter._media_download_bytes
+
+        async def flaky(url, rid):
+            if url.endswith("b.png"):
+                raise httpx.InvalidURL("synthetic")
+            return await download(url, rid)
+
+        with patch.object(converter, "_media_download_bytes", side_effect=flaky):
+            result = self.client.post("/v1/images/generations", json={"prompt": "x", "n": 2})
+        self.assertEqual(result.status_code, 200, result.text)
+        data = result.json()["data"]
+        self.assertEqual(len(data), 1)
+        asset_id = data[0]["url"].rsplit("/", 1)[-1]
+        self.assertIsNotNone(self.store.get_asset(asset_id))  # The survivor stays referenced.
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 1)
 
     def test_store_unavailable_refuses_before_upstream(self):
         self.enterContext(patch.dict(converter.CONFIG, {
@@ -763,8 +965,6 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.store._db.commit()
         self.assertEqual(self.client.get(path).status_code, 404)  # Not served until the sweep.
 
-    def test_no_replay_on_server_errors(self):
-        self.image_status = 500
     def test_no_replay_on_server_errors(self):
         self.enterContext(patch.dict(converter.CONFIG, {"failover_max": 2}))
         self.image_status = 500
@@ -831,6 +1031,8 @@ class AdminMediaApiTests(unittest.TestCase):
                            "updated": time.time(), "status": "completed",
                            "media_id": None, "error": None, "credit": 3.5}
         self.gateway = Mock()
+        self.gateway._media_ttl_hours.side_effect = lambda: float(self.config["media_ttl_hours"])
+        self.gateway._media_max_bytes.side_effect = lambda: self.config["media_max_total_mb"] * 1048576
         self.gateway.admin_media_models.return_value = [{"id": "minimax-video-h3", "kinds": ["video"],
                                                          "sources": ["static"], "default": ["video"],
                                                          "accounts": 2}]
@@ -891,6 +1093,35 @@ class AdminMediaApiTests(unittest.TestCase):
         missing = self.client.post("/admin/media/tasks/missing/refresh", headers=self.headers)
         self.assertEqual(missing.status_code, 404)
         self.assertIn("视频任务不存在", missing.json()["error"]["message"])
+
+    def test_expired_assets_disappear_from_admin_views(self):
+        meta = self.store.save_asset("image", PNG_BYTES, model="m", ttl_hours=72, max_total_bytes=1 << 20)
+        self.store._db.execute("UPDATE assets SET created=?", (time.time() - 2 * 3600,))
+        self.store._db.commit()
+        path = f"/admin/media/assets/{meta['id']}"
+
+        def views():
+            listed = self.client.get("/admin/media/assets", headers=self.headers).json()["items"]
+            usage = self.client.get("/admin/media", headers=self.headers).json()["usage"]
+            return (len(listed), self.client.get(path, headers=self.headers).status_code,
+                    self.client.get(path + "/content", headers=self.headers).status_code,
+                    usage["images"]["count"])
+
+        self.assertEqual(views(), (1, 200, 200, 1))
+        self.config["media_ttl_hours"] = 1  # Shrinking the TTL applies before any sweep.
+        self.assertEqual(views(), (0, 404, 404, 0))
+
+    def test_media_routes_keep_the_generic_error_envelope(self):
+        refresh = self.gateway._media_video_refresh
+        refresh.side_effect = converter.HTTPException(status_code=409, detail="plain text detail")
+        result = self.client.post("/admin/media/tasks/t1/refresh", headers=self.headers)
+        self.assertEqual(result.status_code, 409)
+        self.assertTrue(result.json()["error"]["message"])
+        refresh.side_effect = RuntimeError("secret internal detail")
+        result = self.client.post("/admin/media/tasks/t1/refresh", headers=self.headers)
+        self.assertEqual(result.status_code, 500)
+        self.assertEqual(result.json()["error"]["message"], "管理操作失败，请检查存储状态后重试")
+        self.assertNotIn("secret", result.text)
 
     def test_unavailable_store_reports_service_error(self):
         self.config["media_store"] = None
