@@ -2212,6 +2212,32 @@ $white: var(--page);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+// Aggregated gateway web tool calls above a request's attempts: compact kpiCards that sit
+// in the panel's glass as wells, wrapping to two rows when the drawer is narrow.
+.toolSummary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+  padding: 0 22px 16px;
+}
+.toolSummary .kpiCard {
+  @include glass-well;
+  border-radius: 14px;
+  padding: 10px 14px 9px;
+}
+.toolSummary .kpiCard small {
+  min-height: 0;
+}
+.toolSummary .kpiCard strong {
+  font-size: 17px;
+  margin: 3px 0 0;
+}
+.toolSummary .toolFailed strong {
+  color: var(--error);
+}
+.toolBadge {
+  margin-inline-start: 6px;
+}
 .healthList {
   padding: 0 22px 18px;
 }

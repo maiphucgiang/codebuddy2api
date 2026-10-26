@@ -34,7 +34,11 @@ const request = {
   duration_ms: 1520,
   total_tokens: 420,
   credit: 0,
-  attempts: [{ outcome: "success", credential: "mock-account", status_code: 200 }],
+  attempts: [
+    { outcome: "success", credential: "mock-account", status_code: 200 },
+    { stage: "server_tool", model: "web-search", outcome: "success", duration_ms: 812.5 },
+    { stage: "server_tool", model: "web-fetch", outcome: "error", duration_ms: 40 },
+  ],
 };
 const settings = {
   revision: 1,
@@ -317,8 +321,10 @@ test("international OAuth choices send distinct sites and show the selected offi
 test("log tabs, cursor, details and guarded destructive clear", async ({ page }) => {
   const mock = await mockAPI(page);
   await page.goto("/dashboard/logs");
+  await expect(page.getByText("联网 2", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "查看详情" }).click();
   await expect(page.getByRole("heading", { name: "实际尝试", exact: true })).toBeVisible();
+  await expect(page.getByRole("group", { name: "联网工具汇总" })).toContainText("852.5 ms");
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "下一页" }).click();
   await expect(page.getByText("第 2 页", { exact: true })).toBeVisible();
