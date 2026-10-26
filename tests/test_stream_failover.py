@@ -458,6 +458,36 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
             converter.UpstreamHTTPError(403, json.dumps(refusal).encode()),
             json.dumps(refusal).encode()))
 
+    def test_account_and_model_restrictions_are_not_replayed(self):
+        for status, code in ((400, 11128), (403, 11140), (403, 11148)):
+            with self.subTest(code=code):
+                self.fresh_pool()
+                self.logs.clear()
+                message = "Illegal API invocation from an unapproved channel" if code == 11128 else "synthetic restriction"
+                body = {"code": code, "msg": message}
+                if code == 11140:
+                    body = {"code": "error", "error": {"code": code, "message": "restricted"}}
+                with allow_failover(3):
+                    self.poison_with_status(status, body)
+                    response, sent = self.stream_post()
+                self.assertEqual(response.status_code, status, response.text)
+                self.assertEqual(len(sent), 2 if code == 11128 else 1)
+                self.assertEqual(len(set(self.uids(sent))), 1, "限制响应不得扩散到其他账号")
+                self.assertEqual(self.failover_lines(), [])
+
+    def test_model_scoped_error_codes_are_not_replayed(self):
+        cases = ((500, 11134), (503, 11134), (400, 11102), (400, 11129),
+                 (400, 11150), (400, 11158))
+        for status, code in cases:
+            for wrapped in (False, True):
+                with self.subTest(status=status, code=code, wrapped=wrapped):
+                    payload = {"code": code, "msg": "synthetic model failure"}
+                    if wrapped:
+                        payload = {"code": "error", "error": {"code": code, "message": "model failure"}}
+                    raw = json.dumps(payload).encode()
+                    self.assertFalse(converter._failover_safe(
+                        converter.UpstreamHTTPError(status, raw), raw))
+
     def test_transport_before_request_body_fails_over(self):
         for error_type in REPLAYABLE_TRANSPORT:
             with self.subTest(error=error_type.__name__):

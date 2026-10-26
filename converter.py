@@ -463,6 +463,12 @@ MODEL_COOLDOWN = 600        # Model cooldown when a 429 omits reset time
 MODEL_COOLDOWN_MAX = 86400  # Maximum model cooldown in seconds
 UPSTREAM_BODY_AUDIT_LIMIT = 256 * 1024  # Bounded upstream error JSON kept per failed attempt.
 RESTRICTED_CODES = frozenset({"11140"})  # Upstream account-restriction codes; disable, never requeue.
+MODEL_RESTRICTED_CODES = frozenset({"11148"})
+MODEL_SCOPED_ERROR_CODES = frozenset({"11102", "11129", "11134", "11150", "11158"})
+# 11102 keeps its dedicated console-confirmed model failover.
+NO_FAILOVER_UPSTREAM_CODES = (RESTRICTED_CODES | MODEL_RESTRICTED_CODES
+                              | (MODEL_SCOPED_ERROR_CODES - {"11102"}) | {"11128"})
+MODEL_RESTRICTION_COOLDOWN = 30 * 60
 FRESH_401_LIMIT = 3         # Fresh-token 401s inside the window before auto-disable
 FRESH_401_WINDOW = 3600     # Sliding window for fresh-token 401 counting
 REFRESH_REJECT_LIMIT = 3    # Consecutive business refresh rejections before auto-disable
@@ -1535,13 +1541,32 @@ class CredentialPool:
     def note_status(self, cm: CredentialManager | None, status: int,
                     model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None,
                     channel_fallback=False):
-        """Apply credential-wide auth cooldowns, per-model 429 cooldowns and backend/model backoff."""
+        """Apply account, model and backend policy from the business code before the HTTP status."""
         if cm is None:
+            return
+        code, _, body = _upstream_diagnostic(raw or b"")
+        if code in MODEL_SCOPED_ERROR_CODES and code not in MODEL_NOT_SERVABLE_CODES:
+            return
+        not_servable = _parse_not_servable(raw, status) if model else None
+        if not_servable:
+            if channel_fallback:
+                # The console catalog is this account's detour, so its rejection must not block the
+                # shared domestic endpoint for accounts that still reach v2.
+                self._cool_model(cm, model, time.time() + MODEL_COOLDOWN, generation=generation,
+                                 reason=f"console {not_servable[0]}")
+            else:
+                self.note_not_servable(cm, model, code=not_servable[0], msg=not_servable[1], generation=generation)
+            return
+        if code in MODEL_SCOPED_ERROR_CODES:
+            return
+        if code in MODEL_RESTRICTED_CODES:
+            self._note_error_body(cm, body, generation=generation)
+            if model:
+                self._cool_model(cm, model, time.time() + MODEL_RESTRICTION_COOLDOWN,
+                                 generation=generation, reason=f"上游模型限制 {code}")
             return
         if status in (401, 403):
             self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
-            # One parse feeds the audit body, the restriction check and the tooltip.
-            code, _, body = _upstream_diagnostic(raw or b"")
             self._note_error_body(cm, body, generation=generation)
             if status == 403 and code in RESTRICTED_CODES:
                 self._auto_disable(cm, f"上游限制 {code}", generation=generation)
@@ -1553,16 +1578,6 @@ class CredentialPool:
             # console fallback (search, MCP) are left to request-scoped failover.
             if channel_fallback:
                 self.cooldown(cm, reason="backend channel check (HTTP 400)", generation=generation)
-            return
-        not_servable = _parse_not_servable(raw, status) if model else None
-        if not_servable:
-            if channel_fallback:
-                # The console catalog is this account's detour, so its rejection must not block the
-                # shared domestic endpoint for accounts that still reach v2.
-                self._cool_model(cm, model, time.time() + MODEL_COOLDOWN, generation=generation,
-                                 reason=f"console {not_servable[0]}")
-            else:
-                self.note_not_servable(cm, model, code=not_servable[0], msg=not_servable[1], generation=generation)
             return
         if status != 429 or not model:
             return
@@ -4605,13 +4620,15 @@ def _replay_cost_note(error) -> str:
 
 
 def _failover_safe(error, raw=b"") -> bool:
-    """Allow configured pre-response transport or HTTP failover, never filter or incomplete-stream replay."""
+    """Allow bounded failover without replaying restrictions, model errors or filtered responses."""
+    raw = raw or getattr(error, "raw", b"")
     if is_filter_error(raw):
+        return False
+    code, _, _ = _upstream_diagnostic(raw)
+    if code in NO_FAILOVER_UPSTREAM_CODES:
         return False
     if isinstance(error, UpstreamHTTPError):
         if error.status in FAILOVER_CODES:
-            return True
-        if error.status == 400 and is_channel_check_error(raw):
             return True
         return (error.from_channel_fallback
                 and _parse_not_servable(raw, error.status) is not None)
