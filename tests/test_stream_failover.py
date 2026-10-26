@@ -488,6 +488,21 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
                     self.assertFalse(converter._failover_safe(
                         converter.UpstreamHTTPError(status, raw), raw))
 
+    def test_prompt_prepend_is_not_duplicated_across_failover(self):
+        self.fresh_pool()
+        self.logs.clear()
+        with allow_failover(1), patch.dict(converter.CONFIG, {"prompt_mode": "prepend"}):
+            self.poison_with_status(429)
+            self.poison_once = True
+            response, sent = self.stream_post()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(sent), 2)
+        for request in sent:
+            body = json.loads(request.content)
+            systems = [m for m in body["messages"] if m.get("role") == "system"]
+            self.assertTrue(systems[0]["content"].startswith("You are CodeBuddy Code.\n"))
+            self.assertEqual(sum(m["content"] == systems[0]["content"] for m in systems), 1)
+
     def test_transport_before_request_body_fails_over(self):
         for error_type in REPLAYABLE_TRANSPORT:
             with self.subTest(error=error_type.__name__):

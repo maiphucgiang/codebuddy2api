@@ -23,6 +23,7 @@ Runtime keys in `.env` stay read-only in the WebUI until they are moved into the
 | `--auth-file` | scan `auth/` | Explicit credential file, repeatable; disables scanning other files |
 | `--log` | retired | Warns without writing a file; use SQLite logs in the WebUI |
 | `--desensitize` | off | Adapt fixed CLI templates, compact runtime prompts and mask keywords with zero-width characters |
+| `--prompt-mode` | `empty` | `empty` adds no gateway default system prompt; `prepend` inserts a concise official WorkBuddy/CodeBuddy prefix at the front; hot and WebUI-editable |
 | `--no-compact` | off | With desensitization, retain fuller instructions while adapting templates and pruning runtime context; does not disable Responses projection |
 | `--keep-tool-metadata [true/false]` | `false` | Retain tool descriptions and parameter-schema `description/title`, independently of prompt compaction |
 | `--skip-check` | off | Skip startup preflight |
@@ -291,7 +292,8 @@ Readable history is kept in `reasoning_content`, never ordinary answer text. Res
 
 ## Request boundaries
 
-- All three generation protocols normalize `developer` to `system`, move an existing system message first or insert a default. This normalization does not mutate the caller's payload. Optional [Responses projection](#responses-projection) and desensitization process content separately; the whole pipeline is not a verbatim pass-through by default.
+- All three generation protocols normalize `developer` to `system` and move an existing system message first without mutating the caller's payload. Optional [Responses projection](#responses-projection) and desensitization process content separately; the whole pipeline is not a verbatim pass-through by default.
+- `prompt_mode` is hot and configurable through WebUI, `--prompt-mode` or `CODEBUDDY2API_PROMPT_MODE`. Default `empty` adds no gateway system prompt and never clears caller instructions. `prepend` inserts exactly one prefix after routing: `You are WorkBuddy, a powerful AI assistant.` plus the official task goal for WorkBuddy profiles, or `You are CodeBuddy Code.` plus the official CLI task instructions for CLI profiles. The prefixes are distilled from the official templates, and retries do not duplicate them. DSH adaptation remains independent of this switch.
 - An always-on DSH adapter converts the official fixed identity, shared coding persona (preserving the model ID), minimal persona, direct `You are DeepSeek Harness.` and current/legacy DSH Web GUI role context to WorkBuddy wording in system, developer and assistant text and text blocks. It covers standard/PTC/Cordis/minimal/headless/web/SDK/ACP, leaves plan instructions, source-checkout descriptions and unrelated brand references unchanged, and remains active when desensitization is off. User/tool content is not globally rewritten.
 - Images count across all history and tool results, including duplicates, in message/content array order. The default keeps the newest 16, removing only excess images while retaining text and message structure; emptied image content receives a text placeholder.
 - `--image-policy error` returns local `413 / too_many_images`. JSON still over budget after processing returns `413 / request_too_large`, without further text truncation to fit the limit.

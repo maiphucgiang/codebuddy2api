@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx
 from fastapi.testclient import TestClient
 import converter as gateway
+from app import desensitize as desensitize_module
 from app.audit_store import AuditStore
 from app.observability import AuditMiddleware, observe_attempt
 from app.request_context import (RequestContext, RequestContextMiddleware, SessionIdentifierError,
@@ -201,6 +202,44 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                 upstream = self.fx.requests[-1].content.decode("utf-8")
                 self.assertNotIn(source, upstream)
                 self.assertGreaterEqual(upstream.count("You are WorkBuddy, a powerful AI assistant"), 2)
+
+    def test_prompt_modes_cover_profiles_protocols_and_client_instructions(self):
+        workbuddy = ("You are WorkBuddy, a powerful AI assistant.\n\n"
+                     "Your main goal is to follow the USER's instructions at each message, denoted by the <user_query> tag.")
+        codebuddy = ("You are CodeBuddy Code.\n\nYou are an interactive CLI tool that helps users with software engineering tasks. "
+                     "Use the instructions below and the tools available to you to assist the user. Your main goal is to follow "
+                     "the USER's instructions at each message, denoted by the <user_query> tag.")
+        for profile in fixtures.fixtures.PROFILES:
+            expected = workbuddy if profile.endswith("-work") else codebuddy
+            for route in fixtures.fixtures.GENERATIONS:
+                for has_system in (False, True):
+                    for mode in ("empty", "prepend"):
+                        with self.subTest(profile=profile, route=route, has_system=has_system, mode=mode):
+                            self.fx.configure(profiles=(profile,))
+                            body = self.fx.payload(route, system="client rules" if has_system else None)
+                            with patch.dict(gateway.CONFIG, {"prompt_mode": mode, "desensitize": False}):
+                                response = self.fx.client.post("/v1/" + route, json=body)
+                            self.assertEqual(response.status_code, 200, response.text)
+                            upstream = json.loads(self.fx.requests[-1].content)
+                            messages = upstream["messages"]
+                            systems = [m for m in messages if m.get("role") == "system"]
+                            if mode == "prepend":
+                                self.assertEqual(messages[0]["role"], "system")
+                                self.assertEqual(messages[0]["content"], expected)
+                                self.assertEqual(sum(m.get("content") == expected for m in systems), 1)
+                            else:
+                                self.assertNotIn(expected, [m.get("content") for m in systems])
+                                if not has_system:
+                                    self.assertEqual(systems, [])
+                            if has_system:
+                                self.assertIn("client rules", [m.get("content") for m in systems])
+                            self.assertNotIn("You are a helpful assistant.", [m.get("content") for m in systems])
+
+        original = {"messages": [{"role": "user", "content": "hi"}]}
+        once = desensitize_module.apply_system_prompt_mode(original, "cn-work", "prepend")
+        twice = desensitize_module.apply_system_prompt_mode(once, "cn-work", "prepend")
+        self.assertEqual(twice, once)
+        self.assertEqual(original, {"messages": [{"role": "user", "content": "hi"}]})
 
     def test_legacy_workbuddy_attempt_ids_are_independent(self):
         for profile in ("cn-work", "intl-work"):

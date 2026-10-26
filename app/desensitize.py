@@ -143,6 +143,17 @@ _DSH_MINIMAL_PATTERN = _template_pattern("You are a helpful software engineer as
 _DSH_DIRECT_PATTERN = _template_pattern("You are DeepSeek Harness")
 _DSH_WEB_GUI_PATTERN = _template_pattern("DeepSeek Harness Web GUI")
 _CHANNEL_IDENTITY_FIXED = _DSH_WORKBUDDY_IDENTITY
+
+WORKBUDDY_SYSTEM_PROMPT = (
+    "You are WorkBuddy, a powerful AI assistant.\n\n"
+    "Your main goal is to follow the USER's instructions at each message, denoted by the <user_query> tag."
+)
+CODEBUDDY_SYSTEM_PROMPT = (
+    "You are CodeBuddy Code.\n\n"
+    "You are an interactive CLI tool that helps users with software engineering tasks. "
+    "Use the instructions below and the tools available to you to assist the user. "
+    "Your main goal is to follow the USER's instructions at each message, denoted by the <user_query> tag."
+)
 _GIT_STATUS_CONTEXT = re.compile(
     r"^\s*(?:gitStatus:\s*|#\s*gitStatus\s*\n)"
     r"This is the git status at the start of the conversation\.", re.IGNORECASE | re.MULTILINE,
@@ -454,6 +465,22 @@ def desensitize_channel_body(body: dict) -> dict:
             ]
         messages.append(adapted)
     return {**body, "messages": messages}
+
+
+def apply_system_prompt_mode(body: dict, profile: str, mode: str) -> dict:
+    """Apply an optional profile prompt without mutating canonical messages."""
+    if mode == "empty":
+        return body
+    if mode != "prepend":
+        raise ValueError("prompt_mode 仅支持 empty 或 prepend")
+    prompt = WORKBUDDY_SYSTEM_PROMPT if profile in ("cn-work", "intl-work") else CODEBUDDY_SYSTEM_PROMPT
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system" \
+            and _content_to_text(messages[0].get("content")) == prompt:
+        return body
+    return {**body, "messages": [{"role": "system", "content": prompt}, *messages]}
 
 
 # ---------------------------------------------------------------------------

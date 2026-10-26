@@ -35,7 +35,7 @@ from starlette.concurrency import run_in_threadpool
 import uvicorn as uvicorn  # Keep the existing embedding/test hook.
 
 try:
-    from app.desensitize import desensitize_body, desensitize_channel_body
+    from app.desensitize import apply_system_prompt_mode, desensitize_body, desensitize_channel_body
 except ImportError:  # Disable desensitization when its module is unavailable.
     def desensitize_body(body, roles=("system",), desensitize_harness_user=False,
                          desensitize_tools=False, compact_harness=False,
@@ -43,6 +43,9 @@ except ImportError:  # Disable desensitization when its module is unavailable.
         return body
 
     def desensitize_channel_body(body):
+        return body
+
+    def apply_system_prompt_mode(body, profile, mode):
         return body
 
 from app.adapters.responses_adapter import (
@@ -2806,7 +2809,8 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "usage_daily_accounts": None,  # Independent per-account usage snapshots
                 "usage_snapshots": None,  # On-disk cache of the per-account snapshots
                 "credit_price_cny": None, "credit_price_usd": None, "usd_rate": None,
-                "desensitize": False, "no_compact": False, "keep_tool_metadata": False}  # None prices use module defaults.
+                "desensitize": False, "no_compact": False, "keep_tool_metadata": False,
+                "prompt_mode": "empty"}  # None prices use module defaults.
 
 # In-memory OAuth sessions do not survive restarts.
 _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
@@ -2944,6 +2948,7 @@ def _route_chat(payload, body, rid, *, tried=()):
         if routed_model != body.get("model"):
             body = {**body, "model": routed_model}
         body, merged_runs, merged_messages = merge_intl_user_images(body, profile)
+        body = apply_system_prompt_mode(body, profile, CONFIG.get("prompt_mode", "empty"))
         if body is not canonical:
             _guard_request_size(body)
         if merged_runs:
@@ -3827,10 +3832,7 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
     ]
     if messages[0].get("role") != "system":
         system_index = next((index for index, message in enumerate(messages) if message.get("role") == "system"), None)
-        if system_index is None:
-            messages = [{"role": "system", "content": "You are a helpful assistant."}, *messages]
-            message_indices.insert(0, None)
-        else:
+        if system_index is not None:
             messages = [messages[system_index], *messages[:system_index], *messages[system_index + 1:]]
             message_indices.insert(0, message_indices.pop(system_index))
     body["messages"] = normalize_chat_messages(messages, message_indices=message_indices)
@@ -5785,6 +5787,9 @@ def main():
     ap.add_argument("--no-compact", action="store_true",
                     help="配合 --desensitize 保留主要行为指令，仍适配固定模板并裁剪运行时元数据；"
                          "非流式纯审核拒绝最多压缩兜底一次。")
+    ap.add_argument("--prompt-mode", choices=("empty", "prepend"),
+                    default=os.environ.get("CODEBUDDY2API_PROMPT_MODE", "empty"),
+                    help="系统提示词：empty 不附加网关默认提示词（默认）；prepend 在最前面插入对应后端的精简官方提示词")
     ap.add_argument("--keep-tool-metadata", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_KEEP_TOOL_METADATA", "false"),
                     help="保留工具描述及参数 description/title；启用脱敏时仍处理描述文本，默认 false")
@@ -5879,7 +5884,7 @@ def main():
     for key in ("max_images", "image_policy", "max_request_bytes", "log_body_limit",
                 "tool_call_max_retry", "max_inbound_bytes", "max_collect_bytes", "max_concurrent",
                 "failover_max", "retry_write_timeout", "upstream_keepalive", "max_inflight_per_account",
-                "request_context_mode", "stream_mode", "model_capability_guard", "admin_allowed_origins",
+                "request_context_mode", "prompt_mode", "stream_mode", "model_capability_guard", "admin_allowed_origins",
                 "responses_projection_mode", "responses_projection_max_bytes", "routing_scheduler",
                 "catalog_probe_mode"):
         CONFIG[key] = getattr(args, key)

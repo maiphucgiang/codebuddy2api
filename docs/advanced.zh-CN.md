@@ -23,6 +23,7 @@ Compose 会加载 `.env` 中的每个键，注释掉一行即可解除锁定；�
 | `--auth-file` | 扫描 `auth/` | 指定凭据文件，可重复传入；不再扫描其他文件 |
 | `--log` | 已停用 | 提示弃用且不写文件；日志统一在 WebUI 查看 SQLite 记录 |
 | `--desensitize` | 关 | 适配固定 CLI 模板、压缩运行时提示、零宽脱敏关键词 |
+| `--prompt-mode` | `empty` | `empty` 不附加网关默认 system 提示词；`prepend` 在最前面插入精简的 WorkBuddy／CodeBuddy 官方前缀；热生效，可在 WebUI 配置 |
 | `--no-compact` | 关 | 配合脱敏保留主要行为指令，仍适配模板及裁剪运行时上下文；不关闭 Responses 投影 |
 | `--keep-tool-metadata [true/false]` | `false` | 保留工具描述及参数 schema 的 `description/title`，与提示词压缩独立 |
 | `--skip-check` | 关 | 跳过启动预检 |
@@ -292,7 +293,8 @@ Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 
 
 ## 请求边界
 
-- 三个生成协议统一将 `developer` 归一为 `system`，已有 system 移到首位，缺失时补默认值；归一化不修改调用方 payload。可选的 [Responses 投影](#responses-投影)和脱敏会另行处理内容，因此默认链路并非逐字透传。
+- 三个生成协议统一将 `developer` 归一为 `system`，已有 system 移到首位；归一化不修改调用方 payload。可选的 [Responses 投影](#responses-投影)和脱敏会另行处理内容，因此默认链路并非逐字透传。
+- `prompt_mode` 热生效，可在 WebUI、CLI 或环境变量配置。默认 `empty` 不附加网关 system 提示词，也不清空客户端已有指令。`prepend` 在选路后仅插入一次前缀：WorkBuddy 后端使用 `You are WorkBuddy, a powerful AI assistant.` 及官方任务目标，CLI 后端使用 `You are CodeBuddy Code.` 及官方 CLI 任务说明。前缀提炼自官方模板，重试不重复插入；DSH 适配不受此开关控制。
 - 独立 DSH 适配始终将官方固定身份、共享 coding persona（保留模型 ID）、minimal persona、`You are DeepSeek Harness.` 及当前／旧版 DSH Web GUI 角色语境转换为 WorkBuddy 表述，覆盖 system、developer、assistant 文本及文本块。适配 standard／PTC／Cordis／minimal／headless／web／SDK／ACP，保留 plan 指令、源码 checkout 说明和普通品牌引用，关闭脱敏也生效；不对 user/tool 内容做全局替换。
 - 图片计入全部历史和工具结果，重复图片逐次计数，按消息与内容块数组顺序判断新旧。默认保留最新 16 张，只移除超额图片并保留文本和消息结构；图片清空的内容用文本占位。
 - `--image-policy error` 在本地返回 `413 / too_many_images`。处理后仍超过字节上限则返回 `413 / request_too_large`，不为满足预算继续截断文本。
