@@ -70,14 +70,14 @@ Cherry Studio、ZCode、LobeChat、NextChat、Open WebUI 或自研 SDK 客户端
 
 流式策略是服务端设置，不是客户端请求字段。默认 `compatible` 保持 Responses 及带工具 Chat/Messages 的聚合行为；`realtime` 让三个协议都增量发送。两种模式的非流式请求均为经过校验的 JSON。配置、部分输出错误及不再自动重生成工具参数等限制见[流式模式](advanced.zh-CN.md#流式模式)。
 
-## 联网搜索
+## 联网搜索与抓取
 
-仅搜索的端点，上游为 `/agenttool/v1/search`：不调用模型，不产生 token 计费。
+搜索与抓取端点，上游为 agenttool 的 `/v1/search` 与 `/v1/webfetch`：不调用模型，不产生 token 计费。
 
 | 客户端 | 配置 |
 |--------|------|
-| MCP 客户端（Claude Code、Codex CLI 等） | Streamable-HTTP 服务器 `http://127.0.0.1:8787/v1/mcp`，暴露一个 `web_search` 工具 |
-| REST 客户端 | `POST /v1/search`，请求体 `{"query": "...", "max_results": 5}` |
+| MCP 客户端（Claude Code、Codex CLI 等） | Streamable-HTTP 服务器 `http://127.0.0.1:8787/v1/mcp`，暴露 `web_search` 与 `web_fetch` 工具 |
+| REST 客户端 | `POST /v1/search`，请求体 `{"query": "...", "max_results": 5}`；`POST /v1/fetch`，请求体 `{"url": "...", "prompt": "...", "max_length": 20000}` |
 
 ```bash
 claude mcp add --transport http web-search http://127.0.0.1:8787/v1/mcp \
@@ -86,10 +86,17 @@ codex mcp add web-search --url http://127.0.0.1:8787/v1/mcp --bearer-token-env-v
 
 curl http://127.0.0.1:8787/v1/search -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{"query": "rust edition guide", "max_results": 5}'
+
+curl http://127.0.0.1:8787/v1/fetch -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"url": "https://example.com/guide", "prompt": "summarize"}'
 ```
 
 - 与其他 `/v1` 端点使用同一个 API key。
 - `POST /v1/search` 校验 `query` 与 `max_results`（1–10），上游结果条目原样返回：`{"object": "search.results", "query", "total_results", "results": [{title, url, snippet, ...}]}`。
+- `POST /v1/fetch` 校验 `url`（http/https）及可选的 `prompt`、`max_length`（1–100000）；由上游抓取页面并整理为 markdown：`{"object": "fetch.result", "url", "title", "content", ...}`。指向内网的 URL（`localhost`、私有、链路本地等非公网 IP 地址，以及 `.local`／`.internal` 主机名）会在发起上游请求前被拒绝，REST 端点返回 400，MCP `web_fetch` 工具与网关执行的 `web_fetch` 服务端工具同样适用。该检查只看字面主机名，不检测仅经 DNS 解析到内网地址的域名。
+- 在推理请求里声明服务端联网工具——Anthropic 的 `web_search_*`／`web_fetch_*` 类型或 OpenAI 的 `web_search`／`web_search_options`——网关会改为在 agenttool 端点自行执行，并返回协议原生块（`server_tool_use` + `web_search_tool_result`／`web_fetch_tool_result`，或 `web_search_call`）。每次工具执行多产生一轮计费的模型往返；支持 `max_uses`、域名过滤与 `search_context_size`，`user_location` 忽略。
+- 搜索结果不会在多轮对话中丢失：模型能看到每条结果的标题、链接与摘要；输出的 `web_search_result` 块把摘要放进网关自有的 `encrypted_content` 值（前缀 `cb2api:`），`web_search_call` 项则带 `action.sources`。客户端把这些项回传（`server_tool_use`、`web_search_tool_result`、`web_fetch_tool_result`、`web_search_call`）时，网关会以普通文本上下文（而非工具调用）还原给模型；其他 `encrypted_content`（例如 Anthropic 的真实密文）会被忽略。带日期的 OpenAI 类型（如 `web_search_preview_2025_03_11`、`web_search_2025_08_26`）与不带日期的写法同样生效。
+- 网关执行的工具不会产生独立的审计记录：每次执行在触发它的请求中记为一条 `server_tool` 尝试（`model` 为 `web-search`／`web-fetch`，含结果、错误码、profile、凭证、尝试次数与耗时），该请求仍保留自己的模型、profile 与结果；其用量为所有上游轮次之和。
 - 网关按请求选号，并按网关 failover 配置做一次换号重试；上游确定性拒绝原样返回。
 
 ## 值得了解的协议行为

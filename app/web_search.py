@@ -7,21 +7,30 @@ MAX_RESULTS = 10
 QUERY_TIMEOUT = 20
 
 
-def request_body(query: str, max_results: int = DEFAULT_RESULTS) -> dict:
+def request_body(query: str, max_results: int = DEFAULT_RESULTS, *,
+                 allowed_domains=None, freshness: str = "") -> dict:
     count = max(1, min(int(max_results or DEFAULT_RESULTS), MAX_RESULTS))
-    return {"query": query, "type": "text2text", "max_results": count}
+    body = {"query": query, "type": "text2text", "max_results": count}
+    if isinstance(allowed_domains, (list, tuple)):
+        domains = [str(domain).strip() for domain in allowed_domains
+                   if str(domain).strip()]
+        if domains:
+            body["allowed_domains"] = domains
+    if isinstance(freshness, str) and freshness.strip():
+        body["freshness"] = freshness.strip()
+    return body
 
 
 def parse_results(payload) -> list:
     """Validate the upstream envelope and return its result items unchanged; raise ValueError on unusable bodies."""
     if not isinstance(payload, dict):
-        raise ValueError("search response must be a JSON object")
+        raise ValueError("搜索响应必须是 JSON 对象")
     code = payload.get("code")
     if code not in (None, 0, "0"):
-        raise ValueError(f"search failed: {payload.get('msg') or code}")
+        raise ValueError(f"搜索失败：{payload.get('msg') or code}")
     results = payload.get("results")
     if not isinstance(results, list):
-        raise ValueError("search response has no results list")
+        raise ValueError("搜索响应缺少 results 列表")
     return [item for item in results
             if isinstance(item, dict) and isinstance(item.get("url"), str) and item["url"]]
 

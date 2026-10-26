@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stateless Model Context Protocol endpoint exposing the web_search tool.
+"""Stateless Model Context Protocol endpoint exposing the web_search and web_fetch tools.
 
 One streamable-HTTP surface, no sessions and no server-initiated requests: each POST
 carries exactly one JSON-RPC message. The 2026-07-28 era is validated per request via
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app import web_search
+from app import web_fetch, web_search
 
 JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
@@ -58,10 +58,28 @@ TOOL = {
 }
 
 
-async def dispatch(headers, message, tool):
+FETCH_TOOL = {
+    "name": "web_fetch",
+    "title": "Web Fetch",
+    "description": "Fetch a URL and return its content as summarized markdown.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "The http(s) URL to fetch."},
+            "prompt": {"type": "string", "description": "What to extract from the page."},
+        },
+        "required": ["url"],
+    },
+    "annotations": {"readOnlyHint": True, "openWorldHint": True},
+}
+
+TOOLS = [TOOL, FETCH_TOOL]
+
+
+async def dispatch(headers, message, tools):
     """Handle one decoded JSON-RPC message; returns (status, body-or-None).
 
-    `tool(query, count)` awaits the search and returns (results, problem_text).
+    `tools` maps tool names to async callables returning (result, problem_text).
     Requests carrying params._meta.protocolVersion follow the 2026-07-28 rules;
     everything else is served under the legacy eras (initialize negotiates).
     """
@@ -73,8 +91,8 @@ async def dispatch(headers, message, tool):
     params = message.get("params")
     meta = params.get("_meta") if isinstance(params, dict) else None
     if isinstance(meta, dict) and meta.get(VERSION_KEY) is not None:
-        return await _modern(headers, message, tool)
-    return await _legacy(headers, message, tool)
+        return await _modern(headers, message, tools)
+    return await _legacy(headers, message, tools)
 
 
 def error_body(identifier, code, message):
@@ -90,7 +108,7 @@ def _header_version(headers):
     return value.strip() if isinstance(value, str) else None
 
 
-async def _legacy(headers, message, tool):
+async def _legacy(headers, message, tools):
     identifier = message.get("id")
     version = _header_version(headers)
     if version not in (None, *SUPPORTED_VERSIONS):
@@ -107,15 +125,15 @@ async def _legacy(headers, message, tool):
     if method == "ping":
         return 200, _result(identifier, {})
     if method == "tools/list":
-        return 200, _result(identifier, {"tools": [TOOL]})
+        return 200, _result(identifier, {"tools": TOOLS})
     if method == "tools/call":
-        return await _call_tool(message, tool)
+        return await _call_tool(message, tools)
     return 200, error_body(
         identifier, JSONRPC_METHOD_NOT_FOUND, f"Method not found: {method}"
     )
 
 
-async def _modern(headers, message, tool):
+async def _modern(headers, message, tools):
     identifier = message.get("id")
     method = message.get("method")
     meta_version = message["params"]["_meta"][VERSION_KEY]
@@ -146,10 +164,10 @@ async def _modern(headers, message, tool):
     if method == "tools/list":
         return 200, _result(
             identifier,
-            _complete({"tools": [TOOL], "ttlMs": LIST_TTL_MS, "cacheScope": "public"}),
+            _complete({"tools": TOOLS, "ttlMs": LIST_TTL_MS, "cacheScope": "public"}),
         )
     if method == "tools/call":
-        return await _call_tool(message, tool)
+        return await _call_tool(message, tools)
     return 404, error_body(
         identifier, JSONRPC_METHOD_NOT_FOUND, f"Method not found: {method}"
     )
@@ -173,31 +191,40 @@ def _result(identifier, payload):
     return {"jsonrpc": "2.0", "id": identifier, "result": payload}
 
 
-async def _call_tool(message, tool):
+async def _call_tool(message, tools):
     identifier = message.get("id")
     params = message.get("params")
     name = params.get("name") if isinstance(params, dict) else None
-    if name != TOOL["name"]:
+    if not isinstance(name, str) or name not in tools:
         return 200, error_body(
             identifier, JSONRPC_METHOD_NOT_FOUND, f"Unknown tool: {name}"
         )
     arguments = params.get("arguments") if isinstance(params, dict) else None
-    query, count, problem = _arguments(arguments)
-    if problem:
-        return 200, _result(identifier, _tool_error(problem))
-    results, problem = await tool(query, count)
-    if problem:
-        return 200, _result(identifier, _tool_error(problem))
+    if name == FETCH_TOOL["name"]:
+        url, prompt, problem = _fetch_arguments(arguments)
+        if problem:
+            return 200, _result(identifier, _tool_error(problem))
+        result, problem = await tools[name](url, prompt)
+        if problem:
+            return 200, _result(identifier, _tool_error(problem))
+        text = web_fetch.result_text(result)
+    else:
+        query, count, problem = _arguments(arguments)
+        if problem:
+            return 200, _result(identifier, _tool_error(problem))
+        results, problem = await tools[name](query, count)
+        if problem:
+            return 200, _result(identifier, _tool_error(problem))
+        text = web_search.search_text(query, results)
     return 200, _result(
         identifier,
         _complete(
             {
-                "content": [{"type": "text", "text": web_search.search_text(query, results)}],
+                "content": [{"type": "text", "text": text}],
                 "isError": False,
             }
         ),
     )
-
 
 def _arguments(arguments):
     if not isinstance(arguments, dict):
@@ -222,6 +249,19 @@ def _arguments(arguments):
             f"invalid arguments: count must be between 1 and {web_search.MAX_RESULTS}",
         )
     return query.strip(), number, ""
+
+
+def _fetch_arguments(arguments):
+    if not isinstance(arguments, dict):
+        return "", "", "invalid arguments: expected an object"
+    try:
+        url = web_fetch.validate_url(arguments.get("url"))
+    except ValueError as error:
+        return "", "", f"invalid arguments: {error}"
+    prompt = arguments.get("prompt")
+    if prompt is not None and not isinstance(prompt, str):
+        return "", "", "invalid arguments: prompt must be a string"
+    return url, prompt or "", ""
 
 
 def _tool_error(message):

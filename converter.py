@@ -19,12 +19,13 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -61,7 +62,8 @@ from app.usage_snapshots import UsageSnapshots
 from app.client_hangup import ClientHungUp, await_or_hangup
 from app.observability import (AuditMiddleware, observe_recovery, observe_route, observe_stream_mode,
                                observe_responses_projection, observe_usage, observe_attempt,
-                               observe_failure, observe_failure_seq, observe_discard)
+                               observe_failure, observe_failure_seq, observe_discard,
+                               observe_nested)
 from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
                                credential_file_lock)
 from app.upstream_io import (ChatSSEAccumulator, StreamOutputBudget, UpstreamHTTPError,
@@ -92,8 +94,9 @@ from app import perf_metrics
 from app.startup import allows_open_noauth, capture_launch, load_startup_env, restart_process, run_server
 from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
                               profile_for_auth, profile_for_headers, profile_region, profile_product,
-                              profile_site, chat_url_for_headers, search_url_for_headers, refresh_url_for_auth)
-from app import dsml, mcp_server, web_search
+                              profile_site, chat_url_for_headers, search_url_for_headers, fetch_url_for_headers,
+                              refresh_url_for_auth)
+from app import dsml, mcp_server, server_tools, web_fetch, web_search
 from app.inbound_limits import anthropic_path
 from app.client_profiles import (CLI_VERSION, CLI_USER_AGENT, credential_headers, catalog_cache_key,
                                  account_key, canonical_uid, enterprise_id_of, identity_email,
@@ -2799,10 +2802,17 @@ def _check_admin_auth(authorization: Optional[str], x_api_key: Optional[str]):
     _check_auth(authorization, x_api_key)
 
 
-def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(), requirements=None):
-    """Select a fresh credential lease and headers, excluding tried accounts; report unavailable capacity."""
+def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(), requirements=None,
+              sticky=True):
+    """Select a fresh credential lease and headers, excluding tried accounts; report unavailable capacity.
+
+    ``sticky=False`` neither reads nor rebinds the session binding, for calls that serve a session
+    without being its conversation (internal tool calls failing over from a borrowed account).
+    """
     context = current_context()
-    raw_key = context.session_key if context is not None and context.scoped else session_key(payload)
+    raw_key = None
+    if sticky:
+        raw_key = context.session_key if context is not None and context.scoped else session_key(payload)
     skey = f"{region}:{raw_key}" if raw_key and region is not None else raw_key
     skey = model_policy.sticky_scope(CONFIG, skey, model)
     pool = CONFIG.get("cred_pool")
@@ -3846,7 +3856,7 @@ async def chat_completions(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
 
     payload = _prepare_payload(payload)
     # Aggregation supports exactly one completion, so reject other n values.
@@ -3862,6 +3872,22 @@ async def chat_completions(request: Request,
     # Forward only supported request fields.
     client_wants_stream = _client_wants_stream(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
+    # Gateway-executed web tools: hosted web_search tool types plus web_search_options.
+    server_spec: dict = {}
+    if isinstance(body.get("tools"), list) and body["tools"]:
+        plain_tools, split_spec = server_tools.split_server_tools(body["tools"], openai_types=True)
+        body["tools"], server_spec = server_tools.merge_injected(plain_tools, split_spec)
+    if isinstance(payload.get("web_search_options"), dict) and server_tools.TOOL_SEARCH not in server_spec:
+        options_spec = {"WebSearch": server_tools.search_config_from_options(
+            payload["web_search_options"])}
+        body["tools"], options_active = server_tools.merge_injected(body.get("tools") or [], options_spec)
+        server_spec.update(options_active)
+    if server_spec:
+        body["_server_tools"] = server_spec
+    hosted_choice = body.get("tool_choice")
+    if isinstance(hosted_choice, dict) and server_tools.is_openai_search_type(hosted_choice.get("type")):
+        body["tool_choice"] = ({"type": "function", "function": {"name": server_tools.TOOL_SEARCH}}
+                               if server_tools.TOOL_SEARCH in server_spec else "auto")
     body = await run_in_threadpool(_prepare_chat_body, body, session_payload=payload)
     stream_policy = _snapshot_stream_policy("chat", body)
     observe_stream_mode(stream_policy.mode)
@@ -3890,8 +3916,9 @@ async def chat_completions(request: Request,
 
     # Aggregate upstream SSE for non-streaming clients.
     async def fetch(routed, cred, headers, url):
-        return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
-                                         filter_retry=True, max_collect_bytes=stream_policy.max_collect_bytes)
+        result, _records = await _run_server_tool_chat(
+            url, headers, routed, model_name, rid, cred, policy=stream_policy)
+        return result
     # Watch for disconnects across the entire failover sequence.
     try:
         collected = await await_or_hangup(
@@ -4109,6 +4136,13 @@ def _chat_result_to_sse_lines(m: dict) -> list[str]:
         lines.append("data: " + json.dumps(usage_chunk, ensure_ascii=False))
     lines.append("data: [DONE]")
     return lines
+
+
+async def _replay_merged_sse(merged: dict):
+    """Replay a collected completion as SSE lines, each followed by its blank event separator."""
+    for line in _chat_result_to_sse_lines(merged):
+        yield line
+        yield ""
 
 
 def _network_error_text(error: Exception) -> str:
@@ -4443,9 +4477,8 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
         result = await _fetch_checked_chat(
             url, headers, body, model_name, rid, cred,
             max_collect_bytes=policy.max_collect_bytes)
-        for line in _chat_result_to_sse_lines(_completion_to_merged(result)):
+        async for line in _replay_merged_sse(_completion_to_merged(result)):
             yield line
-            yield ""
         _log_finish(model_name, t0, result, rid)
         return
     if tracker is None:
@@ -4511,9 +4544,15 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     sent = False
     # Realtime delivers every reasoning delta as it arrives; only compatible keeps the
     # historical single-block replay that hides the reasoning timeline from clients.
-    upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, policy=policy)
-    if not policy.realtime:
-        upstream = _coalesce_reasoning_sse(upstream, max_bytes=policy.max_collect_bytes)
+    if body.get("_server_tools"):
+        # Gateway-executed web tools run as one aggregated loop, then replay.
+        merged, _records = await _run_server_tool_merged(
+            url, headers, body, model_name, t0, rid, cred, policy=policy)
+        upstream = _replay_merged_sse(merged)
+    else:
+        upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, policy=policy)
+        if not policy.realtime:
+            upstream = _coalesce_reasoning_sse(upstream, max_bytes=policy.max_collect_bytes)
     try:
         try:
             async for line in upstream:
@@ -4776,8 +4815,8 @@ async def _routed_fetch(payload, canonical, model_name, rid, t0, fetch, routed, 
                  f"{_replay_cost_note(error)}")
 
 
-def _wrap_search_error(status: int, raw: bytes, error) -> HTTPException:
-    """Re-shape upstream or transport failures as gateway error envelopes for search consumers."""
+def _wrap_agenttool_error(status: int, raw: bytes, error) -> HTTPException:
+    """Re-shape upstream or transport failures as gateway error envelopes for agenttool consumers."""
     detail = _safe_err_raw(raw, status)
     err = detail.get("error") if isinstance(detail, dict) else None
     if not (isinstance(detail, dict) and isinstance(err, dict) and err.get("message")):
@@ -4792,24 +4831,54 @@ def _wrap_search_error(status: int, raw: bytes, error) -> HTTPException:
                          headers=error.headers if isinstance(error, UpstreamHTTPError) else None)
 
 
-async def _web_search(query: str, max_results: int) -> list:
-    """Run one upstream web search with bounded credential failover; returns parsed results."""
-    rid = _request_id()
-    _log(f"[{rid}] ▶ WEB SEARCH | chars={len(query)} | max_results={max_results}")
-    body = web_search.request_body(query, max_results)
+@dataclass(frozen=True)
+class _AgentTool:
+    """One upstream agenttool endpoint: where it lives, how its reply is read and how it is reported."""
+    name: str                       # Route model and log tag, e.g. "web-search".
+    url_for: Callable[[dict], str]
+    timeout: float
+    parse: Callable[[Any], Any]     # Raises ValueError on an unusable body.
+    invalid_body: str               # Client-facing 502 text for a non-JSON body.
+    bad_response: str               # Failure code recorded for an unusable body.
+    summarize: Callable[[Any], str]
+
+
+_WEB_SEARCH = _AgentTool(
+    name="web-search", url_for=search_url_for_headers, timeout=web_search.QUERY_TIMEOUT,
+    parse=web_search.parse_results, invalid_body="搜索响应体不是有效的 JSON",
+    bad_response="bad_search_response", summarize=lambda results: f"{len(results)} 条")
+_WEB_FETCH = _AgentTool(
+    name="web-fetch", url_for=fetch_url_for_headers, timeout=web_fetch.FETCH_TIMEOUT,
+    parse=web_fetch.parse_content, invalid_body="网页抓取响应体不是有效的 JSON",
+    bad_response="bad_webfetch_response",
+    summarize=lambda content: f"{len(content.get('content') or '')} 字符")
+
+
+async def _agenttool_call(tool: _AgentTool, body: dict, rid: str, *, borrowed=None):
+    """POST one agenttool request with bounded credential failover; returns the parsed reply.
+
+    ``borrowed`` is a ``(cred, headers)`` lease the caller keeps owning: it serves the first
+    attempt and is never released here. Failover then leases other accounts outside the session
+    binding, so a conversation that lent its account never moves to another one.
+    """
+    label = tool.name.replace("-", " ").upper()
     tried = []
     recovered = None
     while True:
-        cred, headers = await run_in_threadpool(
-            lambda: _cred_for({"model": "web-search"}, None, tried=tried))
-        url = search_url_for_headers(headers)
+        owned = borrowed is None or bool(tried)
+        if owned:
+            cred, headers = await run_in_threadpool(lambda: _cred_for(
+                {"model": tool.name}, None, tried=tried, sticky=borrowed is None))
+        else:
+            cred, headers = borrowed
+        url = tool.url_for(headers)
         profile = profile_for_headers(headers)
-        observe_route(public_model="web-search", upstream_model=None, profile=profile,
+        observe_route(public_model=tool.name, upstream_model=None, profile=profile,
                       credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")))
         t0 = time.time()
         try:
-            async with _backend_stream(url, headers, body, timeout=web_search.QUERY_TIMEOUT,
-                                       rid=rid, model_name="web-search") as response:
+            async with _backend_stream(url, headers, body, timeout=tool.timeout,
+                                       rid=rid, model_name=tool.name) as response:
                 if response.status_code != 200:
                     _check_upstream_status(response.status_code, await read_bounded_error(response),
                                            cred, None, headers=response.headers)
@@ -4817,42 +4886,63 @@ async def _web_search(query: str, max_results: int) -> list:
             try:
                 payload = json.loads(raw.decode("utf-8", "replace"))
             except ValueError:
-                raise ValueError("invalid search response body") from None
-            results = web_search.parse_results(payload)
+                raise ValueError(tool.invalid_body) from None
+            result = tool.parse(payload)
         except (httpx.HTTPError, UpstreamResponseError) as error:
-            release_credential(cred)
-            status, raw = _upstream_failure(error, "web-search", t0, rid)
+            status, raw = _upstream_failure(error, tool.name, t0, rid)
             recovered = observe_failure_seq()
             tried.append(_cred_manager(cred))
             limit = _failover_limit()
             if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
-                raise _wrap_search_error(status, raw, error) from None
-            _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | web-search | 上游 HTTP {status}"
+                raise _wrap_agenttool_error(status, raw, error) from None
+            _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | {tool.name} | 上游 HTTP {status}"
                  f"{_replay_cost_note(error)}")
             continue
         except ValueError as error:
-            release_credential(cred)
-            observe_failure("bad_search_response")
+            observe_failure(tool.bad_response)
             raise HTTPException(status_code=502, detail={"error": {"message": str(error),
                                              "type": "upstream_error"}}) from None
-        release_credential(cred)
+        finally:
+            if owned:
+                release_credential(cred)
         _note_cred_model_ok(cred, None)
         if tried:
             observe_recovery(recovered)
-        _log(f"[{rid}] ✔ WEB SEARCH {len(results)} 条 | {profile} | {time.time() - t0:.1f}s")
-        return results
+        _log(f"[{rid}] ✔ {label} {tool.summarize(result)} | {profile} | {time.time() - t0:.1f}s")
+        return result
 
 
-async def _mcp_search(query: str, count: int):
-    """Adapter for the MCP tool layer; map gateway errors to tool text instead of HTTP failures."""
-    try:
-        return await _web_search(query, count), None
-    except HTTPException as error:
-        detail = error.detail.get("error", {}) if isinstance(error.detail, dict) else {}
-        message = str(detail.get("message") or error.detail or "web search failed")
-        code = detail.get("code") if isinstance(detail, dict) else None
-        observe_failure(str(code) if code else f"http_{error.status_code}")
-        return None, message
+async def _web_search(query: str, max_results: int, allowed_domains=None, freshness: str = "",
+                      *, borrowed=None) -> list:
+    """Run one upstream web search with bounded credential failover; returns parsed results."""
+    rid = _request_id()
+    _log(f"[{rid}] ▶ WEB SEARCH | chars={len(query)} | max_results={max_results}")
+    body = web_search.request_body(query, max_results, allowed_domains=allowed_domains,
+                                    freshness=freshness)
+    return await _agenttool_call(_WEB_SEARCH, body, rid, borrowed=borrowed)
+
+
+async def _web_fetch(url: str, prompt: str = "", max_length: int | None = None, *,
+                     borrowed=None) -> dict:
+    """Run one upstream web fetch with bounded credential failover; returns parsed content."""
+    rid = _request_id()
+    _log(f"[{rid}] ▶ WEB FETCH | chars={len(url)}")
+    body = web_fetch.request_body(url, prompt, max_length or web_fetch.DEFAULT_MAX_LENGTH)
+    return await _agenttool_call(_WEB_FETCH, body, rid, borrowed=borrowed)
+
+
+def _mcp_tool(call, failure: str):
+    """Adapt a gateway web tool for the MCP layer; map gateway errors to tool text instead of HTTP failures."""
+    async def run(*args):
+        try:
+            return await call(*args), None
+        except HTTPException as error:
+            detail = error.detail.get("error", {}) if isinstance(error.detail, dict) else {}
+            message = str(detail.get("message") or error.detail or failure)
+            code = detail.get("code") if isinstance(detail, dict) else None
+            observe_failure(str(code) if code else f"http_{error.status_code}")
+            return None, message
+    return run
 
 
 def _note_content_filter(rid, model_name, *, final):
@@ -4891,7 +4981,7 @@ async def create_response(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
 
     payload = _prepare_payload(payload, field="input")
     # Reject server-side conversation references because this gateway is stateless.
@@ -4961,6 +5051,54 @@ async def create_response(request: Request,
     return response
 
 
+async def _run_server_tool_chat(url, headers, routed, model_name, rid, cred, *, policy):
+    """Fetch one Chat completion, running declared gateway web tools to completion."""
+    spec = routed.get("_server_tools") or {}
+    continuing = False
+
+    async def fetch_chat(tool_body):
+        nonlocal continuing
+        if continuing:
+            # Continuations grow the body with fetched content. The first round was already
+            # measured by _prepare_chat_body and _route_chat.
+            await run_in_threadpool(_guard_request_size, tool_body)
+        continuing = True
+        return await _fetch_checked_chat(url, headers, tool_body, model_name, rid, cred,
+                                         filter_retry=True,
+                                         max_collect_bytes=policy.max_collect_bytes)
+    if not spec:
+        return await fetch_chat(routed), []
+    _log(f"[{rid}] ⚙ 内置联网工具已注入 | {sorted(spec)}")
+    # Tool calls are not requests of their own: they fold into this request's audit record,
+    # and they run on this attempt's account instead of leasing capacity or sticky binding.
+    borrowed = (cred, headers)
+
+    async def search_fn(query, count, allowed, freshness):
+        with observe_nested("web-search"):
+            return await _web_search(query, count, allowed, freshness, borrowed=borrowed)
+
+    async def fetch_fn(url, prompt, max_length):
+        with observe_nested("web-fetch"):
+            return await _web_fetch(url, prompt, max_length, borrowed=borrowed)
+
+    result, records = await server_tools.run_chat_tool_loop(
+        fetch_chat, routed, spec, search_fn=search_fn, fetch_fn=fetch_fn)
+    if records:
+        _log(f"[{rid}] ⚙ 内置联网工具执行 {len(records)} 次 | "
+             f"{[record['kind'] for record in records]}")
+        # Each round reported its own usage; the audit record holds the total.
+        observe_usage(result.get("usage") or {})
+    return result, records
+
+
+async def _run_server_tool_merged(url, headers, routed, model_name, t0, rid, cred, *, policy):
+    """Run gateway web tools for a streaming client; returns the final merged completion and records."""
+    result, records = await _run_server_tool_chat(
+        url, headers, routed, model_name, rid, cred, policy=policy)
+    _log_finish(model_name, t0, result, rid)
+    return _completion_to_merged(result), records
+
+
 async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False,
                              payload=None, canonical=None, request=None, policy=None):
     policy = policy or _snapshot_stream_policy("messages" if anthropic else "responses", body)
@@ -4970,13 +5108,22 @@ async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, a
                                           parallel_tool_calls=body.get("parallel_tool_calls", True),
                                           tool_registry=tool_registry))
 
+    server_records: list = []
+
     async def fetch(routed, cred, headers, url):
-        return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
-                                         filter_retry=True, max_collect_bytes=policy.max_collect_bytes)
+        result, records = await _run_server_tool_chat(
+            url, headers, routed, model_name, rid, cred, policy=policy)
+        server_records.extend(records)
+        return result
     try:
         collected = await await_or_hangup(
             _routed_fetch(payload, body if canonical is None else canonical,
                           model_name, rid, t0, fetch, body, cred, headers, url), request)
+        if server_records:
+            if anthropic:
+                converter.seed_server_tools(server_records)
+            else:
+                converter.seed_web_search_calls(server_records)
         for line in _chat_result_to_sse_lines(_completion_to_merged(collected)):
             converter.feed_line(_public_sse_line(line, model_name))
         converter.finish()
@@ -4999,7 +5146,9 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
     state = {}
     tracker = None
     declared_names = _declared_tool_names(body)
-    if policy.realtime:
+    # Gateway web tools replay one aggregated result, which the realtime accumulator never sees.
+    realtime = policy.realtime and not body.get("_server_tools")
+    if realtime:
         budget = StreamOutputBudget(policy.max_collect_bytes)
         tracker = ChatSSEAccumulator(collect=False, retain_tools=True, budget=budget,
                                      declared_names=declared_names)
@@ -5017,10 +5166,21 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
                                               parallel_tool_calls=body.get("parallel_tool_calls", True),
                                               tool_registry=tool_registry))
     sent = False
-    upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred,
-                               policy=policy, tracker=tracker, state=state)
-    if not policy.realtime:
-        upstream = _coalesce_reasoning_sse(upstream, max_bytes=policy.max_collect_bytes)
+    if body.get("_server_tools"):
+        # Gateway-executed web tools run as one aggregated loop, then replay.
+        merged, records = await _run_server_tool_merged(
+            url, headers, body, model_name, t0, rid, cred, policy=policy)
+        if records:
+            if anthropic:
+                converter.seed_server_tools(records)
+            else:
+                converter.seed_web_search_calls(records)
+        upstream = _replay_merged_sse(merged)
+    else:
+        upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred,
+                                   policy=policy, tracker=tracker, state=state)
+        if not realtime:
+            upstream = _coalesce_reasoning_sse(upstream, max_bytes=policy.max_collect_bytes)
     try:
         try:
             async for line in upstream:
@@ -5028,7 +5188,7 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
                 if events:
                     sent = True
                     yield events.encode("utf-8")
-            if policy.realtime:
+            if realtime:
                 converter.set_validated_tools((state.get("merged") or {}).get("tool_calls"))
                 if tracker.filter_detector.detected:
                     converter.mark_content_filter()
@@ -5088,7 +5248,7 @@ async def create_message(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
 
     payload = _prepare_payload(payload)
     # Convert Anthropic messages and tools to Chat format.
@@ -5136,14 +5296,15 @@ async def web_search_endpoint(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}",
-                                         "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
     query = payload.get("query") if isinstance(payload, dict) else None
     if not isinstance(query, str) or not query.strip():
-        raise HTTPException(status_code=400, detail={"error": {"message": "query is required",
+        raise HTTPException(status_code=400, detail={"error": {"message": "query 必须是非空字符串",
                                        "type": "invalid_request_error"}})
-    max_results, problem = _validated_max_results(payload.get("max_results")
-                                                  if isinstance(payload, dict) else None)
+    max_results, problem = _validated_count(payload.get("max_results")
+                                                 if isinstance(payload, dict) else None,
+                                                 web_search.DEFAULT_RESULTS, 1,
+                                                 web_search.MAX_RESULTS, "max_results")
     if problem:
         raise HTTPException(status_code=400, detail={"error": {"message": problem,
                                        "type": "invalid_request_error"}})
@@ -5151,15 +5312,51 @@ async def web_search_endpoint(request: Request,
     return {"object": "search.results", "query": query, "total_results": len(results), "results": results}
 
 
-def _validated_max_results(value) -> tuple[int, str]:
-    """Accept the upstream max_results field with the same bounds the MCP tool enforces."""
+@app.post("/v1/fetch")
+async def web_fetch_endpoint(request: Request,
+                             authorization: Optional[str] = Header(default=None),
+                             x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """Serve generic REST web fetches; returns the upstream content fields unchanged."""
+    _check_auth(authorization, x_api_key)
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise _bad_json(e) from None
+    try:
+        url = web_fetch.validate_url(payload.get("url") if isinstance(payload, dict) else None)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail={"error": {"message": str(error),
+                                         "type": "invalid_request_error"}}) from None
+    prompt = payload.get("prompt") if isinstance(payload, dict) else None
+    if prompt is not None and not isinstance(prompt, str):
+        raise HTTPException(status_code=400, detail={"error": {"message": "prompt 必须是字符串",
+                                         "type": "invalid_request_error"}})
+    max_length, problem = _validated_count(payload.get("max_length")
+                                               if isinstance(payload, dict) else None,
+                                               web_fetch.DEFAULT_MAX_LENGTH, 1,
+                                               web_fetch.MAX_LENGTH, "max_length")
+    if problem:
+        raise HTTPException(status_code=400, detail={"error": {"message": problem,
+                                         "type": "invalid_request_error"}})
+    result = await _web_fetch(url, prompt or "", max_length)
+    return {"object": "fetch.result", **result}
+
+
+def _bad_json(error: Exception) -> HTTPException:
+    """400 for an unparsable JSON request body."""
+    return HTTPException(status_code=400, detail={"error": {"message": f"bad json: {error}",
+                                                            "type": "invalid_request_error"}})
+
+
+def _validated_count(value, default: int, low: int, high: int, field: str) -> tuple[int, str]:
+    """Accept an integer query field with bounds; errors stay user-visible (Chinese)."""
     if value is None:
-        return web_search.DEFAULT_RESULTS, ""
+        return default, ""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not float(value).is_integer():
-        return 0, "max_results must be an integer"
+        return 0, f"{field} 必须是整数"
     number = int(value)
-    if number < 1 or number > web_search.MAX_RESULTS:
-        return 0, f"max_results must be between 1 and {web_search.MAX_RESULTS}"
+    if number < low or number > high:
+        return 0, f"{field} 必须在 {low} 到 {high} 之间"
     return number, ""
 
 
@@ -5167,7 +5364,7 @@ def _validated_max_results(value) -> tuple[int, str]:
 async def mcp_endpoint(request: Request,
                        authorization: Optional[str] = Header(default=None),
                        x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """Serve the stateless MCP streamable-HTTP surface exposing one web_search tool."""
+    """Serve the stateless MCP streamable-HTTP surface exposing the web_search and web_fetch tools."""
     _check_auth(authorization, x_api_key)
     origin = request.headers.get("origin")
     if origin:
@@ -5184,7 +5381,10 @@ async def mcp_endpoint(request: Request,
     if not executes:
         # 协议握手与列表请求不产生上游调用，不进入请求统计。
         observe_discard()
-    status, body = await mcp_server.dispatch(request.headers, message, _mcp_search)
+    status, body = await mcp_server.dispatch(
+        request.headers, message,
+        {"web_search": _mcp_tool(_web_search, "web search failed"),
+         "web_fetch": _mcp_tool(_web_fetch, "web fetch failed")})
     if status == 202 or body is None:
         return Response(status_code=202)
     return JSONResponse(body, status_code=status)
@@ -5209,7 +5409,7 @@ async def count_tokens(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail={"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}})
     return {"input_tokens": _estimate_input_tokens(payload)}

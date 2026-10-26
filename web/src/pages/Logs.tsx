@@ -23,7 +23,8 @@ import {
   Panel,
   ResourceState,
 } from "../components";
-import { eventActionLabel, eventKindLabel } from "../values";
+import { eventActionLabel, eventKindLabel, webToolLabel } from "../values";
+import { serverToolSummary } from "../serverTools";
 import { CreditFilters, CreditRow, useAccountNames } from "../CreditChanges";
 import { profiles } from "./Models";
 import s from "../ui.module.scss";
@@ -55,6 +56,31 @@ const outcomeLabels: Record<string, string> = {
   cancelled: "logs.outcome.cancelled",
   warning: "logs.outcome.warning",
 };
+function ServerToolSummary({ attempts }: { attempts: unknown }) {
+  const t = useT();
+  const summary = serverToolSummary(attempts);
+  if (!summary) return null;
+  return (
+    <>
+      <div className={s.toolSummary} role="group" aria-label={t("logs.tool.summary")}>
+        {(
+          [
+            [t("logs.tool.searches"), metric(summary.search), false],
+            [t("logs.tool.fetches"), metric(summary.fetch), false],
+            [t("logs.tool.failed"), metric(summary.failed), summary.failed > 0],
+            [t("logs.tool.time"), `${metric(summary.durationMs)} ms`, false],
+          ] as const
+        ).map(([label, value, failed]) => (
+          <div className={`${s.kpiCard} ${failed ? s.toolFailed : ""}`} key={label}>
+            <small>{label}</small>
+            <strong>{value}</strong>
+          </div>
+        ))}
+      </div>
+      {summary.truncated && <p className={s.note}>{t("logs.tool.truncated")}</p>}
+    </>
+  );
+}
 export function Logs() {
   const t = useT();
   const [kind, setKind] = useState("request");
@@ -279,6 +305,8 @@ export function Logs() {
                   {resource.data.items.map((item, i) => {
                     const outcome =
                       kind === "request" ? item.outcome : object(item.details ?? {}).outcome;
+                    const tools = kind === "request" ? serverToolSummary(item.attempts) : null;
+                    const toolModel = kind === "request" ? webToolLabel(item.model) : undefined;
                     return (
                       <tr key={text(item.id) + i}>
                         <td>
@@ -292,10 +320,18 @@ export function Logs() {
                         ) : (
                           <>
                             <td>
-                              <strong title={kind === "request" ? undefined : text(item.action)}>
+                              <strong
+                                title={
+                                  kind === "request"
+                                    ? toolModel && text(item.model)
+                                    : text(item.action)
+                                }
+                              >
                                 {text(
                                   kind === "request"
-                                    ? item.model
+                                    ? toolModel
+                                      ? t(toolModel)
+                                      : item.model
                                     : eventActionLabel(item.action)
                                       ? t(eventActionLabel(item.action)!)
                                       : item.action,
@@ -308,6 +344,15 @@ export function Logs() {
                                     : eventKindLabel(item.kind)
                                       ? t(eventKindLabel(item.kind)!)
                                       : item.kind,
+                                )}
+                                {tools && (
+                                  <span className={s.toolBadge}>
+                                    <Badge tone={tools.failed ? "bad" : "neutral"}>
+                                      {t("logs.tool.badge", {
+                                        n: tools.truncated ? `${tools.total}+` : tools.total,
+                                      })}
+                                    </Badge>
+                                  </span>
                                 )}
                               </small>
                               {kind === "request" && item.client_ip ? (
@@ -395,6 +440,7 @@ export function Logs() {
                 />
                 {Array.isArray(detail.attempts) && (
                   <Panel title={t("logs.attempts")}>
+                    <ServerToolSummary attempts={detail.attempts} />
                     {detail.attempts.length ? (
                       list(detail.attempts).map((attempt, i) => (
                         <div key={i}>

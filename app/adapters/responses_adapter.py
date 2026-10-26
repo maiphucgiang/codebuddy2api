@@ -10,6 +10,7 @@ import re
 import time
 from typing import Any
 
+from app import server_tools
 from app.reasoning import extract_reasoning_text, map_reasoning_controls
 from app.upstream_io import (StreamOutputBudget, merge_tool_call_delta, new_tool_state,
                              seal_tool_identities, tool_identity_complete)
@@ -61,8 +62,12 @@ def responses_request_to_chat(body: dict) -> dict:
             if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list):
                 raw_tools.extend(item["tools"])
 
+
+    # OpenAI hosted web_search tools are executed by the gateway itself.
+    plain_tools, spec = server_tools.split_server_tools(raw_tools, openai_types=True)
     registry, chat_tools = _build_tool_registry_and_chat_tools(
-        raw_tools, input_items=inp if isinstance(inp, list) else None)
+        plain_tools, input_items=inp if isinstance(inp, list) else None)
+    chat_tools, active_spec = server_tools.merge_injected(chat_tools, spec)
 
     messages: list[dict] = []
 
@@ -88,8 +93,18 @@ def responses_request_to_chat(body: dict) -> dict:
         chat["tools"] = chat_tools
     if registry.upstream_to_identity:
         chat["_tool_registry"] = registry.to_dict()
+    if active_spec:
+        chat["_server_tools"] = active_spec
     if "tool_choice" in body:
-        chat["tool_choice"] = _convert_tool_choice_for_chat(body["tool_choice"], tool_registry=registry)
+        choice = body["tool_choice"]
+        if isinstance(choice, dict) and server_tools.is_openai_search_type(choice.get("type")) \
+                and server_tools.TOOL_SEARCH in active_spec:
+            # Hosted tool_choice maps onto the injected gateway function, which the
+            # plain-tool registry does not know.
+            chat["tool_choice"] = {"type": "function",
+                                   "function": {"name": server_tools.TOOL_SEARCH}}
+        else:
+            chat["tool_choice"] = _convert_tool_choice_for_chat(choice, tool_registry=registry)
 
     # Forward supported parameters.
     for key in ("temperature", "top_p", "stop", "seed",
@@ -121,12 +136,19 @@ def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None)
     pending_assistant_content: str | list[dict] | None = None
     pending_tool_calls: list[dict] = []
     pending_reasoning: list[str] = []
+    # Executed web searches become text context ahead of the turn's own text.
+    pending_search_context: list[str] = []
 
     def _flush_assistant():
         nonlocal pending_assistant_content, pending_tool_calls
-        if pending_assistant_content is not None or pending_tool_calls or pending_reasoning:
-            msg: dict[str, Any] = {"role": "assistant",
-                                   "content": pending_assistant_content or ""}
+        if (pending_assistant_content is not None or pending_tool_calls or pending_reasoning
+                or pending_search_context):
+            content = pending_assistant_content or ""
+            if pending_search_context:
+                context = "\n".join(pending_search_context) + "\n"
+                content = ([{"type": "text", "text": context}] + content if isinstance(content, list)
+                           else context + content)
+            msg: dict[str, Any] = {"role": "assistant", "content": content}
             if pending_tool_calls:
                 msg["tool_calls"] = pending_tool_calls[:]
             if pending_reasoning:
@@ -135,6 +157,7 @@ def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None)
             pending_assistant_content = None
             pending_tool_calls.clear()
             pending_reasoning.clear()
+            pending_search_context.clear()
 
     def _set_assistant_content(content):
         nonlocal pending_assistant_content
@@ -174,6 +197,12 @@ def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None)
                 raise ValueError("reasoning requires an assistant item")
             text = extract_reasoning_text(item)
             pending_reasoning.append(text)
+            continue
+
+        if item_type == "web_search_call":
+            text = _web_search_call_text(item)
+            if text:
+                pending_search_context.append(text)
             continue
 
         # Untyped role messages
@@ -244,6 +273,21 @@ def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None)
 
     _flush_assistant()
     return messages
+
+
+def _web_search_call_text(item: dict) -> str:
+    """Render an echoed web_search_call as text with its query and source URLs."""
+    action = item.get("action")
+    if not isinstance(action, dict):
+        return ""
+    queries, sources = action.get("queries"), action.get("sources")
+    query = action.get("query") or (queries[0] if isinstance(queries, list) and queries else "")
+    results = [{"url": source["url"]} for source in (sources if isinstance(sources, list) else [])
+               if isinstance(source, dict) and isinstance(source.get("url"), str) and source["url"]]
+    if not query and not results:
+        return ""
+    error = "the search did not complete" if item.get("status") == "failed" else None
+    return server_tools.search_context_text(query, results, error=error)
 
 
 def _extract_content(content) -> str | list[dict]:
@@ -553,6 +597,45 @@ class ResponsesStreamConverter:
         self._usage: dict | None = None
         self._content_filter = False
         self._seq = 0  # Monotonic emitted-event sequence
+        # Executed gateway web searches to prepend as web_search_call items.
+        self._seed_search_calls: list[dict] = []
+        self._seeds_emitted = False
+        self._seed_count = 0  # Leading seeded items; compatible-mode indices start after them.
+
+    def seed_web_search_calls(self, records) -> None:
+        """Queue executed gateway web-search records; emitted as leading items."""
+        self._seed_search_calls = [record for record in (records or [])
+                                   if record.get("kind") == "search"]
+        self._seeds_emitted = False
+
+    def _search_call_item(self, record: dict, status: str) -> dict:
+        query = (record.get("input") or {}).get("query") or ""
+        action: dict[str, Any] = {"type": "search", "queries": [query] if query else []}
+        if status != "in_progress":
+            action["sources"] = [{"type": "url", "url": item["url"]}
+                                 for item in record.get("results") or [] if item.get("url")]
+        return {"type": "web_search_call", "id": record.get("id") or _rand_id("ws_"),
+                "status": status, "action": action}
+
+    def _seed_events(self) -> list[str]:
+        """Emit web_search_call items for executed gateway searches."""
+        if self._seeds_emitted:
+            return []
+        self._seeds_emitted = True
+        events: list[str] = []
+        self._seed_count = len(self._seed_search_calls)
+        for record in self._seed_search_calls:
+            final_status = "failed" if record.get("error") else "completed"
+            index = self._next_output_idx
+            self._next_output_idx += 1
+            events.append(self._evt("response.output_item.added",
+                                    {"output_index": index,
+                                     "item": self._search_call_item(record, "in_progress")}))
+            events.append(self._evt("response.output_item.done",
+                                    {"output_index": index,
+                                     "item": self._search_call_item(record, final_status)}))
+        return events
+
     # Public methods
 
     def feed_line(self, line: str) -> str:
@@ -589,11 +672,11 @@ class ResponsesStreamConverter:
         # Close reasoning items.
         if self._emitted_reasoning_item:
             events.append(self._evt("response.reasoning_summary_text.done", {
-                "output_index": 0, "summary_index": 0, "text": self._reasoning,
-                "item_id": self._reasoning_item_id
+                "output_index": self._reasoning_output_idx, "summary_index": 0,
+                "text": self._reasoning, "item_id": self._reasoning_item_id
             }))
             events.append(self._evt("response.output_item.done", {
-                "output_index": 0, "item": self._reasoning_item(status)
+                "output_index": self._reasoning_output_idx, "item": self._reasoning_item(status)
             }))
 
         # Close text content.
@@ -722,6 +805,7 @@ class ResponsesStreamConverter:
             events.append(self._evt("response.created", {"response": resp}))
             events.append(self._evt("response.in_progress", {"response": resp}))
             self._emitted_created = True
+            events.extend(self._seed_events())
 
         # usage
         if chunk.get("usage"):
@@ -842,10 +926,10 @@ class ResponsesStreamConverter:
             self._output_order.append((kind, index))
             return output_index
         if kind == "reasoning":
-            return 0
+            return self._seed_count
         if kind == "message":
-            return 1 if self._emitted_reasoning_item else 0
-        return ((1 if self._emitted_reasoning_item else 0)
+            return self._seed_count + (1 if self._emitted_reasoning_item else 0)
+        return (self._seed_count + (1 if self._emitted_reasoning_item else 0)
                 + (1 if self._emitted_msg_item else 0) + len(self._tool_calls))
 
     def _sync_tool_state(self, index: int, tool: dict) -> dict:
@@ -923,7 +1007,7 @@ class ResponsesStreamConverter:
     def _msg_idx(self) -> int:
         """Return the stable message index in realtime mode or the canonical placement."""
         return (self._message_output_idx if self._realtime else
-                1 if self._emitted_reasoning_item else 0)
+                self._seed_count + (1 if self._emitted_reasoning_item else 0))
 
     def _reasoning_item(self, status: str) -> dict:
         """Build a reasoning item with its text in the first summary block."""
@@ -965,7 +1049,8 @@ class ResponsesStreamConverter:
         return item
 
     def _response_obj(self, status: str, incomplete_reason: str | None = None) -> dict:
-        output = []
+        output = [self._search_call_item(record, "failed" if record.get("error") else "completed")
+                  for record in self._seed_search_calls]
         if self._realtime:
             for kind, index in self._output_order:
                 if kind == "reasoning" and self._emitted_reasoning_item:

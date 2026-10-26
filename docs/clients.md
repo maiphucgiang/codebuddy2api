@@ -70,14 +70,14 @@ The generation endpoints are `POST /v1/chat/completions`, `POST /v1/responses` a
 
 Streaming policy is a server setting, not a client request field. The default `compatible` mode aggregates Responses and tool-bearing Chat/Messages as before; `realtime` sends all three protocols incrementally. Non-streaming requests remain validated JSON in either mode. See [Streaming modes](advanced.md#streaming-modes) for configuration, partial-output errors and the loss of automatic tool-argument regeneration.
 
-## Web search
+## Web search and fetch
 
-Search-only endpoints backed by the upstream `/agenttool/v1/search`; no model is called and no tokens are billed.
+Search and fetch endpoints backed by the upstream agenttool `/v1/search` and `/v1/webfetch`; no model is called and no tokens are billed.
 
 | Client | Setup |
 |--------|-------|
-| MCP clients (Claude Code, Codex CLI, …) | Streamable-HTTP server at `http://127.0.0.1:8787/v1/mcp` exposing one `web_search` tool |
-| REST clients | `POST /v1/search` with `{"query": "...", "max_results": 5}` |
+| MCP clients (Claude Code, Codex CLI, …) | Streamable-HTTP server at `http://127.0.0.1:8787/v1/mcp` exposing `web_search` and `web_fetch` tools |
+| REST clients | `POST /v1/search` with `{"query": "...", "max_results": 5}`, `POST /v1/fetch` with `{"url": "...", "prompt": "...", "max_length": 20000}` |
 
 ```bash
 claude mcp add --transport http web-search http://127.0.0.1:8787/v1/mcp \
@@ -86,11 +86,18 @@ codex mcp add web-search --url http://127.0.0.1:8787/v1/mcp --bearer-token-env-v
 
 curl http://127.0.0.1:8787/v1/search -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{"query": "rust edition guide", "max_results": 5}'
+
+curl http://127.0.0.1:8787/v1/fetch -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"url": "https://example.com/guide", "prompt": "summarize"}'
 ```
 
 - Requests use the same API key as the other `/v1` endpoints.
 - `POST /v1/search` validates `query` and `max_results` (1–10) and returns the upstream result items unchanged: `{"object": "search.results", "query", "total_results", "results": [{title, url, snippet, ...}]}`.
 - The gateway picks an account per request and fails over once per gateway failover settings; deterministic upstream rejections are returned as-is.
+- `POST /v1/fetch` validates `url` (http/https), optional `prompt` and `max_length` (1–100000); the upstream fetches the page and summarizes it to markdown: `{"object": "fetch.result", "url", "title", "content", ...}`. URLs that target the internal network (`localhost`, private, link-local or other non-public IP addresses, `.local` / `.internal` hostnames) are rejected before any upstream request, on the REST endpoint (400), the MCP `web_fetch` tool and gateway-executed `web_fetch` server tools alike. The check is lexical: hostnames that only resolve to internal addresses (for example via DNS) are not detected.
+- Declaring server-side web tools — Anthropic `web_search_*` / `web_fetch_*` types or OpenAI `web_search` / `web_search_options` — makes the gateway execute them on the agenttool endpoints and return protocol-native blocks (`server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result`, or `web_search_call`). Each executed tool adds one billed model round-trip; `max_uses`, domain filters and `search_context_size` are honored, `user_location` is ignored.
+- Search results are not lost between turns. The model sees each result's title, link and snippet; emitted `web_search_result` blocks carry the snippet in a gateway-owned `encrypted_content` value (`cb2api:` prefix) and `web_search_call` items list `action.sources`. Clients that echo these items back (`server_tool_use`, `web_search_tool_result`, `web_fetch_tool_result`, `web_search_call`) get them replayed to the model as plain text context, not as tool calls. Other `encrypted_content` values, such as real Anthropic blobs, are ignored. Dated OpenAI types such as `web_search_preview_2025_03_11` and `web_search_2025_08_26` are accepted like their undated forms.
+- Gateway-executed tools do not create audit records of their own: each shows up as one `server_tool` attempt (`model` `web-search` or `web-fetch`, outcome, error code, profile, credential, tries, duration) inside the request that triggered it, which keeps its own model, profile and outcome. Its usage is the sum over every upstream round.
 
 ## Protocol behavior worth knowing
 

@@ -44,6 +44,7 @@ class WebSearchTests(fixtures.RegionRoutingTests):
         self.search_requests = []
         self.fail_first = 0
         self.search_status = 200
+        self.search_reply = None
         self.enterContext(patch.object(converter, "_log", side_effect=self.capture_log))
 
     def capture_log(self, message, *args, **kwargs):
@@ -63,6 +64,8 @@ class WebSearchTests(fixtures.RegionRoutingTests):
         self.assertEqual(request.headers["x-domain"], self.credentials[uid]["auth"]["domain"])
         payload = json.loads(request.content)
         self.assertEqual(payload["type"], "text2text")
+        if self.search_reply is not None:
+            return self.search_reply
         if self.fail_first:
             self.fail_first -= 1
             return httpx.Response(429, json={"error": {"message": "synthetic quota"}})
@@ -134,6 +137,27 @@ class WebSearchTests(fixtures.RegionRoutingTests):
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertEqual(payload["error"]["message"], "synthetic rejection")
         self.assertNotIn("type\": \"error", response.text)   # OpenAI 形态，非 Anthropic 信封
+
+    BAD_BODIES = (
+        (httpx.Response(200, content=b"<html>"), "搜索响应体不是有效的 JSON"),
+        (httpx.Response(200, json=[]), "搜索响应必须是 JSON 对象"),
+        (httpx.Response(200, json={"code": 15003, "msg": "boom"}), "搜索失败：boom"),
+        (httpx.Response(200, json={"code": 15003}), "搜索失败：15003"),
+        (httpx.Response(200, json={}), "搜索响应缺少 results 列表"),
+    )
+
+    def test_rest_unusable_upstream_body_is_a_chinese_502(self):
+        for reply, message in self.BAD_BODIES:
+            with self.subTest(message=message):
+                self.search_requests.clear()
+                self.search_reply = reply
+                with patch.dict(converter.CONFIG, {"failover_max": 1}):
+                    response = self.client.post("/v1/search", json=SEARCH_BODY)
+                self.assertEqual(response.status_code, 502, response.text)
+                self.assertEqual(response.json()["error"],
+                                 {"message": message, "type": "upstream_error"})
+                # A readable but unusable reply is not a failover case.
+                self.assertEqual(len(self.search_requests), 1)
 
     # -- MCP surface ---------------------------------------------------------
 
@@ -212,6 +236,22 @@ class WebSearchTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["error"]["code"], -32601)
 
+    def test_mcp_non_string_tool_name_is_an_unknown_tool(self):
+        for name in (["x"], {}, {"a": 1}, 7, None):
+            with self.subTest(name=name):
+                response = self.mcp_post(rpc(8, "tools/call", {"name": name, "arguments": {}}),
+                                         LEGACY_HEADERS)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["error"]["code"], -32601)
+        self.assertEqual(self.search_requests, [])
+
+    def test_mcp_unusable_upstream_body_is_a_tool_error(self):
+        self.search_reply = httpx.Response(200, content=b"<html>")
+        message = rpc(9, "tools/call", {"name": "web_search", "arguments": {"query": QUERY}})
+        result = self.mcp_post(message, LEGACY_HEADERS).json()["result"]
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["content"][0]["text"], "搜索响应体不是有效的 JSON")
+
     def test_mcp_upstream_failure_is_a_tool_error(self):
         self.search_status = 429
         message = rpc(9, "tools/call", {"name": "web_search", "arguments": {"query": QUERY}})
@@ -270,6 +310,15 @@ class WebSearchTests(fixtures.RegionRoutingTests):
         # 搜索不调用模型，usage 恒为空，不污染 token 统计。
         self.assertIsNone(record["input_tokens"])
         self.assertIsNone(record["output_tokens"])
+
+    def test_unusable_upstream_body_is_recorded_with_its_failure_code(self):
+        store, client = self.audited_client()
+        self.search_reply = httpx.Response(200, json={})
+        response = client.post("/v1/search", json=SEARCH_BODY)
+        self.assertEqual(response.status_code, 502, response.text)
+        records = store.list_records()["items"]
+        self.assertEqual(len(records), 1, records)
+        self.assertEqual(records[0]["error_code"], "bad_search_response")
 
     def test_audit_records_rest_search_protocol(self):
         store, client = self.audited_client()

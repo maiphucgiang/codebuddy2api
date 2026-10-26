@@ -207,10 +207,10 @@ class AuditStore:
             self._db.execute("CREATE TABLE IF NOT EXISTS ingest (id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at REAL NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, started_at REAL NOT NULL, model TEXT, profile TEXT, credential TEXT, outcome TEXT, status_code INTEGER, payload TEXT NOT NULL, logical_bytes INTEGER NOT NULL)")
             self._db.execute("CREATE INDEX IF NOT EXISTS requests_time ON requests(started_at,id)")
-            self._db.execute("CREATE TABLE IF NOT EXISTS attempts (request_id TEXT NOT NULL, ordinal INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(request_id,ordinal))")
             self._db.execute("CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, started_at REAL NOT NULL, kind TEXT NOT NULL, action TEXT, payload TEXT NOT NULL, logical_bytes INTEGER NOT NULL)")
             self._db.execute("CREATE INDEX IF NOT EXISTS events_time ON events(started_at,id)")
             self._init_accounting()
+            self._migrate_attempts()
             for table in ("stats_hourly", "stats_daily", "stats_totals"):
                 self._db.execute(f"CREATE TABLE IF NOT EXISTS {table} (bucket INTEGER NOT NULL, dimension TEXT NOT NULL, dimension_key TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(bucket,dimension,dimension_key))")
             self._migrate_ingest_time()
@@ -251,6 +251,17 @@ class AuditStore:
             self._db.execute("UPDATE requests SET duration_ms=json_extract(payload,'$.duration_ms')")
         self._db.execute("CREATE INDEX IF NOT EXISTS requests_duration ON requests(started_at,duration_ms)")
 
+    def _migrate_attempts(self):
+        # Attempts live only in the request payload; the per-row copy was never read.
+        if not self._db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='attempts'").fetchone():
+            return
+        # Recount without the duplicated attempts; audit_requests_update keeps detail_accounting in step.
+        self._db.execute("UPDATE requests SET logical_bytes=length(CAST(payload AS BLOB))+256")
+        # The old delete trigger cascades into the table dropped below.
+        self._db.execute("DROP TRIGGER IF EXISTS audit_requests_delete")
+        self._init_accounting()
+        self._db.execute("DROP TABLE attempts")
+
     def _open_read(self):
         """Fresh read-only WAL snapshot per call; None falls back to the write path."""
         try:
@@ -270,8 +281,7 @@ class AuditStore:
             self._db.execute("INSERT INTO detail_accounting SELECT 1,COALESCE((SELECT SUM(logical_bytes) FROM requests),0)+COALESCE((SELECT SUM(logical_bytes) FROM events),0),(SELECT COUNT(*) FROM requests),(SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM ingest),NULL")
         for table, counter in (("requests", "request_count"), ("events", "event_count")):
             self._db.execute(f"CREATE TRIGGER IF NOT EXISTS audit_{table}_insert AFTER INSERT ON {table} BEGIN UPDATE detail_accounting SET logical_bytes=logical_bytes+NEW.logical_bytes,{counter}={counter}+1 WHERE id=1; END")
-            cascade = "DELETE FROM attempts WHERE request_id=OLD.id;" if table == "requests" else ""
-            self._db.execute(f"CREATE TRIGGER IF NOT EXISTS audit_{table}_delete AFTER DELETE ON {table} BEGIN UPDATE detail_accounting SET logical_bytes=logical_bytes-OLD.logical_bytes,{counter}={counter}-1 WHERE id=1; {cascade} END")
+            self._db.execute(f"CREATE TRIGGER IF NOT EXISTS audit_{table}_delete AFTER DELETE ON {table} BEGIN UPDATE detail_accounting SET logical_bytes=logical_bytes-OLD.logical_bytes,{counter}={counter}-1 WHERE id=1; END")
             self._db.execute(f"CREATE TRIGGER IF NOT EXISTS audit_{table}_update AFTER UPDATE OF logical_bytes ON {table} BEGIN UPDATE detail_accounting SET logical_bytes=logical_bytes+NEW.logical_bytes-OLD.logical_bytes WHERE id=1; END")
         for operation, delta in (("INSERT", "+1"), ("DELETE", "-1")):
             self._db.execute(f"CREATE TRIGGER IF NOT EXISTS audit_ingest_{operation.lower()} AFTER {operation} ON ingest BEGIN UPDATE detail_accounting SET ingest_count=ingest_count{delta} WHERE id=1; END")
@@ -484,10 +494,7 @@ class AuditStore:
                     "INSERT INTO requests(id,started_at,model,profile,credential,outcome,status_code,payload,logical_bytes,client_ip,duration_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (data["id"], data["started_at"], data["model"], data["profile"], data["credential"],
                      data["outcome"], data["status_code"], payload,
-                     len(payload.encode()) + sum(len(json.dumps(a).encode()) + 32 for a in data["attempts"]) + 256,
-                     data["client_ip"], data["duration_ms"]))
-                for i, attempt in enumerate(data["attempts"]):
-                    db.execute("INSERT INTO attempts VALUES(?,?,?)", (data["id"], i, json.dumps(attempt)))
+                     len(payload.encode()) + 256, data["client_ip"], data["duration_ms"]))
             self._prune()
             return {"ok": True, "recorded": True, "details": bool(keep and db.execute("SELECT 1 FROM requests WHERE id=?", (data["id"],)).fetchone())}
         return self._run(commit, {"ok": False, "recorded": False, "reason": "storage_failure"}, write=True, dropped=True)
@@ -808,7 +815,7 @@ class AuditStore:
         if scope not in ("details", "all"):
             raise ValueError("invalid clear scope")
         def commit(db):
-            for table in ("requests", "attempts", "events"):
+            for table in ("requests", "events"):
                 db.execute(f"DELETE FROM {table}")
             db.execute("UPDATE detail_accounting SET cleanup_target=NULL WHERE id=1")
             db.execute("UPDATE state SET detail_generation=detail_generation+1,cleared_at=? WHERE id=1", (time.time(),))

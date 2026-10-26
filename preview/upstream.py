@@ -159,6 +159,7 @@ class Upstream:
             "/v2/chat/completions": self.chat,
             "/console/chat/completions": self.chat,
             "/agenttool/v1/search": self.search,
+            "/agenttool/v1/webfetch": self.webfetch,
             "/activity/growth/buddy/info": self.buddy_info,
             "/activity/growth/buddy/travel/status": self.travel_status,
             "/activity/growth/buddy/travel/config": self.travel_config,
@@ -413,6 +414,13 @@ class Upstream:
         return Reply(payload={"code": 0, "results": [
             {"title": f"{query} · 模拟结果 {index}", "url": f"https://example.com/preview/{index}",
              "snippet": f"预览环境为“{query}”生成的第 {index} 条搜索结果。"} for index in range(1, count + 1)]})
+
+    def webfetch(self, request, body, state):
+        url = str(body.get("url") or "")[:200]
+        return Reply(payload={"url": url, "title": "预览抓取",
+                              "content": f"# 预览环境为 {url} 生成的抓取内容。\n\n正文摘要。",
+                              "content_type": "text/markdown", "content_length": 64,
+                              "truncated": False, "status_code": 200})
 
     # -- growth center ------------------------------------------------------------------
 

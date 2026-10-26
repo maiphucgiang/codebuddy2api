@@ -48,7 +48,7 @@ vp exec playwright test -c playwright.integration.config.ts   # against the real
 **`converter.py`** is the monolithic gateway entry point. It owns:
 - The global `CONFIG` dict, which holds runtime state shared by everything: `control_store`, `audit_store`, `management`, ledgers and the resolved settings. Modules in `app/` receive it explicitly, or as `gateway.CONFIG` from the module object.
 - `CredentialManager` (one `.info` credential plus token refresh) and `CredentialPool` (account selection, cooldowns, model and site blocks).
-- The inference routes: `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/models`, `/v1/search` and `/v1/mcp`.
+- The inference routes: `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/models`, `/v1/search`, `/v1/fetch` and `/v1/mcp`. `app/server_tools.py` adapts protocol server-side web tools (`web_search_*`, `web_fetch_*`, `web_search`, `web_search_options`) into gateway-executed tools and drives the extra upstream rounds.
 - The legacy `/admin/*` credential routes.
 - Stream failover (`_StreamFailure`, `_DeferredStreamResponse`), which holds back the response status until the upstream proves healthy.
 - The background housekeeping and automation threads, started from `main()`.

@@ -45,13 +45,13 @@ Compose 默认拉取 `latest`（`CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebu
 |------|----------|
 | OpenAI Chat / Responses | `http://127.0.0.1:8787/v1` |
 | Anthropic Messages | `http://127.0.0.1:8787` |
-| MCP（web_search 工具） | `http://127.0.0.1:8787/v1/mcp` |
-| REST 联网搜索 | `POST http://127.0.0.1:8787/v1/search` |
+| MCP（web_search + web_fetch 工具） | `http://127.0.0.1:8787/v1/mcp` |
+| REST 联网搜索 / 抓取 | `POST http://127.0.0.1:8787/v1/search` / `POST http://127.0.0.1:8787/v1/fetch` |
 
 - **API Key**：与 WebUI 登录使用同一个密钥。
 - **模型**：使用 WebUI 中的对外 ID，或查询 `GET /v1/models`。
 - 国内、国际账号共用这些地址，无需额外的地域参数。Anthropic SDK 会自行追加 `/v1/messages`，不要把它写入 Base URL。
-- 搜索端点只做联网搜索，不调用模型，见[联网搜索](docs/clients.zh-CN.md#联网搜索)。
+- 搜索与抓取端点不调用模型。在请求里声明 Anthropic `web_search_*`／`web_fetch_*` 或 OpenAI `web_search` 服务端工具时，网关会自行执行，见[联网搜索与抓取](docs/clients.zh-CN.md#联网搜索与抓取)。
 - 工具参数：三种推理协议均会将空参数根转换为对象 Schema；带字段级布尔 `required` 标记的旧式参数映射会包入 `properties`，必填字段名汇总到根部。`pattern` 等 Schema 关键字若对应的是字段，仍按字段名处理。标准 Schema、含 `$`／`x-` 扩展的根以及嵌套 Schema 保持原样。
 
 [Codex CLI、Claude Code / CC Switch 等配置示例 →](docs/clients.zh-CN.md)

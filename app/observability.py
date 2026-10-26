@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
@@ -257,19 +258,60 @@ def observe_usage(usage):
         observation.usage(usage, "upstream_hook", 2)
 
 
+def _append_attempt(observation, entry):
+    if len(observation.attempts) < 32:
+        observation.attempts.append(entry)
+    else:
+        # Reserve the last slot for a bounded overflow marker, not an unbounded trace.
+        previous = observation.attempts[-1]
+        dropped = previous.get("dropped", 0) + 1 if previous.get("stage") == "attempts_truncated" else 2
+        observation.attempts[-1] = safe_attempt({"stage": "attempts_truncated", "dropped": dropped})
+
+
 def observe_attempt(stage, **safe_metadata):
     observation = _current.get()
     if observation is not None:
         context = current_context()
         metadata = context.attempt_metadata() if context is not None else {}
-        entry = safe_attempt({**metadata, **safe_metadata, "stage": stage})
-        if len(observation.attempts) < 32:
-            observation.attempts.append(entry)
-        else:
-            # Reserve the last slot for a bounded overflow marker, not an unbounded trace.
-            previous = observation.attempts[-1]
-            dropped = previous.get("dropped", 0) + 1 if previous.get("stage") == "attempts_truncated" else 2
-            observation.attempts[-1] = safe_attempt({"stage": "attempts_truncated", "dropped": dropped})
+        _append_attempt(observation, safe_attempt({**metadata, **safe_metadata, "stage": stage}))
+
+
+@contextmanager
+def observe_nested(model):
+    """Run a gateway-internal upstream call without touching the request's own fields.
+
+    Inside, every observe_* call lands on a temporary child observation; on exit
+    the enclosing request gets one ``server_tool`` attempt summarizing it. Without
+    an enclosing observation this is a no-op.
+    """
+    parent = _current.get()
+    if parent is None:
+        yield
+        return
+    child = _Observation({}, time.monotonic())
+    token = _current.set(child)
+    error = None
+    try:
+        yield
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        _current.reset(token)
+        tries = [entry for entry in child.attempts if entry.get("stage") == "upstream_attempt"]
+        failed = child.failed or error is not None
+        entry = {"stage": "server_tool", "model": model,
+                 "outcome": "error" if failed else "success",
+                 "profile": child.record.get("profile"),
+                 "credential": child.record.get("credential"),
+                 "attempt": len(tries),
+                 "duration_ms": (time.monotonic() - child.monotonic_start) * 1000,
+                 "status_code": next((item["status_code"] for item in reversed(child.attempts)
+                                      if "status_code" in item), None),
+                 "upstream_request_id": tries[-1].get("upstream_request_id") if tries else None}
+        if failed:
+            entry["error_code"] = child.record.get("error_code") or type(error).__name__
+        _append_attempt(parent, safe_attempt(entry))
 
 
 def observe_failure(code):

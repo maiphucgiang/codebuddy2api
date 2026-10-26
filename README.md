@@ -45,13 +45,13 @@ The template binds to localhost only. Configure HTTPS and restrict network acces
 |----------|----------|
 | OpenAI Chat / Responses | `http://127.0.0.1:8787/v1` |
 | Anthropic Messages | `http://127.0.0.1:8787` |
-| MCP (web_search tool) | `http://127.0.0.1:8787/v1/mcp` |
-| REST web search | `POST http://127.0.0.1:8787/v1/search` |
+| MCP (web_search + web_fetch) | `http://127.0.0.1:8787/v1/mcp` |
+| REST web search / fetch | `POST http://127.0.0.1:8787/v1/search` / `POST http://127.0.0.1:8787/v1/fetch` |
 
 - **API key:** the same key used to sign in to the WebUI.
 - **Model:** a public ID from the WebUI or `GET /v1/models`.
 - All accounts share these URLs; no region parameter is needed. Anthropic SDKs append `/v1/messages` themselves, so leave it out of the Base URL.
-- The search endpoints run web searches only — no model calls. See [Web search](docs/clients.md#web-search).
+- The search and fetch endpoints never call a model. Declaring Anthropic `web_search_*` / `web_fetch_*` or OpenAI `web_search` server tools makes the gateway execute them itself. See [Web search and fetch](docs/clients.md#web-search-and-fetch).
 - Tool parameters: across all three inference protocols, an empty parameter root becomes an object schema. Legacy field maps with boolean `required` flags are wrapped in `properties`, with required names collected at the root. A schema keyword such as `pattern` still counts as a field name when it holds a field. Standard schemas, roots with `$`/`x-` extensions, and nested schemas are left untouched.
 
 [Codex CLI, Claude Code / CC Switch and other client examples →](docs/clients.md)

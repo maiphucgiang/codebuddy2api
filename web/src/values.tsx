@@ -157,6 +157,7 @@ const labels: Record<string, string> = {
   automatic_vacuum: "自动压缩",
   lock_timeout_ms: "锁等待上限",
   sql_deadline_ms: "SQL 执行上限",
+  dropped: "省略条数",
 };
 const profiles: Record<string, string> = {
   "cn-cli": "大陆 · CodeBuddy",
@@ -329,7 +330,16 @@ export function bytes(value: number) {
   if (value < 1073741824) return `${(value / 1048576).toFixed(1)} MiB`;
   return `${(value / 1073741824).toFixed(2)} GiB`;
 }
+// Model names the gateway reports for its own web tools, e.g. on /v1/search records.
+const webToolKeys: Record<string, MessageKey> = {
+  "web-search": "val.tool.web_search",
+  "web-fetch": "val.tool.web_fetch",
+};
+export function webToolLabel(model: unknown) {
+  return typeof model === "string" ? ownLabel(webToolKeys, model) : undefined;
+}
 const valueKeys: Record<string, MessageKey> = {
+  ...webToolKeys,
   success: "val.success",
   error: "val.error",
   cancelled: "val.cancelled",
@@ -356,6 +366,8 @@ const valueKeys: Record<string, MessageKey> = {
   send: "val.stage.send",
   collect: "val.stage.collect",
   refresh: "val.stage.refresh",
+  server_tool: "val.stage.server_tool",
+  attempts_truncated: "val.stage.attempts_truncated",
   info: "val.level.info",
   rate_probe: "val.protocol.rate_probe",
 };
