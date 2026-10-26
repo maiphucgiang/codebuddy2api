@@ -3848,7 +3848,7 @@ async def chat_completions(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
 
     payload = _prepare_payload(payload)
     # Aggregation supports exactly one completion, so reject other n values.
@@ -4986,7 +4986,7 @@ async def create_response(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
 
     payload = _prepare_payload(payload, field="input")
     # Reject server-side conversation references because this gateway is stateless.
@@ -5245,7 +5245,7 @@ async def create_message(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
 
     payload = _prepare_payload(payload)
     # Convert Anthropic messages and tools to Chat format.
@@ -5293,14 +5293,15 @@ async def web_search_endpoint(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}",
-                                         "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
     query = payload.get("query") if isinstance(payload, dict) else None
     if not isinstance(query, str) or not query.strip():
-        raise HTTPException(status_code=400, detail={"error": {"message": "query is required",
+        raise HTTPException(status_code=400, detail={"error": {"message": "query 必须是非空字符串",
                                        "type": "invalid_request_error"}})
-    max_results, problem = _validated_max_results(payload.get("max_results")
-                                                  if isinstance(payload, dict) else None)
+    max_results, problem = _validated_count(payload.get("max_results")
+                                                 if isinstance(payload, dict) else None,
+                                                 web_search.DEFAULT_RESULTS, 1,
+                                                 web_search.MAX_RESULTS, "max_results")
     if problem:
         raise HTTPException(status_code=400, detail={"error": {"message": problem,
                                        "type": "invalid_request_error"}})
@@ -5317,8 +5318,7 @@ async def web_fetch_endpoint(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}",
-                                         "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
     try:
         url = web_fetch.validate_url(payload.get("url") if isinstance(payload, dict) else None)
     except ValueError as error:
@@ -5326,10 +5326,12 @@ async def web_fetch_endpoint(request: Request,
                                          "type": "invalid_request_error"}}) from None
     prompt = payload.get("prompt") if isinstance(payload, dict) else None
     if prompt is not None and not isinstance(prompt, str):
-        raise HTTPException(status_code=400, detail={"error": {"message": "prompt must be a string",
+        raise HTTPException(status_code=400, detail={"error": {"message": "prompt 必须是字符串",
                                          "type": "invalid_request_error"}})
-    max_length, problem = _validated_max_length(payload.get("max_length")
-                                                if isinstance(payload, dict) else None)
+    max_length, problem = _validated_count(payload.get("max_length")
+                                               if isinstance(payload, dict) else None,
+                                               web_fetch.DEFAULT_MAX_LENGTH, 1,
+                                               web_fetch.MAX_LENGTH, "max_length")
     if problem:
         raise HTTPException(status_code=400, detail={"error": {"message": problem,
                                          "type": "invalid_request_error"}})
@@ -5337,27 +5339,21 @@ async def web_fetch_endpoint(request: Request,
     return {"object": "fetch.result", **result}
 
 
-def _validated_max_results(value) -> tuple[int, str]:
-    """Accept the upstream max_results field with the same bounds the MCP tool enforces."""
-    if value is None:
-        return web_search.DEFAULT_RESULTS, ""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not float(value).is_integer():
-        return 0, "max_results must be an integer"
-    number = int(value)
-    if number < 1 or number > web_search.MAX_RESULTS:
-        return 0, f"max_results must be between 1 and {web_search.MAX_RESULTS}"
-    return number, ""
+def _bad_json(error: Exception) -> HTTPException:
+    """400 for an unparsable JSON request body."""
+    return HTTPException(status_code=400, detail={"error": {"message": f"bad json: {error}",
+                                                            "type": "invalid_request_error"}})
 
 
-def _validated_max_length(value) -> tuple[int, str]:
-    """Accept the webfetch max_length field with the upstream bounds."""
+def _validated_count(value, default: int, low: int, high: int, field: str) -> tuple[int, str]:
+    """Accept an integer query field with bounds; errors stay user-visible (Chinese)."""
     if value is None:
-        return web_fetch.DEFAULT_MAX_LENGTH, ""
+        return default, ""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not float(value).is_integer():
-        return 0, "max_length must be an integer"
+        return 0, f"{field} 必须是整数"
     number = int(value)
-    if number < 1 or number > web_fetch.MAX_LENGTH:
-        return 0, f"max_length must be between 1 and {web_fetch.MAX_LENGTH}"
+    if number < low or number > high:
+        return 0, f"{field} 必须在 {low} 到 {high} 之间"
     return number, ""
 
 
@@ -5409,7 +5405,7 @@ async def count_tokens(request: Request,
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+        raise _bad_json(e) from None
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail={"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}})
     return {"input_tokens": _estimate_input_tokens(payload)}

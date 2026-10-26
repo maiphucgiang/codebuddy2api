@@ -331,6 +331,33 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(self.queries[0][2], ["allowed.com"])
         self.assertEqual(records[0]["results"], [])
 
+    def test_continuation_keeps_reasoning_content(self):
+        body = {"messages": [{"role": "user", "content": "q"}], "tools": []}
+        state = {"rounds": [
+            {"choices": [{"index": 0, "message": {
+                "role": "assistant", "content": None, "reasoning_content": "thinking",
+                "tool_calls": [{"id": "call_1", "type": "function",
+                                "function": {"name": "WebSearch",
+                                             "arguments": json.dumps({"query": QUERY})}}]},
+                "finish_reason": "tool_calls"}]},
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}]}
+
+        async def fetch_chat(tool_body):
+            return state["rounds"].pop(0)
+
+        async def search_fn(query, count, allowed, freshness):
+            return [dict(SEARCH_RESULT)]
+
+        async def fetch_fn(url, prompt, max_length):
+            return {"url": url, "content": "body"}
+
+        _run(server_tools.run_chat_tool_loop(
+            fetch_chat, body, {"WebSearch": {"max_uses": None, "allowed_domains": None,
+                                             "blocked_domains": None, "max_results": 5}},
+            search_fn=search_fn, fetch_fn=fetch_fn))
+        assistant = body["messages"][1]
+        self.assertEqual(assistant["reasoning_content"], "thinking")
+
     def test_tool_choice_and_tools_restored_after_loop(self):
         body = {"messages": [{"role": "user", "content": "q"}],
                 "tools": [{"type": "function", "function": {"name": "WebSearch"}}],
@@ -541,11 +568,7 @@ class SeedTests(unittest.TestCase):
          "content": {"url": URL, "title": "Example", "content": "body"}},
     ]
 
-    def feed(self, converter, seeded=True):
-        if seeded:
-            getattr(converter, "seed_server_tools",
-                    lambda r: None)(self.RECORDS) if hasattr(converter, "seed_server_tools") \
-                else converter.seed_web_search_calls(self.RECORDS)
+    def feed(self, converter):
         events = []
         for chunk in json.loads(json.dumps([
                 {"id": "x", "choices": [{"index": 0, "delta": {"role": "assistant",
@@ -560,7 +583,7 @@ class SeedTests(unittest.TestCase):
     def test_anthropic_blocks_lead_the_message(self):
         converter = AnthropicStreamConverter(model="m")
         converter.seed_server_tools(self.RECORDS)
-        events = self.feed(converter, seeded=False)
+        events = self.feed(converter)
         self.assertIn('"server_tool_use"', events)
         self.assertIn('"web_search_tool_result"', events)
         self.assertIn('"web_fetch_tool_result"', events)
@@ -579,7 +602,7 @@ class SeedTests(unittest.TestCase):
                                       "public_id": "srvtoolu_e", "input": {"query": "q"},
                                       "results": None, "error": "max_uses_exceeded",
                                       "error_code": "max_uses_exceeded"}])
-        self.feed(converter, seeded=False)
+        self.feed(converter)
         block = converter.get_nonstream_response()["content"][1]
         self.assertEqual(block["content"],
                          {"type": "web_search_tool_result_error",
@@ -589,7 +612,7 @@ class SeedTests(unittest.TestCase):
     def test_responses_search_call_items_lead(self):
         converter = ResponsesStreamConverter(model="m")
         converter.seed_web_search_calls(self.RECORDS)
-        events = self.feed(converter, seeded=False)
+        events = self.feed(converter)
         self.assertIn("web_search_call", events)
         self.assertIn("response.output_item.added", events)
         output = converter.get_nonstream_response()["output"]
@@ -667,7 +690,7 @@ class SeedTests(unittest.TestCase):
             {"kind": "search", "name": "web_search", "id": "srv_e", "public_id": "srvtoolu_e",
              "input": {"query": "q"}, "results": None, "error": "boom",
              "error_code": "unavailable"}])
-        self.feed(converter, seeded=False)
+        self.feed(converter)
         output = converter.get_nonstream_response()["output"]
         self.assertEqual(output[0]["status"], "failed")
 

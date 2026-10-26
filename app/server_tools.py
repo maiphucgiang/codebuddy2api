@@ -98,13 +98,20 @@ def _declared_domains(value) -> list | None:
     return domains or None
 
 
-def _search_config(tool_def: dict) -> dict:
-    size = str(tool_def.get("search_context_size") or "medium").lower()
-    filters = tool_def.get("filters") if isinstance(tool_def.get("filters"), dict) else {}
+def _domain_policy(tool_def: dict, *, filters: dict | None = None) -> tuple:
+    """Declared (allowed, blocked) domains; allowed wins when both are present."""
+    filters = filters if isinstance(filters, dict) else {}
     allowed = _declared_domains(tool_def.get("allowed_domains") or filters.get("allowed_domains"))
     blocked = _declared_domains(tool_def.get("blocked_domains") or filters.get("blocked_domains"))
     if allowed and blocked:
         blocked = None
+    return allowed, blocked
+
+
+def _search_config(tool_def: dict) -> dict:
+    size = str(tool_def.get("search_context_size") or "medium").lower()
+    filters = tool_def.get("filters") if isinstance(tool_def.get("filters"), dict) else {}
+    allowed, blocked = _domain_policy(tool_def, filters=filters)
     return {
         "max_uses": tool_def.get("max_uses"),
         "allowed_domains": allowed,
@@ -116,10 +123,7 @@ def _search_config(tool_def: dict) -> dict:
 def _fetch_config(tool_def: dict) -> dict:
     tokens = tool_def.get("max_content_tokens")
     max_length = min(100000, int(tokens) * 4) if isinstance(tokens, int) and tokens > 0 else None
-    allowed = _declared_domains(tool_def.get("allowed_domains"))
-    blocked = _declared_domains(tool_def.get("blocked_domains"))
-    if allowed and blocked:
-        blocked = None
+    allowed, blocked = _domain_policy(tool_def)
     return {
         "max_uses": tool_def.get("max_uses"),
         "allowed_domains": allowed,
@@ -303,6 +307,10 @@ def _tool_message(record: dict) -> dict:
 def _assistant_message(message: dict) -> dict:
     kept = {"role": "assistant", "content": message.get("content")}
     calls = []
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        # Tool-call rounds may carry thinking; keep it for the continuation.
+        kept["reasoning_content"] = reasoning
     for call in message.get("tool_calls") or []:
         function = call.get("function") or {}
         calls.append({"id": call.get("id"), "type": "function",
@@ -313,8 +321,7 @@ def _assistant_message(message: dict) -> dict:
 
 
 async def run_chat_tool_loop(fetch_chat, body: dict, spec: dict, *,
-                             search_fn, fetch_fn, max_rounds: int = MAX_ROUNDS,
-                             log=None):
+                             search_fn, fetch_fn, max_rounds: int = MAX_ROUNDS):
     """Drive upstream rounds, executing injected web tools between them.
 
     ``fetch_chat(body)`` must return one merged Chat completion. Mutates
