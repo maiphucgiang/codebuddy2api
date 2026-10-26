@@ -74,7 +74,7 @@ from app.upstream_io import (ChatSSEAccumulator, StreamOutputBudget, UpstreamHTT
                              read_bounded_error)
 from app.inference_resources import (AccountCapacity, InferenceResourcesMiddleware, inference_lifespan,
                                      request_resources, release_credential)
-from app.request_context import SessionIdentifierError, current_context
+from app.request_context import SessionIdentifierError, build_attempt_headers, current_context
 from app.reasoning import resolve_reasoning_effort, thinking_mode
 from app import model_capabilities
 from app.message_normalization import merge_intl_user_images
@@ -612,29 +612,16 @@ def _block_model(model: str | None) -> str | None:
     return "auto" if model == "default-model" else model
 
 
-def _dynamic_request_headers(skey: str | None) -> dict:
+def _dynamic_request_headers(skey: str | None, profile=None) -> dict:
     """Generate upstream request IDs while keeping session IDs stable."""
-    rid = secrets.token_hex(16)   # X-Request-ID == X-Conversation-Message-ID
-    crid = secrets.token_hex(16)  # X-Conversation-Request-ID == X-Root-Request-ID == trace id
+    message_id, request_id, trace_id = (uuid.uuid4().hex for _ in range(3))
+    root = secrets.token_hex(16)
     span, parent = secrets.token_hex(8), secrets.token_hex(8)
-    if skey:
-        conv = str(uuid.UUID(hex=hashlib.sha256(skey.encode()).hexdigest()[:32]))
-    else:
-        conv = str(uuid.uuid4())
-    return {
-        "X-Conversation-ID": conv,
-        "X-Request-ID": rid,
-        "X-Conversation-Message-ID": rid,
-        "X-Conversation-Request-ID": crid,
-        "X-Root-Request-ID": crid,
-        "X-Trace-ID": crid,
-        "traceparent": f"00-{crid}-{span}-01",
-        "b3": f"{crid}-{span}-1-{parent}",
-        "X-B3-TraceId": crid,
-        "X-B3-SpanId": span,
-        "X-B3-ParentSpanId": parent,
-        "X-B3-Sampled": "1",
-    }
+    conv = str(uuid.UUID(hex=hashlib.sha256(skey.encode()).hexdigest()[:32])) if skey else str(uuid.uuid4())
+    return {"X-Conversation-ID": conv, **build_attempt_headers(
+        {}, profile, root=root, message_id=message_id, request_id=request_id,
+        trace_id=trace_id, span=span, parent=parent,
+    )}
 
 
 # Globally unique revisions keep cached policy views and model tables from matching a rebuilt pool.
@@ -2925,7 +2912,7 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(),
     if context is not None and context.scoped:
         headers["X-Conversation-ID"] = context.conversation_id(profile, identity)
     else:
-        headers.update(_dynamic_request_headers(f"{profile}:{identity}:{skey}" if skey else None))
+        headers.update(_dynamic_request_headers(f"{profile}:{identity}:{skey}" if skey else None, profile=profile))
     return cm, headers
 
 
@@ -4352,7 +4339,7 @@ async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name
         if context is None:
             return dict(headers)
         attempt = context.start_attempt()
-        outgoing = context.attempt_headers(headers, attempt)
+        outgoing = context.attempt_headers(headers, attempt, profile=profile_for_headers(headers))
         profile = profile_for_headers(headers)
         observe_attempt("upstream_attempt", profile=profile, upstream_model=body.get("model"),
                         credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")),

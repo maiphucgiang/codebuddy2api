@@ -5,9 +5,12 @@ import json
 
 from .site_routing import domain_for_auth, profile_for_auth, profile_product, profile_region
 
-CLI_VERSION = "2.149.0"
-WORKBUDDY_VERSION = "5.5.2"
-WORKBUDDY_CLI_VERSION = "2.137.1"
+CLI_VERSION = "2.165.0"
+WORKBUDDY_VERSION = "5.9.2"
+WORKBUDDY_CLI_VERSION = CLI_VERSION
+INTL_CLI_VERSION = "2.161.0"
+INTL_WORKBUDDY_VERSION = "5.8.4"
+INTL_WORKBUDDY_CLI_VERSION = INTL_CLI_VERSION
 CLI_USER_AGENT = f"CLI/{CLI_VERSION} CodeBuddy/{CLI_VERSION}"
 
 SDK_HEADERS = {
@@ -26,14 +29,23 @@ SDK_HEADERS = {
 }
 
 
+def _versions(profile):
+    if profile_region(profile) == "intl":
+        return INTL_CLI_VERSION, INTL_WORKBUDDY_VERSION, INTL_WORKBUDDY_CLI_VERSION
+    return CLI_VERSION, WORKBUDDY_VERSION, WORKBUDDY_CLI_VERSION
+
+
 def identity_headers(profile: str) -> dict:
     """Use verified package versions without reading desktop settings or device identities."""
+    cli_version, workbuddy_version, workbuddy_cli_version = _versions(profile)
     if profile_product(profile) == "cli":
-        return {"User-Agent": CLI_USER_AGENT, "X-IDE-Type": "CLI", "X-IDE-Name": "CLI", "X-IDE-Version": CLI_VERSION}
+        return {"User-Agent": f"CLI/{cli_version} CodeBuddy/{cli_version}",
+                "X-IDE-Type": "CLI", "X-IDE-Name": "CLI", "X-IDE-Version": cli_version}
     name = "WorkBuddy AI" if profile_region(profile) == "intl" else "WorkBuddy"
     return {
-        "User-Agent": f"WorkBuddy/{WORKBUDDY_VERSION} {name}/{WORKBUDDY_VERSION} CLI/{WORKBUDDY_CLI_VERSION}",
-        "X-IDE-Type": "WorkBuddy", "X-IDE-Name": "WorkBuddy", "X-IDE-Version": WORKBUDDY_VERSION,
+        "User-Agent": f"WorkBuddy/{workbuddy_version} {name}/{workbuddy_version} CLI/{workbuddy_cli_version}",
+        "X-IDE-Type": "WorkBuddy", "X-IDE-Name": "WorkBuddy", "X-IDE-Version": workbuddy_version,
+        "X-Private-Data": "true",
     }
 
 
@@ -168,6 +180,7 @@ def canonical_uid(account) -> str:
 
 
 def catalog_cache_key(profile: str, identity: str | None = None) -> str:
-    revision = CLI_VERSION if profile_product(profile) == "cli" else f"{WORKBUDDY_VERSION}:{WORKBUDDY_CLI_VERSION}"
+    cli_version, workbuddy_version, workbuddy_cli_version = _versions(profile)
+    revision = cli_version if profile_product(profile) == "cli" else f"{workbuddy_version}:{workbuddy_cli_version}"
     key = f"{profile}:{revision}"
     return f"{key}:account:{identity}" if identity is not None else key

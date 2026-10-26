@@ -136,6 +136,7 @@ WebUI 系统设置可配置这两项；环境变量为 `CODEBUDDY2API_UPSTREAM_K
 scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` / `metadata.conversationId` 或顶层 `conversation_id` / `conversationId`。多处值须一致；冲突、非字符串、控制字符或超过 512 UTF-8 字节时返回 400。空值回退为协议适配后的指令与首条用户输入指纹，包含图片引用但不抓取 URL；缺少可靠输入时使用临时会话。无显式 ID 的相同输入仍无法区分；`user`、`metadata.user_id`、`prompt_cache_key` 不是会话 ID。原始标识不记录、不转发上游。
 
 设回 `legacy` 即恢复新请求的旧行为，在途请求保留入口模式。
+上游客户端身份按已核实的官方包对齐：国内 CLI 2.165.0／WorkBuddy 5.9.2，国际 CLI 2.161.0／WorkBuddy 5.8.4。WorkBuddy 请求使用独立的 message/request UUID 和 trace ID，CLI 保持原有 ID 关系。所有身份头均在本地生成，不读取硬件 ID。
 
 ## 自动化与奖励
 

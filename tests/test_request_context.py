@@ -150,10 +150,18 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
         self.assertEqual(len({r.headers["X-Conversation-ID"] for r in seen}), 1 if same_account else len(seen))
         for request in seen:
             headers = request.headers
-            self.assertEqual(headers["X-Conversation-Request-ID"], root)
-            self.assertEqual(headers["X-Trace-ID"], root)
-            self.assertEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
-            self.assertEqual(headers["traceparent"], f'00-{root}-{headers["X-B3-SpanId"]}-01')
+            workbuddy = headers["X-IDE-Type"] == "WorkBuddy"
+            trace = headers["X-Trace-ID"]
+            if workbuddy:
+                self.assertNotEqual(trace, root)
+                self.assertNotEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
+                self.assertRegex(headers["X-Request-ID"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+                self.assertRegex(headers["X-Conversation-Message-ID"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+            else:
+                self.assertEqual(trace, root)
+                self.assertEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
+            self.assertEqual(headers["X-B3-TraceId"], trace)
+            self.assertEqual(headers["traceparent"], f'00-{trace}-{headers["X-B3-SpanId"]}-01')
         self.assertEqual(self.fx.pool._capacity._counts, {})
 
     def test_profiles_protocols_and_modes_preserve_body_ids_and_isolate_requests(self):
@@ -177,6 +185,19 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                             self.assertTrue(first.json()["id"].startswith(prefix))
                             self.assertNotEqual(first.json()["id"], first.headers["X-Request-ID"])
                         self.assertNotIn("metadata", json.loads(request.content))
+
+    def test_legacy_workbuddy_attempt_ids_are_independent(self):
+        for profile in ("cn-work", "intl-work"):
+            with self.subTest(profile=profile):
+                self.fx.configure(profiles=(profile,))
+                with patch.dict(gateway.CONFIG, {"request_context_mode": "legacy"}):
+                    response = self.fx.client.post("/v1/chat/completions", json=self.fx.payload("chat/completions"))
+                self.assertEqual(response.status_code, 200, response.text)
+                headers = self.fx.requests[-1].headers
+                self.assertNotEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
+                self.assertNotEqual(headers["X-Trace-ID"], headers["X-Conversation-Request-ID"])
+                self.assertRegex(headers["X-Request-ID"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+                self.assertRegex(headers["X-Conversation-Message-ID"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
     def test_pooling_and_capacity_settings_do_not_change_context_contract(self):
         for keepalive in (False, True):

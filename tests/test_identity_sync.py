@@ -89,6 +89,22 @@ class IdentitySyncTests(unittest.TestCase):
         picked = self.pool.headers_for(None, name, region=region)
         return picked[1]["X-User-Id"] if picked else None
 
+    def test_official_versions_and_private_data_are_profile_scoped(self):
+        expected = {
+            "cn-cli": ("CLI/2.165.0 CodeBuddy/2.165.0", "2.165.0", "false", "2.165.0"),
+            "intl-cli": ("CLI/2.161.0 CodeBuddy/2.161.0", "2.161.0", "false", "2.161.0"),
+            "cn-work": ("WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/2.165.0", "5.9.2", "true", "5.9.2:2.165.0"),
+            "intl-work": ("WorkBuddy/5.8.4 WorkBuddy AI/5.8.4 CLI/2.161.0", "5.8.4", "true", "5.8.4:2.161.0"),
+        }
+        for profile, (user_agent, ide_version, private_data, revision) in expected.items():
+            with self.subTest(profile=profile):
+                headers = client_profiles.credential_headers(
+                    {"domain": DOMAINS[profile], "accessToken": "synthetic"}, {"uid": "A"})
+                self.assertEqual(headers["User-Agent"], user_agent)
+                self.assertEqual(headers["X-IDE-Version"], ide_version)
+                self.assertEqual(headers["X-Private-Data"], private_data)
+                self.assertEqual(client_profiles.catalog_cache_key(profile), f"{profile}:{revision}")
+
     def test_account_fingerprint_is_stable_and_unambiguous(self):
         key = client_profiles.account_key
         self.assertEqual(key("cn-cli", "A", "tenant"), key("cn-cli", "A", "tenant"))
