@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx
 from fastapi.testclient import TestClient
 import converter as gateway
+from app import desensitize as desensitize_module
 from app.audit_store import AuditStore
 from app.observability import AuditMiddleware, observe_attempt
 from app.request_context import (RequestContext, RequestContextMiddleware, SessionIdentifierError,
@@ -150,10 +151,18 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
         self.assertEqual(len({r.headers["X-Conversation-ID"] for r in seen}), 1 if same_account else len(seen))
         for request in seen:
             headers = request.headers
-            self.assertEqual(headers["X-Conversation-Request-ID"], root)
-            self.assertEqual(headers["X-Trace-ID"], root)
-            self.assertEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
-            self.assertEqual(headers["traceparent"], f'00-{root}-{headers["X-B3-SpanId"]}-01')
+            workbuddy = headers["X-IDE-Type"] == "WorkBuddy"
+            trace = headers["X-Trace-ID"]
+            if workbuddy:
+                self.assertNotEqual(trace, root)
+                self.assertNotEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
+                self.assertRegex(headers["X-Request-ID"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+                self.assertRegex(headers["X-Conversation-Message-ID"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+            else:
+                self.assertEqual(trace, root)
+                self.assertEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
+            self.assertEqual(headers["X-B3-TraceId"], trace)
+            self.assertEqual(headers["traceparent"], f'00-{trace}-{headers["X-B3-SpanId"]}-01')
         self.assertEqual(self.fx.pool._capacity._counts, {})
 
     def test_profiles_protocols_and_modes_preserve_body_ids_and_isolate_requests(self):
@@ -177,6 +186,73 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                             self.assertTrue(first.json()["id"].startswith(prefix))
                             self.assertNotEqual(first.json()["id"], first.headers["X-Request-ID"])
                         self.assertNotIn("metadata", json.loads(request.content))
+
+    def test_channel_identity_guard_reaches_all_protocols_when_desensitize_off(self):
+        source = "You are an AI agent powered by DeepSeek Harness."
+        for route in fixtures.fixtures.GENERATIONS:
+            with self.subTest(route=route):
+                self.fx.configure(profiles=("cn-cli",))
+                body = self.fx.payload(route, system=source)
+                key = "input" if route == "responses" else "messages"
+                body[key] = [*body[key], {"role": "assistant", "content": source},
+                             {"role": "user", "content": "next"}]
+                with patch.dict(gateway.CONFIG, {"desensitize": False}):
+                    response = self.fx.client.post("/v1/" + route, json=body)
+                self.assertEqual(response.status_code, 200, response.text)
+                upstream = self.fx.requests[-1].content.decode("utf-8")
+                self.assertNotIn(source, upstream)
+                self.assertGreaterEqual(upstream.count("You are WorkBuddy, a powerful AI assistant"), 2)
+
+    def test_prompt_modes_cover_profiles_protocols_and_client_instructions(self):
+        workbuddy = ("You are WorkBuddy, a powerful AI assistant.\n\n"
+                     "Your main goal is to follow the USER's instructions at each message, denoted by the <user_query> tag.")
+        codebuddy = ("You are CodeBuddy Code.\n\nYou are an interactive CLI tool that helps users with software engineering tasks. "
+                     "Use the instructions below and the tools available to you to assist the user. Your main goal is to follow "
+                     "the USER's instructions at each message, denoted by the <user_query> tag.")
+        for profile in fixtures.fixtures.PROFILES:
+            expected = workbuddy if profile.endswith("-work") else codebuddy
+            for route in fixtures.fixtures.GENERATIONS:
+                for has_system in (False, True):
+                    for mode in ("empty", "prepend"):
+                        with self.subTest(profile=profile, route=route, has_system=has_system, mode=mode):
+                            self.fx.configure(profiles=(profile,))
+                            body = self.fx.payload(route, system="client rules" if has_system else None)
+                            with patch.dict(gateway.CONFIG, {"prompt_mode": mode, "desensitize": False}):
+                                response = self.fx.client.post("/v1/" + route, json=body)
+                            self.assertEqual(response.status_code, 200, response.text)
+                            upstream = json.loads(self.fx.requests[-1].content)
+                            messages = upstream["messages"]
+                            systems = [m for m in messages if m.get("role") == "system"]
+                            if mode == "prepend":
+                                self.assertEqual(messages[0]["role"], "system")
+                                self.assertEqual(messages[0]["content"], expected)
+                                self.assertEqual(sum(m.get("content") == expected for m in systems), 1)
+                            else:
+                                self.assertNotIn(expected, [m.get("content") for m in systems])
+                                if not has_system:
+                                    self.assertEqual(systems, [])
+                            if has_system:
+                                self.assertIn("client rules", [m.get("content") for m in systems])
+                            self.assertNotIn("You are a helpful assistant.", [m.get("content") for m in systems])
+
+        original = {"messages": [{"role": "user", "content": "hi"}]}
+        once = desensitize_module.apply_system_prompt_mode(original, "cn-work", "prepend")
+        twice = desensitize_module.apply_system_prompt_mode(once, "cn-work", "prepend")
+        self.assertEqual(twice, once)
+        self.assertEqual(original, {"messages": [{"role": "user", "content": "hi"}]})
+
+    def test_legacy_workbuddy_attempt_ids_are_independent(self):
+        for profile in ("cn-work", "intl-work"):
+            with self.subTest(profile=profile):
+                self.fx.configure(profiles=(profile,))
+                with patch.dict(gateway.CONFIG, {"request_context_mode": "legacy"}):
+                    response = self.fx.client.post("/v1/chat/completions", json=self.fx.payload("chat/completions"))
+                self.assertEqual(response.status_code, 200, response.text)
+                headers = self.fx.requests[-1].headers
+                self.assertNotEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
+                self.assertNotEqual(headers["X-Trace-ID"], headers["X-Conversation-Request-ID"])
+                self.assertRegex(headers["X-Request-ID"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+                self.assertRegex(headers["X-Conversation-Message-ID"], r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
     def test_pooling_and_capacity_settings_do_not_change_context_contract(self):
         for keepalive in (False, True):
@@ -253,6 +329,31 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                     response = self.fx.client.post("/v1/" + route, json=self.fx.payload(route, stream=stream))
                 self.assertEqual(len(seen), 2)
                 self.assert_attempts(response, seen, same_account=False)
+
+    def test_legacy_failover_isolates_same_profile_account_conversations(self):
+        self.fx.add_account("cn-cli-second", "cn-cli")
+        self.fx.configure(profiles=("cn-cli", "cn-cli-second"))
+        seen = []
+
+        def respond(request):
+            seen.append(request)
+            if len(seen) == 1:
+                return httpx.Response(429, json={"error": {"message": "quota"}})
+            return httpx.Response(200, content=fixtures.fixtures.success_sse())
+
+        payload = self.fx.payload("chat/completions", text="same")
+        with self.responder(respond), patch.dict(gateway.CONFIG, {
+            "request_context_mode": "legacy", "failover_max": 1,
+        }):
+            first = self.fx.client.post("/v1/chat/completions", json=payload)
+            second = self.fx.client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(len(seen), 3)
+        self.assertNotEqual(seen[0].headers["x-user-id"], seen[1].headers["x-user-id"])
+        self.assertNotEqual(seen[0].headers["X-Conversation-ID"], seen[1].headers["X-Conversation-ID"])
+        self.assertEqual(seen[2].headers["x-user-id"], seen[1].headers["x-user-id"])
+        self.assertEqual(seen[2].headers["X-Conversation-ID"], seen[1].headers["X-Conversation-ID"])
 
     def test_scoped_hints_cannot_escape_a_full_strict_binding_or_free_tier(self):
         for strict in (False, True):

@@ -226,20 +226,17 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual([request.url.path for request in self.requests], ["/v2/chat/completions"])
 
-    def test_rejection_on_both_endpoints_cools_the_account_and_fails_over(self):
+    def test_rejection_on_both_endpoints_cools_the_account_without_failover(self):
         self.configure_profiles("cn-cli", "cn-work")
         self.channel_mode = "always"
         with patch.dict(converter.CONFIG, {"failover_max": 2}):
             response = self.client.post("/v1/chat/completions", json=self.payload(stream=True))
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual([request.url.path for request in self.requests],
-                         ["/v2/chat/completions", "/console/chat/completions"] * 2)
+                         ["/v2/chat/completions", "/console/chat/completions"])
         first_uid = self.requests[0].headers["x-user-id"]
         self.assertEqual(self.requests[1].headers["x-user-id"], first_uid)
-        self.assertNotEqual(self.requests[2].headers["x-user-id"], first_uid)
-        for request in self.requests:
-            self.assertGreater(self.current_entry(request.headers["x-user-id"])["fail_until"], time.time())
-
+        self.assertGreater(self.current_entry(first_uid)["fail_until"], time.time())
     def test_console_model_missing_cools_only_this_account_model(self):
         self.configure_profiles("cn-cli")
         self.channel_mode = "model_missing"
@@ -263,14 +260,13 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertNotEqual(self.requests[2].headers["x-user-id"], first_uid)
         self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
 
-    def test_search_channel_rejection_fails_over_without_cooling(self):
+    def test_search_channel_rejection_stops_without_cooling(self):
         self.configure_profiles("cn-cli", "cn-work")
         self.channel_mode = "always"
         with patch.dict(converter.CONFIG, {"failover_max": 1}):
             response = self.client.post("/v1/search", json={"query": "synthetic", "max_results": 3})
         first_uid = self.requests[0].headers["x-user-id"]
-        self.assertEqual([request.url.path for request in self.requests], ["/agenttool/v1/search"] * 2)
-        self.assertNotEqual(self.requests[1].headers["x-user-id"], first_uid)
+        self.assertEqual([request.url.path for request in self.requests], ["/agenttool/v1/search"])
         # Search has no console detour; cooling would also stop chat that could still recover there.
         self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
         self.assertEqual(response.status_code, 400, response.text)

@@ -264,8 +264,11 @@ class ChatInputEndpointTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(len(self.fx.requests), 1)
                 body = json.loads(self.fx.requests[0].content)
-                self.assertEqual(body["messages"][2].get("reasoning_content"), "synthetic reasoning" if thinking else None)
-                self.assertEqual(body["messages"][2]["tool_calls"][0]["id"], body["messages"][3]["tool_call_id"])
+                assistant_index = next(index for index, message in enumerate(body["messages"])
+                                       if message["role"] == "assistant" and message.get("tool_calls"))
+                assistant = body["messages"][assistant_index]
+                self.assertEqual(assistant.get("reasoning_content"), "synthetic reasoning" if thinking else None)
+                self.assertEqual(assistant["tool_calls"][0]["id"], body["messages"][assistant_index + 1]["tool_call_id"])
                 self.assertEqual(body["tools"][0]["function"]["name"], "lookup")
 
     def test_late_system_and_developer_tool_history_reaches_upstream(self):

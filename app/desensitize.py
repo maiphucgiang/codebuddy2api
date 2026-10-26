@@ -109,11 +109,16 @@ _PATTERN = re.compile(
 )
 
 # Limit substitutions to known templates without globally stripping whitespace.
-def _template_pattern(text: str) -> re.Pattern:
+def _template_source(text: str) -> str:
     words = [(_ZWSP + "*").join(re.escape(char) for char in word) for word in text.split(" ")]
-    return re.compile(r"(?<!\w)" + r"[\s\u200b]+".join(words) + _ZWSP + r"*(?!\w)", re.IGNORECASE)
+    return r"[\s\u200b]+".join(words) + _ZWSP + r"*"
 
 
+def _template_pattern(text: str) -> re.Pattern:
+    return re.compile(r"(?<!\w)" + _template_source(text) + r"(?!\w)", re.IGNORECASE)
+
+
+_DSH_WORKBUDDY_IDENTITY = "You are WorkBuddy, a powerful AI assistant"
 _WORKBUDDY_IDENTITY = "You are CodeBuddy, Tencent's official CLI"
 _CLAUDE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude"
 _TEMPLATE_REPLACEMENTS = tuple(
@@ -123,10 +128,32 @@ _TEMPLATE_REPLACEMENTS = tuple(
         ("You are a Claude agent, built on Anthropic's Claude Agent SDK", _WORKBUDDY_IDENTITY),
         ("Main branch (you will usually use this for PRs)",
          "Main branch (you will usually use this for PR)"),
-        ("You are an AI agent powered by DeepSeek Harness.", "You are a helpful AI assistant."),
+        ("You are an AI agent powered by DeepSeek Harness.", _DSH_WORKBUDDY_IDENTITY + "."),
     )
 )
 _WORKBUDDY_IDENTITY_PATTERN = _template_pattern(_WORKBUDDY_IDENTITY)
+_CHANNEL_IDENTITY_PATTERN = _template_pattern("You are an AI agent powered by DeepSeek Harness")
+_DSH_CODING_PATTERN = re.compile(
+    r"(?<!\w)" + _template_source("You are a coding agent powered by the")
+    + r"[\s\u200b]+(?P<model>[^\r\n]{1,200}?)[\s\u200b]+"
+    + _template_source("model") + r"(?!\w)",
+    re.IGNORECASE,
+)
+_DSH_MINIMAL_PATTERN = _template_pattern("You are a helpful software engineer assistant")
+_DSH_DIRECT_PATTERN = _template_pattern("You are DeepSeek Harness")
+_DSH_WEB_GUI_PATTERN = _template_pattern("DeepSeek Harness Web GUI")
+_CHANNEL_IDENTITY_FIXED = _DSH_WORKBUDDY_IDENTITY
+
+WORKBUDDY_SYSTEM_PROMPT = (
+    "You are WorkBuddy, a powerful AI assistant.\n\n"
+    "Your main goal is to follow the USER's instructions at each message, denoted by the <user_query> tag."
+)
+CODEBUDDY_SYSTEM_PROMPT = (
+    "You are CodeBuddy Code.\n\n"
+    "You are an interactive CLI tool that helps users with software engineering tasks. "
+    "Use the instructions below and the tools available to you to assist the user. "
+    "Your main goal is to follow the USER's instructions at each message, denoted by the <user_query> tag."
+)
 _GIT_STATUS_CONTEXT = re.compile(
     r"^\s*(?:gitStatus:\s*|#\s*gitStatus\s*\n)"
     r"This is the git status at the start of the conversation\.", re.IGNORECASE | re.MULTILINE,
@@ -224,6 +251,22 @@ def desensitize_text(text: str) -> str:
         return desensitize_text(text[:context.start()]) + _replace_git_status_text(text[context.start():])[0]
     text = _replace_workbuddy_templates(text)
     return _PATTERN.sub(lambda m: _zero_width_split(m.group(0)), text)
+
+
+def _replace_dsh_coding_persona(match: re.Match) -> str:
+    model = match.group("model").strip()
+    return f"{_DSH_WORKBUDDY_IDENTITY}. This conversation is powered by the {model} model"
+
+
+def desensitize_channel_text(text: str) -> str:
+    """Convert official DSH role prompts without changing unrelated brand references."""
+    if not text:
+        return text
+    text = _DSH_CODING_PATTERN.sub(_replace_dsh_coding_persona, text)
+    text = _CHANNEL_IDENTITY_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
+    text = _DSH_MINIMAL_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
+    text = _DSH_DIRECT_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
+    return _DSH_WEB_GUI_PATTERN.sub("WorkBuddy Web GUI", text)
 
 
 def _iter_text_blocks(content):
@@ -398,6 +441,46 @@ def desensitize_body(body: dict, roles: tuple[str, ...] = ("system",),
         nb["tools"] = _desensitize_tool_value(body["tools"], strip_metadata=strip_tool_metadata)
         changed = True
     return nb if changed else body
+
+
+def desensitize_channel_body(body: dict) -> dict:
+    """Remove the known channel identity from instruction and assistant text."""
+    if not body.get("messages"):
+        return body
+    messages = []
+    for message in body["messages"]:
+        if not isinstance(message, dict) or message.get("role") not in ("system", "developer", "assistant"):
+            messages.append(message)
+            continue
+        adapted = dict(message)
+        content = message.get("content")
+        if isinstance(content, str):
+            adapted["content"] = desensitize_channel_text(content)
+        elif isinstance(content, list):
+            adapted["content"] = [
+                {**block, "text": desensitize_channel_text(block["text"])}
+                if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+                else block
+                for block in content
+            ]
+        messages.append(adapted)
+    return {**body, "messages": messages}
+
+
+def apply_system_prompt_mode(body: dict, profile: str, mode: str) -> dict:
+    """Apply an optional profile prompt without mutating canonical messages."""
+    if mode == "empty":
+        return body
+    if mode != "prepend":
+        raise ValueError("prompt_mode 仅支持 empty 或 prepend")
+    prompt = WORKBUDDY_SYSTEM_PROMPT if profile in ("cn-work", "intl-work") else CODEBUDDY_SYSTEM_PROMPT
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system" \
+            and _content_to_text(messages[0].get("content")) == prompt:
+        return body
+    return {**body, "messages": [{"role": "system", "content": prompt}, *messages]}
 
 
 # ---------------------------------------------------------------------------

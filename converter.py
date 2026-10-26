@@ -35,11 +35,17 @@ from starlette.concurrency import run_in_threadpool
 import uvicorn as uvicorn  # Keep the existing embedding/test hook.
 
 try:
-    from app.desensitize import desensitize_body
+    from app.desensitize import apply_system_prompt_mode, desensitize_body, desensitize_channel_body
 except ImportError:  # Disable desensitization when its module is unavailable.
     def desensitize_body(body, roles=("system",), desensitize_harness_user=False,
                          desensitize_tools=False, compact_harness=False,
                          strip_tool_metadata=False):
+        return body
+
+    def desensitize_channel_body(body):
+        return body
+
+    def apply_system_prompt_mode(body, profile, mode):
         return body
 
 from app.adapters.responses_adapter import (
@@ -71,7 +77,7 @@ from app.upstream_io import (ChatSSEAccumulator, StreamOutputBudget, UpstreamHTT
                              read_bounded_error)
 from app.inference_resources import (AccountCapacity, InferenceResourcesMiddleware, inference_lifespan,
                                      request_resources, release_credential)
-from app.request_context import SessionIdentifierError, current_context
+from app.request_context import SessionIdentifierError, build_attempt_headers, current_context
 from app.reasoning import resolve_reasoning_effort, thinking_mode
 from app import model_capabilities
 from app.message_normalization import merge_intl_user_images
@@ -460,6 +466,12 @@ MODEL_COOLDOWN = 600        # Model cooldown when a 429 omits reset time
 MODEL_COOLDOWN_MAX = 86400  # Maximum model cooldown in seconds
 UPSTREAM_BODY_AUDIT_LIMIT = 256 * 1024  # Bounded upstream error JSON kept per failed attempt.
 RESTRICTED_CODES = frozenset({"11140"})  # Upstream account-restriction codes; disable, never requeue.
+MODEL_RESTRICTED_CODES = frozenset({"11148"})
+MODEL_SCOPED_ERROR_CODES = frozenset({"11102", "11129", "11134", "11150", "11158"})
+# 11102 keeps its dedicated console-confirmed model failover.
+NO_FAILOVER_UPSTREAM_CODES = (RESTRICTED_CODES | MODEL_RESTRICTED_CODES
+                              | (MODEL_SCOPED_ERROR_CODES - {"11102"}) | {"11128"})
+MODEL_RESTRICTION_COOLDOWN = 30 * 60
 FRESH_401_LIMIT = 3         # Fresh-token 401s inside the window before auto-disable
 FRESH_401_WINDOW = 3600     # Sliding window for fresh-token 401 counting
 REFRESH_REJECT_LIMIT = 3    # Consecutive business refresh rejections before auto-disable
@@ -603,29 +615,16 @@ def _block_model(model: str | None) -> str | None:
     return "auto" if model == "default-model" else model
 
 
-def _dynamic_request_headers(skey: str | None) -> dict:
+def _dynamic_request_headers(skey: str | None, profile=None) -> dict:
     """Generate upstream request IDs while keeping session IDs stable."""
-    rid = secrets.token_hex(16)   # X-Request-ID == X-Conversation-Message-ID
-    crid = secrets.token_hex(16)  # X-Conversation-Request-ID == X-Root-Request-ID == trace id
+    message_id, request_id, trace_id = (uuid.uuid4().hex for _ in range(3))
+    root = secrets.token_hex(16)
     span, parent = secrets.token_hex(8), secrets.token_hex(8)
-    if skey:
-        conv = str(uuid.UUID(hex=hashlib.sha256(skey.encode()).hexdigest()[:32]))
-    else:
-        conv = str(uuid.uuid4())
-    return {
-        "X-Conversation-ID": conv,
-        "X-Request-ID": rid,
-        "X-Conversation-Message-ID": rid,
-        "X-Conversation-Request-ID": crid,
-        "X-Root-Request-ID": crid,
-        "X-Trace-ID": crid,
-        "traceparent": f"00-{crid}-{span}-01",
-        "b3": f"{crid}-{span}-1-{parent}",
-        "X-B3-TraceId": crid,
-        "X-B3-SpanId": span,
-        "X-B3-ParentSpanId": parent,
-        "X-B3-Sampled": "1",
-    }
+    conv = str(uuid.UUID(hex=hashlib.sha256(skey.encode()).hexdigest()[:32])) if skey else str(uuid.uuid4())
+    return {"X-Conversation-ID": conv, **build_attempt_headers(
+        {}, profile, root=root, message_id=message_id, request_id=request_id,
+        trace_id=trace_id, span=span, parent=parent,
+    )}
 
 
 # Globally unique revisions keep cached policy views and model tables from matching a rebuilt pool.
@@ -1529,27 +1528,24 @@ class CredentialPool:
                     self._remember_credential(e, e["last_error"])
         _log(f"[cred] 凭证熔断 {CRED_COOLDOWN}s: {Path(cm.path).name} {reason}")
 
+    def note_restriction(self, cm: CredentialManager | None, code, *, body=None, generation=None) -> bool:
+        """Disable a restricted account through the same path for inference and automation."""
+        code = str(code or "")
+        if cm is None or code not in RESTRICTED_CODES:
+            return False
+        self.cooldown(cm, reason=f"上游限制 {code}", generation=generation)
+        self._note_error_body(cm, body, generation=generation)
+        self._auto_disable(cm, f"上游限制 {code}", generation=generation)
+        return True
+
     def note_status(self, cm: CredentialManager | None, status: int,
                     model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None,
                     channel_fallback=False):
-        """Apply credential-wide auth cooldowns, per-model 429 cooldowns and backend/model backoff."""
+        """Apply account, model and backend policy from the business code before the HTTP status."""
         if cm is None:
             return
-        if status in (401, 403):
-            self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
-            # One parse feeds the audit body, the restriction check and the tooltip.
-            code, _, body = _upstream_diagnostic(raw or b"")
-            self._note_error_body(cm, body, generation=generation)
-            if status == 403 and code in RESTRICTED_CODES:
-                self._auto_disable(cm, f"上游限制 {code}", generation=generation)
-            elif status == 401:
-                self._note_fresh_401(cm, generation=generation)
-            return
-        if status == 400 and is_channel_check_error(raw):
-            # Only a rejection that survived the console retry is account-wide; endpoints without a
-            # console fallback (search, MCP) are left to request-scoped failover.
-            if channel_fallback:
-                self.cooldown(cm, reason="backend channel check (HTTP 400)", generation=generation)
+        code, _, body = _upstream_diagnostic(raw or b"")
+        if code in MODEL_SCOPED_ERROR_CODES and code not in MODEL_NOT_SERVABLE_CODES:
             return
         not_servable = _parse_not_servable(raw, status) if model else None
         if not_servable:
@@ -1560,6 +1556,29 @@ class CredentialPool:
                                  reason=f"console {not_servable[0]}")
             else:
                 self.note_not_servable(cm, model, code=not_servable[0], msg=not_servable[1], generation=generation)
+            return
+        if code in MODEL_SCOPED_ERROR_CODES:
+            return
+        if code in MODEL_RESTRICTED_CODES:
+            self._note_error_body(cm, body, generation=generation)
+            if model:
+                self._cool_model(cm, model, time.time() + MODEL_RESTRICTION_COOLDOWN,
+                                 generation=generation, reason=f"上游模型限制 {code}")
+            return
+        if status == 403 and code in RESTRICTED_CODES:
+            self.note_restriction(cm, code, body=body, generation=generation)
+            return
+        if status in (401, 403):
+            self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
+            self._note_error_body(cm, body, generation=generation)
+            if status == 401:
+                self._note_fresh_401(cm, generation=generation)
+            return
+        if status == 400 and is_channel_check_error(raw):
+            # Only a rejection that survived the console retry is account-wide; endpoints without a
+            # console fallback (search, MCP) are left to request-scoped failover.
+            if channel_fallback:
+                self.cooldown(cm, reason="backend channel check (HTTP 400)", generation=generation)
             return
         if status != 429 or not model:
             return
@@ -1852,7 +1871,35 @@ def _bearer_token(headers: dict) -> str:
 _HOUSEKEEP_LOCK = threading.Lock()
 
 
+def _background_restriction_code(value):
+    """Read a restriction code from bounded automation results or exception diagnostics."""
+    if not isinstance(value, dict):
+        value = getattr(value, "diagnostics", None) or getattr(value, "details", None)
+    if not isinstance(value, dict):
+        return None
+    nodes = [value] + [value.get(key) for key in ("error", "details", "diagnostics")]
+    for node in nodes:
+        if isinstance(node, dict):
+            code = node.get("code")
+            if code is not None and str(code) in RESTRICTED_CODES:
+                return str(code)
+    return None
+
+
+def _sync_restriction(pool, ledger, entry, generation, phase, value) -> bool:
+    """Stop the current automation sweep after a confirmed account restriction."""
+    code = _background_restriction_code(value)
+    if code is None or not pool.note_restriction(entry["cm"], code, generation=generation):
+        return False
+    message = f"{phase}: 上游限制 {code}"
+    pool.apply_if_current(entry["cm"], generation, lambda: ledger.note_error(entry["id"], message))
+    _log(f"[{phase}] {Path(entry['id']).name} 上游限制 {code}，停止后续同步")
+    return True
+
+
 def _sync_error(pool, ledger, entry, generation, phase, error):
+    if _sync_restriction(pool, ledger, entry, generation, phase, error):
+        return
     message = f"{phase}: {_network_error_text(error)}"
     pool.apply_if_current(entry["cm"], generation, lambda: ledger.note_error(entry["id"], message))
     _log(f"[{phase}] {Path(entry['id']).name} 同步失败（保留旧数据）: {message}")
@@ -1935,6 +1982,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                     return (model_policy.credential_auto_checkin(CONFIG, entry)
                             and pool.apply_if_current(cm, generation, lambda: None))
                 result = checkin_service.perform(token, uid=uid, domain=domain, can_claim=can_claim)
+                if _sync_restriction(pool, ledger, entry, generation, "checkin", result):
+                    return None
                 if result["state"] == "cancelled":
                     if not pool.apply_if_current(cm, generation, lambda: None):
                         failed.add(cid)
@@ -1966,6 +2015,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                 trip = travel.perform(token, profile_for_headers(headers), can_write=can_travel,
                                       enterprise=entry.get("enterprise") is True,
                                       buddy_context=_buddy_context(entry, headers))
+                if _sync_restriction(pool, ledger, entry, generation, "travel", trip):
+                    return None
                 if not pool.apply_if_current(cm, generation, lambda: travel.remember(ledger, cid, trip)):
                     failed.add(cid)
                     return None
@@ -1980,6 +2031,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
         if checkin and model_policy.credential_auto_growth(CONFIG, entry):
             try:
                 summary = growth_tasks.sweep_account(token, uid=uid, domain=domain)
+                if _sync_restriction(pool, ledger, entry, generation, "growth", summary):
+                    return None
                 if summary.get("claimed") or summary.get("errors"):
                     _log(f"[growth] {Path(cid).name}: claimed={len(summary.get('claimed') or [])} "
                          f"accepted={len(summary.get('accepted') or [])} +{summary.get('credit', 0)}c "
@@ -1994,6 +2047,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                         base=chain_base, token=token, uid=uid, domain=domain,
                         headers=headers, lock_key=entry.get("account_key") or cid)
                     outcome = growth_chains.run(code, ctx)
+                    if _sync_restriction(pool, ledger, entry, generation, f"growth:{code}", outcome):
+                        return None
                     if outcome.get("skipped") or outcome.get("claimed"):
                         _log(f"[growth] {Path(cid).name} {code}: {outcome.get('message', '')}")
                 except Exception as error:
@@ -2013,6 +2068,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                 turn = daily_chat.perform(token, profile, uid=uid, domain=domain, can_write=can_chat,
                                           store=CONFIG.get("control_store"),
                                           identity=entry.get("account_key"))
+                if _sync_restriction(pool, ledger, entry, generation, "dailychat", turn):
+                    return None
                 _log(f"[dailychat] {Path(cid).name}: state={turn.get('state')} ok={turn.get('ok')}")
             except Exception as error:
                 _sync_error(pool, ledger, entry, generation, "dailychat", error)
@@ -2752,7 +2809,8 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "usage_daily_accounts": None,  # Independent per-account usage snapshots
                 "usage_snapshots": None,  # On-disk cache of the per-account snapshots
                 "credit_price_cny": None, "credit_price_usd": None, "usd_rate": None,
-                "desensitize": False, "no_compact": False, "keep_tool_metadata": False}  # None prices use module defaults.
+                "desensitize": False, "no_compact": False, "keep_tool_metadata": False,
+                "prompt_mode": "empty"}  # None prices use module defaults.
 
 # In-memory OAuth sessions do not survive restarts.
 _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
@@ -2854,11 +2912,11 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(),
     profile = profile_for_headers(headers)
     if not _in_region(profile, region):
         raise HTTPException(status_code=503, detail={"error": {"message": "未找到指定地域凭据", "type": "auth_error"}})
+    identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
     if context is not None and context.scoped:
-        identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
         headers["X-Conversation-ID"] = context.conversation_id(profile, identity)
     else:
-        headers.update(_dynamic_request_headers(f"{profile}:{skey}" if skey else None))
+        headers.update(_dynamic_request_headers(f"{profile}:{identity}:{skey}" if skey else None, profile=profile))
     return cm, headers
 
 
@@ -2890,6 +2948,7 @@ def _route_chat(payload, body, rid, *, tried=()):
         if routed_model != body.get("model"):
             body = {**body, "model": routed_model}
         body, merged_runs, merged_messages = merge_intl_user_images(body, profile)
+        body = apply_system_prompt_mode(body, profile, CONFIG.get("prompt_mode", "empty"))
         if body is not canonical:
             _guard_request_size(body)
         if merged_runs:
@@ -3773,10 +3832,7 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
     ]
     if messages[0].get("role") != "system":
         system_index = next((index for index, message in enumerate(messages) if message.get("role") == "system"), None)
-        if system_index is None:
-            messages = [{"role": "system", "content": "You are a helpful assistant."}, *messages]
-            message_indices.insert(0, None)
-        else:
+        if system_index is not None:
             messages = [messages[system_index], *messages[:system_index], *messages[system_index + 1:]]
             message_indices.insert(0, message_indices.pop(system_index))
     body["messages"] = normalize_chat_messages(messages, message_indices=message_indices)
@@ -4285,7 +4341,7 @@ async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name
         if context is None:
             return dict(headers)
         attempt = context.start_attempt()
-        outgoing = context.attempt_headers(headers, attempt)
+        outgoing = context.attempt_headers(headers, attempt, profile=profile_for_headers(headers))
         profile = profile_for_headers(headers)
         observe_attempt("upstream_attempt", profile=profile, upstream_model=body.get("model"),
                         credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")),
@@ -4602,13 +4658,18 @@ def _replay_cost_note(error) -> str:
 
 
 def _failover_safe(error, raw=b"") -> bool:
-    """Allow configured pre-response transport or HTTP failover, never filter or incomplete-stream replay."""
+    """Allow bounded failover without replaying restrictions, model errors or filtered responses."""
+    raw = raw or getattr(error, "raw", b"")
     if is_filter_error(raw):
+        return False
+    code, _, _ = _upstream_diagnostic(raw)
+    if code == "11102":
+        return (isinstance(error, UpstreamHTTPError) and error.from_channel_fallback
+                and _parse_not_servable(raw, error.status) is not None)
+    if code in NO_FAILOVER_UPSTREAM_CODES:
         return False
     if isinstance(error, UpstreamHTTPError):
         if error.status in FAILOVER_CODES:
-            return True
-        if error.status == 400 and is_channel_check_error(raw):
             return True
         return (error.from_channel_fallback
                 and _parse_not_servable(raw, error.status) is not None)
@@ -4955,6 +5016,7 @@ def _note_content_filter(rid, model_name, *, final):
 
 
 def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
+    body = desensitize_channel_body(body)
     if not CONFIG.get("desensitize"):
         return body
     return desensitize_body(
@@ -5725,6 +5787,9 @@ def main():
     ap.add_argument("--no-compact", action="store_true",
                     help="配合 --desensitize 保留主要行为指令，仍适配固定模板并裁剪运行时元数据；"
                          "非流式纯审核拒绝最多压缩兜底一次。")
+    ap.add_argument("--prompt-mode", choices=("empty", "prepend"),
+                    default=os.environ.get("CODEBUDDY2API_PROMPT_MODE", "empty"),
+                    help="系统提示词：empty 不附加网关默认提示词（默认）；prepend 在最前面插入对应后端的精简官方提示词")
     ap.add_argument("--keep-tool-metadata", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_KEEP_TOOL_METADATA", "false"),
                     help="保留工具描述及参数 description/title；启用脱敏时仍处理描述文本，默认 false")
@@ -5819,7 +5884,7 @@ def main():
     for key in ("max_images", "image_policy", "max_request_bytes", "log_body_limit",
                 "tool_call_max_retry", "max_inbound_bytes", "max_collect_bytes", "max_concurrent",
                 "failover_max", "retry_write_timeout", "upstream_keepalive", "max_inflight_per_account",
-                "request_context_mode", "stream_mode", "model_capability_guard", "admin_allowed_origins",
+                "request_context_mode", "prompt_mode", "stream_mode", "model_capability_guard", "admin_allowed_origins",
                 "responses_projection_mode", "responses_projection_max_bytes", "routing_scheduler",
                 "catalog_probe_mode"):
         CONFIG[key] = getattr(args, key)
