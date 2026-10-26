@@ -254,13 +254,14 @@ def _arguments(arguments):
 def _fetch_arguments(arguments):
     if not isinstance(arguments, dict):
         return "", "", "invalid arguments: expected an object"
-    url = arguments.get("url")
-    if not isinstance(url, str) or not url.strip().lower().startswith(("http://", "https://")):
-        return "", "", "invalid arguments: url must be an http(s) URL"
+    try:
+        url = web_fetch.validate_url(arguments.get("url"))
+    except ValueError as error:
+        return "", "", f"invalid arguments: {error}"
     prompt = arguments.get("prompt")
     if prompt is not None and not isinstance(prompt, str):
         return "", "", "invalid arguments: prompt must be a string"
-    return url.strip(), prompt or "", ""
+    return url, prompt or "", ""
 
 
 def _tool_error(message):

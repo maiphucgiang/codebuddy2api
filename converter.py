@@ -61,7 +61,8 @@ from app.usage_snapshots import UsageSnapshots
 from app.client_hangup import ClientHungUp, await_or_hangup
 from app.observability import (AuditMiddleware, observe_recovery, observe_route, observe_stream_mode,
                                observe_responses_projection, observe_usage, observe_attempt,
-                               observe_failure, observe_failure_seq, observe_discard)
+                               observe_failure, observe_failure_seq, observe_discard,
+                               observe_nested)
 from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
                                credential_file_lock)
 from app.upstream_io import (ChatSSEAccumulator, StreamOutputBudget, UpstreamHTTPError,
@@ -3875,13 +3876,10 @@ async def chat_completions(request: Request,
         server_spec.update(options_active)
     if server_spec:
         body["_server_tools"] = server_spec
-    hosted_choice = payload.get("tool_choice")
-    if isinstance(hosted_choice, dict) and hosted_choice.get("type") in server_tools.OPENAI_SEARCH_TYPES:
-        if server_tools.TOOL_SEARCH in server_spec:
-            payload = {**payload, "tool_choice": {
-                "type": "function", "function": {"name": server_tools.TOOL_SEARCH}}}
-        else:
-            payload = {**payload, "tool_choice": "auto"}
+    hosted_choice = body.get("tool_choice")
+    if isinstance(hosted_choice, dict) and server_tools.is_openai_search_type(hosted_choice.get("type")):
+        body["tool_choice"] = ({"type": "function", "function": {"name": server_tools.TOOL_SEARCH}}
+                               if server_tools.TOOL_SEARCH in server_spec else "auto")
     body = await run_in_threadpool(_prepare_chat_body, body, session_payload=payload)
     stream_policy = _snapshot_stream_policy("chat", body)
     observe_stream_mode(stream_policy.mode)
@@ -4130,6 +4128,13 @@ def _chat_result_to_sse_lines(m: dict) -> list[str]:
         lines.append("data: " + json.dumps(usage_chunk, ensure_ascii=False))
     lines.append("data: [DONE]")
     return lines
+
+
+async def _replay_merged_sse(merged: dict):
+    """Replay a collected completion as SSE lines, each followed by its blank event separator."""
+    for line in _chat_result_to_sse_lines(merged):
+        yield line
+        yield ""
 
 
 def _network_error_text(error: Exception) -> str:
@@ -4464,9 +4469,8 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
         result = await _fetch_checked_chat(
             url, headers, body, model_name, rid, cred,
             max_collect_bytes=policy.max_collect_bytes)
-        for line in _chat_result_to_sse_lines(_completion_to_merged(result)):
+        async for line in _replay_merged_sse(_completion_to_merged(result)):
             yield line
-            yield ""
         _log_finish(model_name, t0, result, rid)
         return
     if tracker is None:
@@ -4534,15 +4538,9 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
     # historical single-block replay that hides the reasoning timeline from clients.
     if body.get("_server_tools"):
         # Gateway-executed web tools run as one aggregated loop, then replay.
-        result, _records = await _run_server_tool_chat(
-            url, headers, body, model_name, rid, cred, policy=policy)
-        merged = _completion_to_merged(result)
-        _log_finish(model_name, t0, result, rid)
-
-        async def replay():
-            for line in _chat_result_to_sse_lines(merged):
-                yield line
-        upstream = replay()
+        merged, _records = await _run_server_tool_merged(
+            url, headers, body, model_name, t0, rid, cred, policy=policy)
+        upstream = _replay_merged_sse(merged)
     else:
         upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, policy=policy)
         if not policy.realtime:
@@ -5071,15 +5069,31 @@ async def _run_server_tool_chat(url, headers, routed, model_name, rid, cred, *, 
     if not spec:
         return await fetch_chat(routed), []
     _log(f"[{rid}] ⚙ 内置联网工具已注入 | {sorted(spec)}")
+    # Tool calls are not requests of their own: they fold into this request's audit record.
     async def search_fn(query, count, allowed, freshness):
-        return await _web_search(query, count, allowed, freshness)
+        with observe_nested("web-search"):
+            return await _web_search(query, count, allowed, freshness)
+
+    async def fetch_fn(url, prompt, max_length):
+        with observe_nested("web-fetch"):
+            return await _web_fetch(url, prompt, max_length)
 
     result, records = await server_tools.run_chat_tool_loop(
-        fetch_chat, routed, spec, search_fn=search_fn, fetch_fn=_web_fetch)
+        fetch_chat, routed, spec, search_fn=search_fn, fetch_fn=fetch_fn)
     if records:
         _log(f"[{rid}] ⚙ 内置联网工具执行 {len(records)} 次 | "
              f"{[record['kind'] for record in records]}")
+        # Each round reported its own usage; the audit record holds the total.
+        observe_usage(result.get("usage") or {})
     return result, records
+
+
+async def _run_server_tool_merged(url, headers, routed, model_name, t0, rid, cred, *, policy):
+    """Run gateway web tools for a streaming client; returns the final merged completion and records."""
+    result, records = await _run_server_tool_chat(
+        url, headers, routed, model_name, rid, cred, policy=policy)
+    _log_finish(model_name, t0, result, rid)
+    return _completion_to_merged(result), records
 
 
 async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False,
@@ -5129,7 +5143,9 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
     state = {}
     tracker = None
     declared_names = _declared_tool_names(body)
-    if policy.realtime:
+    # Gateway web tools replay one aggregated result, which the realtime accumulator never sees.
+    realtime = policy.realtime and not body.get("_server_tools")
+    if realtime:
         budget = StreamOutputBudget(policy.max_collect_bytes)
         tracker = ChatSSEAccumulator(collect=False, retain_tools=True, budget=budget,
                                      declared_names=declared_names)
@@ -5149,26 +5165,18 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
     sent = False
     if body.get("_server_tools"):
         # Gateway-executed web tools run as one aggregated loop, then replay.
-        result, records = await _run_server_tool_chat(
-            url, headers, body, model_name, rid, cred, policy=policy)
-        merged = _completion_to_merged(result)
-        if state is not None:
-            state["merged"] = merged
+        merged, records = await _run_server_tool_merged(
+            url, headers, body, model_name, t0, rid, cred, policy=policy)
         if records:
             if anthropic:
                 converter.seed_server_tools(records)
             else:
                 converter.seed_web_search_calls(records)
-        _log_finish(model_name, t0, result, rid)
-
-        async def replay():
-            for line in _chat_result_to_sse_lines(merged):
-                yield line
-        upstream = replay()
+        upstream = _replay_merged_sse(merged)
     else:
         upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred,
                                    policy=policy, tracker=tracker, state=state)
-        if not policy.realtime:
+        if not realtime:
             upstream = _coalesce_reasoning_sse(upstream, max_bytes=policy.max_collect_bytes)
     try:
         try:
@@ -5177,7 +5185,7 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
                 if events:
                     sent = True
                     yield events.encode("utf-8")
-            if policy.realtime:
+            if realtime:
                 converter.set_validated_tools((state.get("merged") or {}).get("tool_calls"))
                 if tracker.filter_detector.detected:
                     converter.mark_content_filter()
@@ -5311,10 +5319,11 @@ async def web_fetch_endpoint(request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": {"message": f"bad json: {e}",
                                          "type": "invalid_request_error"}})
-    url = payload.get("url") if isinstance(payload, dict) else None
-    if not isinstance(url, str) or not url.strip().lower().startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail={"error": {"message": "url must be an http(s) URL",
-                                         "type": "invalid_request_error"}})
+    try:
+        url = web_fetch.validate_url(payload.get("url") if isinstance(payload, dict) else None)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail={"error": {"message": str(error),
+                                         "type": "invalid_request_error"}}) from None
     prompt = payload.get("prompt") if isinstance(payload, dict) else None
     if prompt is not None and not isinstance(prompt, str):
         raise HTTPException(status_code=400, detail={"error": {"message": "prompt must be a string",
@@ -5324,7 +5333,7 @@ async def web_fetch_endpoint(request: Request,
     if problem:
         raise HTTPException(status_code=400, detail={"error": {"message": problem,
                                          "type": "invalid_request_error"}})
-    result = await _web_fetch(url.strip(), prompt or "", max_length)
+    result = await _web_fetch(url, prompt or "", max_length)
     return {"object": "fetch.result", **result}
 
 

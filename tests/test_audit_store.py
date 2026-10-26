@@ -456,7 +456,7 @@ class AuditStoreTests(unittest.TestCase):
             self.assertEqual(self.store.list_records("runtime")["items"], [])
             self.assertEqual(self.store.storage()["logical_bytes"], 0)
         with closing(sqlite3.connect(self.path)) as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 0)
             total = db.execute("SELECT payload FROM stats_totals WHERE dimension='global'").fetchone()[0]
             self.assertEqual(json.loads(total)["requests"], 1)
 
@@ -494,7 +494,6 @@ class AuditStoreTests(unittest.TestCase):
             actual = db.execute("SELECT logical_bytes,request_count,event_count,ingest_count FROM detail_accounting").fetchone()
             expected = db.execute("SELECT COALESCE((SELECT SUM(logical_bytes) FROM requests),0)+COALESCE((SELECT SUM(logical_bytes) FROM events),0),(SELECT COUNT(*) FROM requests),(SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM ingest)").fetchone()
             self.assertEqual(actual, expected)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM attempts WHERE request_id NOT IN (SELECT id FROM requests)").fetchone()[0], 0)
         return actual
 
     def aggregate_snapshot(self):
@@ -707,14 +706,13 @@ class AuditStoreTests(unittest.TestCase):
         stamp = time.time()
         for population in (100, 10000):
             # Synthetic details avoid measuring fixture aggregation/setup. Their
-            # accounting and attempts still exercise the production triggers.
+            # accounting still exercises the production triggers.
             with closing(sqlite3.connect(self.path)) as fixture:
                 first = samples[-1][0] if samples else 0
                 for index in range(first, population):
                     fixture.execute(
                         "INSERT INTO requests(id,started_at,model,profile,credential,outcome,status_code,payload,logical_bytes) VALUES(?,?,?,?,?,?,?,?,?)",
                         (f"seed{index}", stamp, None, None, None, "success", 200, "{}", 256))
-                    fixture.execute("INSERT INTO attempts VALUES(?,?,?)", (f"seed{index}", 0, "{}"))
                     fixture.execute("INSERT INTO events VALUES(?,?,?,?,?,?)", (
                         f"event{index}", stamp, "runtime", "test", "{}", 128))
                 fixture.commit()
@@ -825,6 +823,88 @@ class AuditStoreTests(unittest.TestCase):
         accounting = reopened._db.execute("SELECT request_count FROM detail_accounting").fetchone()[0]
         raw_count = reopened._db.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
         self.assertEqual(accounting, raw_count)
+
+    def test_attempts_are_stored_once_in_the_request_payload(self):
+        attempts = [{"stage": "upstream_attempt", "profile": "p"}, {"stage": "upstream_http", "status_code": 200}]
+        self.assertTrue(self.store.record_request(self.record(attempts=attempts))["recorded"])
+        with closing(sqlite3.connect(self.path)) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertNotIn("attempts", tables)
+            payload, logical_bytes = db.execute("SELECT payload,logical_bytes FROM requests").fetchone()
+        self.assertEqual(logical_bytes, len(payload.encode()) + 256)
+        self.assertEqual(self.store.get_request("r1")["attempts"], attempts)
+        self.assertEqual(self.store.list_records()["items"][0]["attempts"], attempts)
+        self.assert_accounting()
+        self.store.clear("details")
+        self.assertEqual(self.assert_accounting(), (0, 0, 0, 1))
+
+    def legacy_attempts_database(self, path, count=3):
+        """Build the pre-change layout: a per-row attempts table, its delete cascade and double-counted bytes."""
+        store = AuditStore(path)
+        for index in range(count):
+            self.assertTrue(store.record_request(self.record(
+                f"legacy-{index}", started_at=time.time() - index,
+                attempts=[{"stage": "upstream_attempt", "profile": "p"},
+                          {"stage": "upstream_http", "status_code": 200}]))["recorded"])
+        store.close()
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE attempts (request_id TEXT NOT NULL, ordinal INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(request_id,ordinal))")
+            db.execute("DROP TRIGGER audit_requests_delete")
+            db.execute("CREATE TRIGGER audit_requests_delete AFTER DELETE ON requests BEGIN UPDATE detail_accounting SET logical_bytes=logical_bytes-OLD.logical_bytes,request_count=request_count-1 WHERE id=1; DELETE FROM attempts WHERE request_id=OLD.id; END")
+            for request_id, payload in db.execute("SELECT id,payload FROM requests").fetchall():
+                attempts = json.loads(payload)["attempts"]
+                for ordinal, attempt in enumerate(attempts):
+                    db.execute("INSERT INTO attempts VALUES(?,?,?)", (request_id, ordinal, json.dumps(attempt)))
+                db.execute("UPDATE requests SET logical_bytes=? WHERE id=?", (
+                    len(payload.encode()) + sum(len(json.dumps(a).encode()) + 32 for a in attempts) + 256,
+                    request_id))
+            db.commit()
+
+    def test_legacy_attempts_table_is_dropped_and_bytes_recounted(self):
+        path = Path(self.temp.name) / "private" / "legacy-attempts.sqlite3"
+        self.legacy_attempts_database(path)
+        with closing(sqlite3.connect(path)) as db:
+            doubled = db.execute("SELECT SUM(logical_bytes) FROM requests").fetchone()[0]
+        store = AuditStore(path)
+        self.addCleanup(store.close)
+        with closing(sqlite3.connect(path)) as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='attempts'").fetchone())
+            self.assertNotIn("attempts", db.execute(
+                "SELECT sql FROM sqlite_master WHERE name='audit_requests_delete'").fetchone()[0])
+            for payload, logical_bytes in db.execute("SELECT payload,logical_bytes FROM requests"):
+                self.assertEqual(logical_bytes, len(payload.encode()) + 256)
+            fixed = db.execute("SELECT SUM(logical_bytes) FROM requests").fetchone()[0]
+            self.assertLess(fixed, doubled)
+            self.assertEqual(db.execute("SELECT logical_bytes,request_count FROM detail_accounting").fetchone(),
+                             (fixed, 3))
+        self.assertEqual(len(store.get_request("legacy-0")["attempts"]), 2)
+        # Deletes through the rebuilt trigger keep the accounting exact.
+        self.assertTrue(store.record_request(self.record("fresh"))["recorded"])
+        store.configure(max_bytes=0)
+        store.storage()
+        with closing(sqlite3.connect(path)) as db:
+            self.assertEqual(db.execute("SELECT logical_bytes,request_count FROM detail_accounting").fetchone(), (0, 0))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 0)
+
+    def test_attempts_migration_is_idempotent_and_leaves_clear_working(self):
+        path = Path(self.temp.name) / "private" / "legacy-attempts.sqlite3"
+        self.legacy_attempts_database(path, count=2)
+        AuditStore(path).close()
+        statements = []
+        connect = sqlite3.connect
+        def traced_connect(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+        with patch("app.audit_store.sqlite3.connect", side_effect=traced_connect):
+            store = AuditStore(path)
+        self.addCleanup(store.close)
+        self.assertFalse(any("UPDATE requests SET logical_bytes" in sql for sql in statements), statements)
+        with closing(sqlite3.connect(path)) as db:
+            expected = db.execute("SELECT SUM(logical_bytes) FROM requests").fetchone()[0]
+            self.assertEqual(db.execute("SELECT logical_bytes FROM detail_accounting").fetchone()[0], expected)
+        self.assertTrue(store.clear("details")["ok"])
+        self.assertEqual(store.storage()["logical_bytes"], 0)
 
 
 if __name__ == "__main__":

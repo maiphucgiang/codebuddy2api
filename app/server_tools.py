@@ -12,18 +12,22 @@ import json
 import re
 import secrets
 
+from app import web_fetch, web_search
+
 TOOL_SEARCH = "WebSearch"
 TOOL_FETCH = "WebFetch"
 INJECTED_NAMES = (TOOL_SEARCH, TOOL_FETCH)
 
-# Anthropic server tool types (any dated version) and OpenAI hosted search types.
+# Anthropic server tool types (any dated version) and OpenAI hosted search types,
+# which may carry a YYYY_MM_DD snapshot suffix (web_search_preview_2025_03_11).
 SEARCH_TYPE_RE = re.compile(r"^web_search(_\d{8})?$")
 FETCH_TYPE_RE = re.compile(r"^web_fetch_\d{8}$")
-OPENAI_SEARCH_TYPES = frozenset({"web_search", "web_search_preview"})
+OPENAI_SEARCH_TYPE_RE = re.compile(r"^web_search(_preview)?(_\d{4}_\d{2}_\d{2})?$")
 
 # search_context_size (OpenAI) → result count (upstream max is 10).
 CONTEXT_SIZE_RESULTS = {"low": 3, "medium": 5, "high": 8}
 MAX_ROUNDS = 4
+_ABSENT = object()
 
 SEARCH_FUNCTION = {
     "type": "function",
@@ -69,10 +73,23 @@ FETCH_FUNCTION = {
 }
 
 
+def is_openai_search_type(kind) -> bool:
+    return isinstance(kind, str) and OPENAI_SEARCH_TYPE_RE.match(kind) is not None
+
+
 def _domain_list(value) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
-    return [str(item).strip().lstrip(".") for item in value if str(item).strip()]
+    domains = (_idna(str(item).strip().strip(".").lower()) for item in value)
+    return [domain for domain in domains if domain]
+
+
+def _idna(domain: str) -> str:
+    """Punycode form, matching web_fetch.canonical_host; unencodable entries stay as given."""
+    try:
+        return domain.encode("idna").decode("ascii")
+    except UnicodeError:
+        return domain
 
 
 def _declared_domains(value) -> list | None:
@@ -139,7 +156,7 @@ def split_server_tools(tools, *, openai_types: bool = False) -> tuple[list, dict
         if FETCH_TYPE_RE.match(kind):
             spec.setdefault(TOOL_FETCH, _fetch_config(tool))
             continue
-        if openai_types and kind in OPENAI_SEARCH_TYPES:
+        if openai_types and is_openai_search_type(kind):
             spec.setdefault(TOOL_SEARCH, _search_config(tool))
             continue
         plain.append(tool)
@@ -188,13 +205,10 @@ def _blocked_suffix(blocked: list) -> str:
     return "".join(f" -site:{domain}" for domain in blocked)
 
 
-def _hostname(url: str) -> str:
-    match = re.match(r"^[a-z][a-z0-9+.-]*://([^/:?#]+)", url, re.IGNORECASE)
-    return (match.group(1).lower() if match else url.lower()).lstrip(".")
-
-
 def _domain_allowed(url: str, allowed: list, blocked: list) -> bool:
-    host = _hostname(url)
+    host = web_fetch.canonical_host(url)
+    if not host:
+        return False
     for domain in blocked:
         if host == domain or host.endswith("." + domain):
             return False
@@ -211,15 +225,27 @@ def _uses_left(spec: dict, name: str, executed: int) -> bool:
 def _search_tool_text(record: dict) -> str:
     if record.get("error"):
         return f"web search failed: {record['error']}"
-    lines = [f"- [{item.get('title') or item.get('url')}]({item.get('url')})"
-             for item in record.get("results") or []]
-    return "\n".join(lines) or "No search results found."
+    query = (record.get("input") or {}).get("query") or ""
+    return web_search.search_text(query, record.get("results") or []) or "No search results found."
 
 
 def _fetch_tool_text(record: dict) -> str:
     if record.get("error"):
         return f"web fetch failed: {record['error']}"
     return str((record.get("content") or {}).get("content") or "")
+
+
+def search_context_text(query: str, results: list, error: str | None = None) -> str:
+    """Render a search an earlier turn executed as assistant text context for replay."""
+    body = (f"web search failed: {error}" if error is not None
+            else web_search.search_text(query, results) or "No search results found.")
+    return f"[Web search results for {json.dumps(query, ensure_ascii=False)}]\n{body}"
+
+
+def fetch_context_text(result: dict, error: str | None = None) -> str:
+    """Render a fetch an earlier turn executed as assistant text context for replay."""
+    body = f"web fetch failed: {error}" if error is not None else web_fetch.result_text(result)
+    return f"[Web fetch result]\n{body}"
 
 
 async def execute_call(name: str, arguments: dict, config: dict, *,
@@ -251,9 +277,7 @@ async def execute_call(name: str, arguments: dict, config: dict, *,
             record["input"] = {"query": query}
             record["results"] = results
         else:
-            url = str(arguments.get("url") or "").strip()
-            if not url.lower().startswith(("http://", "https://")):
-                raise ValueError("url must be an http(s) URL")
+            url = web_fetch.validate_url(arguments.get("url"))
             if not _domain_allowed(url, config["allowed_domains"] or [],
                                    config["blocked_domains"] or []):
                 raise ValueError("URL is blocked by the web fetch domain policy")
@@ -296,21 +320,32 @@ async def run_chat_tool_loop(fetch_chat, body: dict, spec: dict, *,
     ``fetch_chat(body)`` must return one merged Chat completion. Mutates
     ``body["messages"]`` with assistant/tool turns. Continuation rounds relax
     ``tool_choice`` to ``auto``; the original choice and tool list are restored
-    on exit. Returns ``(result, records)``; when the upstream asks for client
-    tools the loop stops and the returned result carries only those calls.
+    on exit. At most ``max_rounds`` rounds of gateway tools execute: the
+    continuation after the last one is sent without the injected tools and its
+    result is returned as-is. Returns ``(result, records)``; when the upstream
+    asks for client tools the loop stops and the returned result carries only
+    those calls. The returned ``usage`` is summed over every upstream round.
     """
     records: list[dict] = []
     executed = {name: 0 for name in INJECTED_NAMES}
-    saved_choice = body.get("tool_choice")
-    saved_tools = body.get("tools")
-    try:
+    saved = {key: body.get(key, _ABSENT) for key in ("tools", "tool_choice")}
+    usage: dict = {}
+
+    async def fetch_round():
         result = await fetch_chat(body)
-        for _ in range(max_rounds):
+        _add_usage(usage, result.get("usage"))
+        return result
+
+    def total(result):
+        return {**result, "usage": usage} if usage else result
+    try:
+        result = await fetch_round()
+        for round_index in range(max_rounds):
             choice = (result.get("choices") or [{}])[0]
             message = choice.get("message") or {}
             calls = message.get("tool_calls") or []
             if choice.get("finish_reason") != "tool_calls" or not calls:
-                return result, records
+                return total(result), records
             gateway_calls = [call for call in calls
                              if (call.get("function") or {}).get("name") in spec]
             client_calls = [call for call in calls if call not in gateway_calls]
@@ -327,24 +362,43 @@ async def run_chat_tool_loop(fetch_chat, body: dict, spec: dict, *,
             if client_calls:
                 # Client tools belong to the caller: surface their calls and stop;
                 # executed gateway calls stay recorded as protocol blocks.
-                return _strip_gateway_calls(result, client_calls), records
+                return total(_strip_gateway_calls(result, client_calls)), records
             # Continuations answer with text, so a required/named choice cannot
             # hold for them; relax it for every follow-up round.
             body["tool_choice"] = "auto"
-            result = await fetch_chat(body)
-        # Round budget exhausted: force a plain answer without the injected tools.
-        if isinstance(body.get("tools"), list):
-            body["tools"] = [tool for tool in body["tools"]
-                             if (tool.get("function") or {}).get("name") not in spec]
-        result = await fetch_chat(body)
-        return result, records
+            if round_index == max_rounds - 1:
+                # Round budget spent: the closing continuation must be a plain answer.
+                _drop_injected_tools(body, spec)
+            result = await fetch_round()
+        return total(result), records
     finally:
-        body["tool_choice"] = saved_choice
-        if "tool_choice" in body and saved_choice is None:
-            del body["tool_choice"]
-        body["tools"] = saved_tools
-        if "tools" in body and saved_tools is None:
-            del body["tools"]
+        for key, value in saved.items():
+            if value is _ABSENT:
+                body.pop(key, None)
+            else:
+                body[key] = value
+
+
+def _add_usage(total: dict, usage) -> None:
+    """Add the numeric leaves of one round's usage into ``total``, including nested detail objects."""
+    if not isinstance(usage, dict):
+        return
+    for key, value in usage.items():
+        if isinstance(value, dict):
+            _add_usage(total.setdefault(key, {}), value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            total[key] = total.get(key, 0) + value
+
+
+def _drop_injected_tools(body: dict, spec: dict) -> None:
+    """Remove gateway tools from the body; an emptied tool list takes tool_choice with it."""
+    remaining = [tool for tool in body.get("tools") or []
+                 if (tool.get("function") or {}).get("name") not in spec]
+    if remaining:
+        body["tools"] = remaining
+    else:
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
 
 
 async def _execute_record(name, function, spec, executed, search_fn, fetch_fn) -> dict:

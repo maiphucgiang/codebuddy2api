@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -31,6 +32,30 @@ def map_usage_to_anthropic(u: dict) -> dict:
         "cache_read_input_tokens": cached,
         "output_tokens": u.get("completion_tokens", 0),
     }
+
+
+# Gateway-owned marker for a search result snippet carried in encrypted_content, so a
+# client echoing the block back gives the next turn the snippet. Real Anthropic blobs
+# never carry it and are ignored.
+_SNIPPET_PREFIX = "cb2api:"
+
+
+def _encode_snippet(snippet) -> str:
+    if not isinstance(snippet, str) or not snippet.strip():
+        return ""
+    raw = json.dumps({"snippet": snippet}, ensure_ascii=False).encode("utf-8")
+    return _SNIPPET_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_snippet(value) -> str:
+    if not isinstance(value, str) or not value.startswith(_SNIPPET_PREFIX):
+        return ""
+    try:
+        data = json.loads(base64.urlsafe_b64decode(value[len(_SNIPPET_PREFIX):]))
+    except ValueError:
+        return ""
+    snippet = data.get("snippet") if isinstance(data, dict) else None
+    return snippet if isinstance(snippet, str) else ""
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +201,7 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
 
     # Assistant content
     if role == "assistant":
+        blocks = _server_tool_blocks_to_text(blocks)
         content_out = _convert_content_blocks(blocks)
         tool_calls: list[dict] = []
         thoughts: list[str] = []
@@ -206,6 +232,59 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
 
     content_out = _convert_content_blocks(blocks)
     return [{"role": role, "content": content_out}] if content_out else []
+
+
+def _server_tool_blocks_to_text(blocks: list) -> list:
+    """Replace echoed gateway server-tool blocks with text context, keeping block order.
+
+    Text rather than synthetic tool calls: upstream providers may reject historical
+    tool calls for tools the request does not declare.
+    """
+    queries = {block.get("id"): block["input"].get("query") or ""
+               for block in blocks
+               if isinstance(block, dict) and block.get("type") == "server_tool_use"
+               and isinstance(block.get("input"), dict)}
+    result: list = []
+    for block in blocks:
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind == "server_tool_use":
+            continue
+        if kind == "web_search_tool_result":
+            text = _search_result_text(block, queries.get(block.get("tool_use_id"), ""))
+        elif kind == "web_fetch_tool_result":
+            text = _fetch_result_text(block)
+        else:
+            result.append(block)
+            continue
+        # Adjacent text blocks are concatenated, so keep the rendering on its own lines.
+        result.append({"type": "text", "text": ("\n" if result else "") + text + "\n"})
+    return result
+
+
+def _search_result_text(block: dict, query: str) -> str:
+    content = block.get("content")
+    if isinstance(content, dict):
+        return server_tools.search_context_text(
+            query, [], error=content.get("error_code") or "unavailable")
+    results = [{"url": item["url"], "title": item.get("title"),
+                "snippet": _decode_snippet(item.get("encrypted_content"))}
+               for item in content or []
+               if isinstance(item, dict) and isinstance(item.get("url"), str) and item["url"]]
+    return server_tools.search_context_text(query, results)
+
+
+def _fetch_result_text(block: dict) -> str:
+    content = block.get("content")
+    if not isinstance(content, dict):
+        return server_tools.fetch_context_text({}, error="unavailable")
+    if content.get("type") == "web_fetch_tool_result_error":
+        return server_tools.fetch_context_text(
+            {}, error=content.get("error_code") or "unavailable")
+    document = content.get("content") if isinstance(content.get("content"), dict) else {}
+    source = document.get("source") if isinstance(document.get("source"), dict) else {}
+    text = source.get("data") if source.get("type") == "text" else ""
+    return server_tools.fetch_context_text({"url": content.get("url"),
+                                            "title": document.get("title"), "content": text})
 
 
 def _convert_content_blocks(blocks: list) -> str | list[dict]:
@@ -443,7 +522,8 @@ class AnthropicStreamConverter:
             results = []
             for item in record.get("results") or []:
                 entry = {"type": "web_search_result", "url": item.get("url"),
-                         "title": item.get("title"), "encrypted_content": ""}
+                         "title": item.get("title"),
+                         "encrypted_content": _encode_snippet(item.get("snippet"))}
                 if item.get("page_age"):
                     entry["page_age"] = item["page_age"]
                 results.append(entry)

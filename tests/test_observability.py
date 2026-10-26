@@ -11,8 +11,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.audit_store import AuditStore
 from app.observability import (AuditMiddleware, _Observation, _Parser, client_meta, normalize_usage,
-                               observe_attempt, observe_failure, observe_responses_projection,
-                               observe_route, observe_usage)
+                               observe_attempt, observe_failure, observe_failure_seq, observe_nested,
+                               observe_recovery, observe_responses_projection, observe_route,
+                               observe_usage)
 
 class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -402,6 +403,96 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
             await middleware({"type": "lifespan"}, receive, send)
         self.assertEqual(len(shutdown_records), 1)
         self.assertEqual(len(middleware._pending), 0)
+
+    async def invoke_ok(self, work):
+        """Serve one 200 response after running ``work`` inside the observed request."""
+        async def app(scope, receive, send):
+            await work()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"{}"})
+        await self.invoke(app)
+        return self.only_record()
+
+    def test_nested_observation_is_a_noop_without_an_enclosing_one(self):
+        with observe_nested("web-search"):
+            observe_route("web-search", None, "profile-b", "fp-b")
+            observe_attempt("upstream_attempt")
+            observe_failure("upstream_500")
+
+    async def test_nested_observation_leaves_request_fields_and_adds_one_attempt(self):
+        async def work():
+            observe_route("public-model", "upstream-model", "profile-a", "fp-a")
+            observe_attempt("upstream_attempt", profile="profile-a")
+            with observe_nested("web-search"):
+                observe_route("web-search", None, "profile-b", "fp-b")
+                observe_attempt("upstream_attempt", upstream_request_id="rid-1")
+                observe_attempt("upstream_http", status_code=200)
+                observe_usage({"input_tokens": 99})
+            observe_usage({"input_tokens": 5})
+        record = await self.invoke_ok(work)
+        self.assertEqual((record["public_model"], record["profile"], record["credential"]),
+                         ("public-model", "profile-a", "fp-a"))
+        self.assertEqual(record["outcome"], "success")
+        self.assertIsNone(record["error_code"])
+        self.assertEqual(record["input_tokens"], 5)
+        self.assertEqual([a["stage"] for a in record["attempts"]], ["upstream_attempt", "server_tool"])
+        entry = record["attempts"][1]
+        self.assertEqual(set(entry), {"stage", "model", "outcome", "profile", "credential", "attempt",
+                                      "duration_ms", "status_code", "upstream_request_id"})
+        self.assertEqual({key: value for key, value in entry.items() if key != "duration_ms"},
+                         {"stage": "server_tool", "model": "web-search", "outcome": "success",
+                          "profile": "profile-b", "credential": "fp-b", "attempt": 1,
+                          "status_code": 200, "upstream_request_id": "rid-1"})
+        self.assertGreaterEqual(entry["duration_ms"], 0)
+
+    async def test_nested_failure_stays_off_the_request_outcome(self):
+        async def work():
+            observe_route("public-model", None, "profile-a", "fp-a")
+            with observe_nested("web-fetch"):
+                observe_attempt("upstream_attempt", upstream_request_id="rid-1")
+                observe_attempt("upstream_error", status_code=500)
+                observe_failure("upstream_500")
+            with self.assertRaises(ValueError):
+                with observe_nested("web-search"):
+                    raise ValueError("boom")
+        record = await self.invoke_ok(work)
+        self.assertEqual(record["outcome"], "success")
+        self.assertIsNone(record["error_code"])
+        failed, raised = record["attempts"]
+        self.assertEqual((failed["model"], failed["outcome"], failed["error_code"], failed["status_code"]),
+                         ("web-fetch", "error", "upstream_500", 500))
+        self.assertEqual(failed["upstream_request_id"], "rid-1")
+        # An exception without a recorded failure falls back to the exception class name.
+        self.assertEqual((raised["model"], raised["outcome"], raised["error_code"], raised["attempt"]),
+                         ("web-search", "error", "ValueError", 0))
+        self.assertNotIn("status_code", raised)
+
+    async def test_nested_recovered_failover_counts_as_success(self):
+        async def work():
+            with observe_nested("web-search"):
+                observe_attempt("upstream_attempt", upstream_request_id="rid-1")
+                observe_attempt("upstream_error", status_code=500)
+                seq = observe_failure("upstream_500")
+                self.assertEqual(observe_failure_seq(), seq)
+                observe_attempt("upstream_attempt", upstream_request_id="rid-2")
+                observe_attempt("upstream_http", status_code=200)
+                observe_recovery(seq)
+        record = await self.invoke_ok(work)
+        entry = record["attempts"][0]
+        self.assertEqual((entry["outcome"], entry["attempt"], entry["status_code"],
+                          entry["upstream_request_id"]), ("success", 2, 200, "rid-2"))
+        self.assertNotIn("error_code", entry)
+
+    async def test_nested_entry_shares_the_attempt_cap(self):
+        async def work():
+            for _ in range(32):
+                observe_attempt("upstream_attempt")
+            for _ in range(2):
+                with observe_nested("web-search"):
+                    pass
+        record = await self.invoke_ok(work)
+        self.assertEqual(len(record["attempts"]), 32)
+        self.assertEqual(record["attempts"][-1], {"stage": "attempts_truncated", "dropped": 3})
 
     def test_tool_identifiers_alone_do_not_fabricate_first_output(self):
         observation = _Observation({}, 0, streaming=True)

@@ -97,7 +97,7 @@ def responses_request_to_chat(body: dict) -> dict:
         chat["_server_tools"] = active_spec
     if "tool_choice" in body:
         choice = body["tool_choice"]
-        if isinstance(choice, dict) and choice.get("type") in server_tools.OPENAI_SEARCH_TYPES \
+        if isinstance(choice, dict) and server_tools.is_openai_search_type(choice.get("type")) \
                 and server_tools.TOOL_SEARCH in active_spec:
             # Hosted tool_choice maps onto the injected gateway function, which the
             # plain-tool registry does not know.
@@ -136,12 +136,19 @@ def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None)
     pending_assistant_content: str | list[dict] | None = None
     pending_tool_calls: list[dict] = []
     pending_reasoning: list[str] = []
+    # Executed web searches become text context ahead of the turn's own text.
+    pending_search_context: list[str] = []
 
     def _flush_assistant():
         nonlocal pending_assistant_content, pending_tool_calls
-        if pending_assistant_content is not None or pending_tool_calls or pending_reasoning:
-            msg: dict[str, Any] = {"role": "assistant",
-                                   "content": pending_assistant_content or ""}
+        if (pending_assistant_content is not None or pending_tool_calls or pending_reasoning
+                or pending_search_context):
+            content = pending_assistant_content or ""
+            if pending_search_context:
+                context = "\n".join(pending_search_context) + "\n"
+                content = ([{"type": "text", "text": context}] + content if isinstance(content, list)
+                           else context + content)
+            msg: dict[str, Any] = {"role": "assistant", "content": content}
             if pending_tool_calls:
                 msg["tool_calls"] = pending_tool_calls[:]
             if pending_reasoning:
@@ -150,6 +157,7 @@ def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None)
             pending_assistant_content = None
             pending_tool_calls.clear()
             pending_reasoning.clear()
+            pending_search_context.clear()
 
     def _set_assistant_content(content):
         nonlocal pending_assistant_content
@@ -189,6 +197,12 @@ def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None)
                 raise ValueError("reasoning requires an assistant item")
             text = extract_reasoning_text(item)
             pending_reasoning.append(text)
+            continue
+
+        if item_type == "web_search_call":
+            text = _web_search_call_text(item)
+            if text:
+                pending_search_context.append(text)
             continue
 
         # Untyped role messages
@@ -259,6 +273,21 @@ def _convert_input_items(items: list, tool_registry: ToolRegistry | None = None)
 
     _flush_assistant()
     return messages
+
+
+def _web_search_call_text(item: dict) -> str:
+    """Render an echoed web_search_call as text with its query and source URLs."""
+    action = item.get("action")
+    if not isinstance(action, dict):
+        return ""
+    queries, sources = action.get("queries"), action.get("sources")
+    query = action.get("query") or (queries[0] if isinstance(queries, list) and queries else "")
+    results = [{"url": source["url"]} for source in (sources if isinstance(sources, list) else [])
+               if isinstance(source, dict) and isinstance(source.get("url"), str) and source["url"]]
+    if not query and not results:
+        return ""
+    error = "the search did not complete" if item.get("status") == "failed" else None
+    return server_tools.search_context_text(query, results, error=error)
 
 
 def _extract_content(content) -> str | list[dict]:
@@ -571,6 +600,7 @@ class ResponsesStreamConverter:
         # Executed gateway web searches to prepend as web_search_call items.
         self._seed_search_calls: list[dict] = []
         self._seeds_emitted = False
+        self._seed_count = 0  # Leading seeded items; compatible-mode indices start after them.
 
     def seed_web_search_calls(self, records) -> None:
         """Queue executed gateway web-search records; emitted as leading items."""
@@ -580,9 +610,12 @@ class ResponsesStreamConverter:
 
     def _search_call_item(self, record: dict, status: str) -> dict:
         query = (record.get("input") or {}).get("query") or ""
+        action: dict[str, Any] = {"type": "search", "queries": [query] if query else []}
+        if status != "in_progress":
+            action["sources"] = [{"type": "url", "url": item["url"]}
+                                 for item in record.get("results") or [] if item.get("url")]
         return {"type": "web_search_call", "id": record.get("id") or _rand_id("ws_"),
-                "status": status,
-                "action": {"type": "search", "queries": [query] if query else []}}
+                "status": status, "action": action}
 
     def _seed_events(self) -> list[str]:
         """Emit web_search_call items for executed gateway searches."""
@@ -590,6 +623,7 @@ class ResponsesStreamConverter:
             return []
         self._seeds_emitted = True
         events: list[str] = []
+        self._seed_count = len(self._seed_search_calls)
         for record in self._seed_search_calls:
             final_status = "failed" if record.get("error") else "completed"
             index = self._next_output_idx
@@ -638,11 +672,11 @@ class ResponsesStreamConverter:
         # Close reasoning items.
         if self._emitted_reasoning_item:
             events.append(self._evt("response.reasoning_summary_text.done", {
-                "output_index": 0, "summary_index": 0, "text": self._reasoning,
-                "item_id": self._reasoning_item_id
+                "output_index": self._reasoning_output_idx, "summary_index": 0,
+                "text": self._reasoning, "item_id": self._reasoning_item_id
             }))
             events.append(self._evt("response.output_item.done", {
-                "output_index": 0, "item": self._reasoning_item(status)
+                "output_index": self._reasoning_output_idx, "item": self._reasoning_item(status)
             }))
 
         # Close text content.
@@ -892,10 +926,10 @@ class ResponsesStreamConverter:
             self._output_order.append((kind, index))
             return output_index
         if kind == "reasoning":
-            return 0
+            return self._seed_count
         if kind == "message":
-            return 1 if self._emitted_reasoning_item else 0
-        return ((1 if self._emitted_reasoning_item else 0)
+            return self._seed_count + (1 if self._emitted_reasoning_item else 0)
+        return (self._seed_count + (1 if self._emitted_reasoning_item else 0)
                 + (1 if self._emitted_msg_item else 0) + len(self._tool_calls))
 
     def _sync_tool_state(self, index: int, tool: dict) -> dict:
@@ -973,7 +1007,7 @@ class ResponsesStreamConverter:
     def _msg_idx(self) -> int:
         """Return the stable message index in realtime mode or the canonical placement."""
         return (self._message_output_idx if self._realtime else
-                1 if self._emitted_reasoning_item else 0)
+                self._seed_count + (1 if self._emitted_reasoning_item else 0))
 
     def _reasoning_item(self, status: str) -> dict:
         """Build a reasoning item with its text in the first summary block."""
