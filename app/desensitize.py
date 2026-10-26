@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any, Iterable
 
 from app.harness_context import parse_harness_text
@@ -142,7 +143,14 @@ _DSH_CODING_PATTERN = re.compile(
 _DSH_MINIMAL_PATTERN = _template_pattern("You are a helpful software engineer assistant")
 _DSH_DIRECT_PATTERN = _template_pattern("You are DeepSeek Harness")
 _DSH_WEB_GUI_PATTERN = _template_pattern("DeepSeek Harness Web GUI")
+_DSH_WEB_GUI_FINGERPRINT_PATTERN = re.compile(
+    r"\bWeb GUI whose URL the runtime context names\.\s+When the user refers",
+    re.IGNORECASE,
+)
 _CHANNEL_IDENTITY_FIXED = _DSH_WORKBUDDY_IDENTITY
+_CHANNEL_SYSTEM_DEFAULT = "You are a helpful assistant."
+_CHANNEL_INSTRUCTIONS_OPEN = "<instructions>\n"
+_CHANNEL_INSTRUCTIONS_CLOSE = "\n</instructions>"
 
 WORKBUDDY_SYSTEM_PROMPT = (
     "You are WorkBuddy, a powerful AI assistant.\n\n"
@@ -266,7 +274,11 @@ def desensitize_channel_text(text: str) -> str:
     text = _CHANNEL_IDENTITY_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
     text = _DSH_MINIMAL_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
     text = _DSH_DIRECT_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
-    return _DSH_WEB_GUI_PATTERN.sub("WorkBuddy Web GUI", text)
+    text = _DSH_WEB_GUI_PATTERN.sub("WorkBuddy Web GUI", text)
+    return _DSH_WEB_GUI_FINGERPRINT_PATTERN.sub(
+        "Web GUI whose URL the runtime context names. The interface, when the user refers",
+        text,
+    )
 
 
 def _iter_text_blocks(content):
@@ -465,6 +477,75 @@ def desensitize_channel_body(body: dict) -> dict:
             ]
         messages.append(adapted)
     return {**body, "messages": messages}
+
+
+def _instruction_blocks(contents: list) -> list[dict]:
+    """Wrap system content as user-visible instructions without dropping non-text blocks."""
+    blocks: list[dict] = [{"type": "text", "text": _CHANNEL_INSTRUCTIONS_OPEN}]
+    for index, content in enumerate(contents):
+        if index:
+            blocks.append({"type": "text", "text": "\n\n"})
+        if isinstance(content, str):
+            blocks.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            blocks.extend(deepcopy(content))
+        elif content is not None:
+            blocks.append({"type": "text", "text": str(content)})
+    blocks.append({"type": "text", "text": _CHANNEL_INSTRUCTIONS_CLOSE})
+    return blocks
+
+
+def _prepend_user_instructions(message: dict, contents: list) -> dict:
+    """Prepend wrapped instructions to one user message while preserving its shape."""
+    moved = _instruction_blocks(contents)
+    existing = message.get("content")
+    updated = dict(message)
+    if isinstance(existing, str):
+        if any(block.get("type") != "text" for block in moved):
+            updated["content"] = moved + ([{"type": "text", "text": existing}] if existing else [])
+        else:
+            text = "".join(block.get("text", "") for block in moved)
+            updated["content"] = text + ("\n\n" + existing if existing else "")
+    elif isinstance(existing, list):
+        updated["content"] = moved + deepcopy(existing)
+    elif existing is None:
+        updated["content"] = moved
+    else:
+        updated["content"] = moved + [{"type": "text", "text": str(existing)}]
+    return updated
+
+
+def system_as_user_body(body: dict) -> dict:
+    """Move a refused system prompt into the first user message for one bounded retry."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return body
+    leading: list = []
+    index = 0
+    while index < len(messages) and isinstance(messages[index], dict) \
+            and messages[index].get("role") == "system":
+        leading.append(messages[index].get("content"))
+        index += 1
+    rest = [deepcopy(message) for message in messages[index:]]
+    later_system = False
+    for message in rest:
+        if isinstance(message, dict) and message.get("role") == "system":
+            message["role"] = "user"
+            later_system = True
+    meaningful = any(_content_to_text(content).strip() for content in leading)
+    if meaningful and leading and not (
+        len(leading) == 1 and _content_to_text(leading[0]).strip() == _CHANNEL_SYSTEM_DEFAULT
+    ):
+        user_index = next((i for i, message in enumerate(rest)
+                           if isinstance(message, dict) and message.get("role") == "user"), None)
+        moved = _instruction_blocks(leading)
+        if user_index is None:
+            rest.insert(0, {"role": "user", "content": moved})
+        else:
+            rest[user_index] = _prepend_user_instructions(rest[user_index], leading)
+    if not meaningful and not later_system:
+        return body
+    return {**body, "messages": [{"role": "system", "content": _CHANNEL_SYSTEM_DEFAULT}, *rest]}
 
 
 def apply_system_prompt_mode(body: dict, profile: str, mode: str) -> dict:

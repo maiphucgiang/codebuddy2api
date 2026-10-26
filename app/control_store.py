@@ -267,7 +267,10 @@ class ControlStore:
         def change(state):
             record = state["credentials"].setdefault(account_key, {})
             record["enabled"] = enabled
-            record.pop("auto_disabled", None)  # Any manual toggle clears the provenance.
+            # Any manual toggle clears automatic restriction provenance. The reason/body/time
+            # fields are evidence for the disabled state and must not survive an appeal release.
+            for key in ("auto_disabled", "auto_reason", "auto_body", "auto_at"):
+                record.pop(key, None)
         return self._update(None, change)
 
     def disable_credential_auto(self, account_key, reason="", body=None, at=None):

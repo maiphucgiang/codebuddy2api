@@ -58,6 +58,7 @@ function expiry(value: unknown) {
 const lastErrorLabels: Record<string, string> = {
   http_401: "上游 401（登录态被拒）",
   http_403: "上游 403（无权限）",
+  restricted: "官方限制（11140）",
   credential_error: "凭证同步失败（详见操作结果）",
 };
 
@@ -65,6 +66,7 @@ const healthLabels: Record<string, string> = {
   ready: "就绪",
   disabled: "人工停用",
   auto_disabled: "自动禁用",
+  restricted: "被官方限制",
   circuit_open: "认证熔断",
   expired: "已过期",
   error: "错误",
@@ -616,6 +618,22 @@ export function Credentials() {
       .catch((err: unknown) => setError(errorMessage(err)))
       .finally(() => setBusy(false));
   };
+  const releaseRestriction = (credential: Credential) => {
+    run(async () => {
+      const response = await api.patch(`/credentials/${encodeURIComponent(credential.id)}`, {
+        enabled: true,
+      });
+      const saved = object(response.data);
+      if (saved.id !== credential.id || saved.enabled !== true || !Number.isInteger(saved.revision))
+        throw new Error("限制解除结果未确认，请刷新列表核验");
+      notify({
+        key: "restriction",
+        tone: "good",
+        title: "官方限制已解除",
+        body: <span>账号已重新加入选路。</span>,
+      });
+    });
+  };
   const preference = (
     credential: Credential,
     field: "auto_checkin" | "auto_travel" | "auto_daily_chat" | "auto_growth",
@@ -761,6 +779,15 @@ export function Credentials() {
           >
             清除冷却
           </button>
+          {c.restricted === true && (
+            <button
+              disabled={busy}
+              aria-label={`解除官方限制 ${c.name ?? c.id}`}
+              onClick={() => releaseRestriction(c)}
+            >
+              申诉通过，重新使用
+            </button>
+          )}
           {c.trial_supported === true && (
             <button
               disabled={busy || c.enabled !== true}
@@ -826,23 +853,37 @@ export function Credentials() {
   const renderHealthBadge = (c: Credential) => {
     const disabled = c.enabled === false;
     const until = number(c.fail_until);
+    const restrictedUntil = number(c.restricted_until);
+    const restrictedRemaining =
+      restrictedUntil === null ? null : Math.max(0, Math.ceil(restrictedUntil - now / 1000));
     const remaining = disabled
       ? null
       : until === null
         ? null
         : Math.max(0, Math.ceil(until - now / 1000));
-    const label = disabled
-      ? c.auto_disabled
-        ? healthLabels.auto_disabled
-        : healthLabels.disabled
-      : remaining !== null && remaining > 0
-        ? `认证熔断 ${remaining}s`
-        : c.health === "ready"
-          ? "认证正常"
-          : (healthLabels[typeof c.health === "string" ? c.health : ""] ?? text(c.health));
+    const label =
+      c.restricted === true
+        ? restrictedRemaining !== null && restrictedRemaining > 0
+          ? `${healthLabels.restricted} ${restrictedRemaining}s`
+          : healthLabels.restricted
+        : disabled
+          ? c.auto_disabled
+            ? healthLabels.auto_disabled
+            : healthLabels.disabled
+          : remaining !== null && remaining > 0
+            ? `认证熔断 ${remaining}s`
+            : c.health === "ready"
+              ? "认证正常"
+              : (healthLabels[typeof c.health === "string" ? c.health : ""] ?? text(c.health));
     return (
       <Badge
-        tone={remaining !== null && remaining > 0 ? "bad" : c.health === "ready" ? "good" : "warn"}
+        tone={
+          c.restricted === true || (remaining !== null && remaining > 0)
+            ? "bad"
+            : c.health === "ready"
+              ? "good"
+              : "warn"
+        }
       >
         {label}
       </Badge>

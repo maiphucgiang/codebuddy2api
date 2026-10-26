@@ -171,6 +171,7 @@ const statuses: Record<string, string> = {
   ready: "就绪",
   disabled: "人工停用",
   auto_disabled: "自动禁用",
+  restricted: "被官方限制",
   error: "失败",
   success: "成功",
   cancelled: "已取消",
