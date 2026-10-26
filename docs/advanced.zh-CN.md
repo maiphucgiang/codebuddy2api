@@ -131,7 +131,7 @@ WebUI 系统设置可配置这两项；环境变量为 `CODEBUDDY2API_UPSTREAM_K
 
 生成接口响应带网关生成的 `X-Request-ID`，可关联文本日志及可用的审计明细；正文响应 ID、工具调用 ID 不变，不采用客户端请求 ID 进行鉴权或去重。
 
-`request_context_mode` 默认 `legacy`，保留旧会话键和上游头。通过 WebUI、`--request-context-mode scoped` 或 `CODEBUDDY2API_REQUEST_CONTEXT_MODE=scoped` 启用新模式：每次客户端 HTTP 请求的根 ID 在既有重试／换号中保持不变，每次上游尝试生成独立 ID/span，会话 ID 按账号隔离。不增加重试，不保存服务端历史，不自动生成缓存键。
+`request_context_mode` 默认 `legacy`，保留旧会话提示行为。legacy 会话 ID 在同账号、同会话中保持稳定，但故障转移选择其他账号时会变化，即使两个账号属于同一 profile。通过 WebUI、`--request-context-mode scoped` 或 `CODEBUDDY2API_REQUEST_CONTEXT_MODE=scoped` 启用新模式：每次客户端 HTTP 请求的根 ID 在既有重试／换号中保持不变，每次上游尝试生成独立 ID/span，会话 ID 按账号隔离。不增加重试，不保存服务端历史，不自动生成缓存键。
 
 scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` / `metadata.conversationId` 或顶层 `conversation_id` / `conversationId`。多处值须一致；冲突、非字符串、控制字符或超过 512 UTF-8 字节时返回 400。空值回退为协议适配后的指令与首条用户输入指纹，包含图片引用但不抓取 URL；缺少可靠输入时使用临时会话。无显式 ID 的相同输入仍无法区分；`user`、`metadata.user_id`、`prompt_cache_key` 不是会话 ID。原始标识不记录、不转发上游。
 

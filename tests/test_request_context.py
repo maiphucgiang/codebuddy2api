@@ -254,6 +254,31 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                 self.assertEqual(len(seen), 2)
                 self.assert_attempts(response, seen, same_account=False)
 
+    def test_legacy_failover_isolates_same_profile_account_conversations(self):
+        self.fx.add_account("cn-cli-second", "cn-cli")
+        self.fx.configure(profiles=("cn-cli", "cn-cli-second"))
+        seen = []
+
+        def respond(request):
+            seen.append(request)
+            if len(seen) == 1:
+                return httpx.Response(429, json={"error": {"message": "quota"}})
+            return httpx.Response(200, content=fixtures.fixtures.success_sse())
+
+        payload = self.fx.payload("chat/completions", text="same")
+        with self.responder(respond), patch.dict(gateway.CONFIG, {
+            "request_context_mode": "legacy", "failover_max": 1,
+        }):
+            first = self.fx.client.post("/v1/chat/completions", json=payload)
+            second = self.fx.client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(len(seen), 3)
+        self.assertNotEqual(seen[0].headers["x-user-id"], seen[1].headers["x-user-id"])
+        self.assertNotEqual(seen[0].headers["X-Conversation-ID"], seen[1].headers["X-Conversation-ID"])
+        self.assertEqual(seen[2].headers["x-user-id"], seen[1].headers["x-user-id"])
+        self.assertEqual(seen[2].headers["X-Conversation-ID"], seen[1].headers["X-Conversation-ID"])
+
     def test_scoped_hints_cannot_escape_a_full_strict_binding_or_free_tier(self):
         for strict in (False, True):
             with self.subTest(strict=strict):

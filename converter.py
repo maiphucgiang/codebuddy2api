@@ -2921,11 +2921,11 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(),
     profile = profile_for_headers(headers)
     if not _in_region(profile, region):
         raise HTTPException(status_code=503, detail={"error": {"message": "未找到指定地域凭据", "type": "auth_error"}})
+    identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
     if context is not None and context.scoped:
-        identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
         headers["X-Conversation-ID"] = context.conversation_id(profile, identity)
     else:
-        headers.update(_dynamic_request_headers(f"{profile}:{skey}" if skey else None))
+        headers.update(_dynamic_request_headers(f"{profile}:{identity}:{skey}" if skey else None))
     return cm, headers
 
 
