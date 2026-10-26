@@ -94,6 +94,7 @@ class WebFetchTests(fixtures.RegionRoutingTests):
         self.fetch_requests = []
         self.fail_first = 0
         self.fetch_status = 200
+        self.fetch_reply = None
 
     def handle_upstream(self, request):
         if request.url.path == FETCH_UPSTREAM_PATH:
@@ -109,6 +110,8 @@ class WebFetchTests(fixtures.RegionRoutingTests):
         payload = json.loads(request.content)
         self.assertEqual(payload["format"], "markdown")
         self.assertEqual(payload["timeout"], 20)
+        if self.fetch_reply is not None:
+            return self.fetch_reply
         if self.fail_first:
             self.fail_first -= 1
             return httpx.Response(429, json={"error": {"message": "synthetic quota"}})
@@ -175,6 +178,27 @@ class WebFetchTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(response.json()["error"]["message"], "synthetic rejection")
 
+    BAD_BODIES = (
+        (httpx.Response(200, content=b"<html>"), "网页抓取响应体不是有效的 JSON"),
+        (httpx.Response(200, json=[]), "网页抓取响应必须是 JSON 对象"),
+        (httpx.Response(200, json={"code": 15003, "msg": "boom"}), "网页抓取失败：boom"),
+        (httpx.Response(200, json={"code": 15003}), "网页抓取失败：15003"),
+        (httpx.Response(200, json={"url": URL}), "网页抓取响应缺少正文"),
+    )
+
+    def test_rest_unusable_upstream_body_is_a_chinese_502(self):
+        for reply, message in self.BAD_BODIES:
+            with self.subTest(message=message):
+                self.fetch_requests.clear()
+                self.fetch_reply = reply
+                with patch.dict(converter.CONFIG, {"failover_max": 1}):
+                    response = self.client.post("/v1/fetch", json=FETCH_BODY)
+                self.assertEqual(response.status_code, 502, response.text)
+                self.assertEqual(response.json()["error"],
+                                 {"message": message, "type": "upstream_error"})
+                # A readable but unusable reply is not a failover case.
+                self.assertEqual(len(self.fetch_requests), 1)
+
     # -- MCP surface ---------------------------------------------------------
 
     def test_mcp_lists_both_tools(self):
@@ -227,7 +251,29 @@ class WebFetchTests(fixtures.RegionRoutingTests):
         self.assertTrue(result["isError"])
         self.assertEqual(result["content"][0]["text"], "synthetic rejection")
 
+    def test_mcp_unusable_upstream_body_is_a_tool_error(self):
+        self.fetch_reply = httpx.Response(200, content=b"<html>")
+        message = rpc(9, "tools/call", {"name": "web_fetch", "arguments": {"url": URL}})
+        response = self.client.post("/v1/mcp", json=message, headers=LEGACY_HEADERS)
+        result = response.json()["result"]
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["content"][0]["text"], "网页抓取响应体不是有效的 JSON")
+
     # -- Auditing ------------------------------------------------------------
+
+    def test_unusable_upstream_body_is_recorded_with_its_failure_code(self):
+        store = AuditStore(self.root / "fetch-audit.sqlite3")
+        self.addCleanup(store.close)
+        application = FastAPI()
+        application.router.routes = list(converter.app.router.routes)
+        application.add_middleware(AuditMiddleware, store)
+        self.fetch_reply = httpx.Response(200, json={"url": URL})
+        with TestClient(application) as client:
+            response = client.post("/v1/fetch", json=FETCH_BODY)
+        self.assertEqual(response.status_code, 502, response.text)
+        records = store.list_records()["items"]
+        self.assertEqual(len(records), 1, records)
+        self.assertEqual(records[0]["error_code"], "bad_webfetch_response")
 
     def test_audit_records_rest_fetch_protocol(self):
         store = AuditStore(self.root / "fetch-audit.sqlite3")

@@ -195,7 +195,7 @@ async def _call_tool(message, tools):
     identifier = message.get("id")
     params = message.get("params")
     name = params.get("name") if isinstance(params, dict) else None
-    if name not in tools:
+    if not isinstance(name, str) or name not in tools:
         return 200, error_body(
             identifier, JSONRPC_METHOD_NOT_FOUND, f"Unknown tool: {name}"
         )

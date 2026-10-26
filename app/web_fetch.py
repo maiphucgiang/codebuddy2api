@@ -73,13 +73,13 @@ def parse_content(payload) -> dict:
     Success bodies carry no ``code`` field; error bodies are ``{code, msg}``.
     """
     if not isinstance(payload, dict):
-        raise ValueError("webfetch response must be a JSON object")
+        raise ValueError("网页抓取响应必须是 JSON 对象")
     code = payload.get("code")
     if code not in (None, 0, "0"):
-        raise ValueError(f"webfetch failed: {payload.get('msg') or code}")
+        raise ValueError(f"网页抓取失败：{payload.get('msg') or code}")
     content = payload.get("content")
     if not isinstance(content, str) or not content:
-        raise ValueError("webfetch response has no content")
+        raise ValueError("网页抓取响应缺少正文")
     return payload
 
 

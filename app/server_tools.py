@@ -324,18 +324,21 @@ async def run_chat_tool_loop(fetch_chat, body: dict, spec: dict, *,
                              search_fn, fetch_fn, max_rounds: int = MAX_ROUNDS):
     """Drive upstream rounds, executing injected web tools between them.
 
-    ``fetch_chat(body)`` must return one merged Chat completion. Mutates
-    ``body["messages"]`` with assistant/tool turns. Continuation rounds relax
-    ``tool_choice`` to ``auto``; the original choice and tool list are restored
-    on exit. At most ``max_rounds`` rounds of gateway tools execute: the
-    continuation after the last one is sent without the injected tools and its
-    result is returned as-is. Returns ``(result, records)``; when the upstream
-    asks for client tools the loop stops and the returned result carries only
-    those calls. The returned ``usage`` is summed over every upstream round.
+    ``fetch_chat(body)`` must return one merged Chat completion. Assistant/tool
+    turns go into the loop's own copy of ``body["messages"]``. Continuation rounds
+    relax ``tool_choice`` to ``auto``. The original message list, choice and tool
+    list are restored on exit, so a failover retry re-routed from the same body
+    never carries this attempt's tool turns. At most ``max_rounds`` rounds of
+    gateway tools execute: the continuation after the last one is sent without
+    the injected tools and its result is returned as-is. Returns
+    ``(result, records)``; when the upstream asks for client tools the loop
+    stops and the returned result carries only those calls. The returned
+    ``usage`` is summed over every upstream round.
     """
     records: list[dict] = []
     executed = {name: 0 for name in INJECTED_NAMES}
-    saved = {key: body.get(key, _ABSENT) for key in ("tools", "tool_choice")}
+    saved = {key: body.get(key, _ABSENT) for key in ("messages", "tools", "tool_choice")}
+    messages = body["messages"] = list(body["messages"])
     usage: dict = {}
 
     async def fetch_round():
@@ -356,7 +359,7 @@ async def run_chat_tool_loop(fetch_chat, body: dict, spec: dict, *,
             gateway_calls = [call for call in calls
                              if (call.get("function") or {}).get("name") in spec]
             client_calls = [call for call in calls if call not in gateway_calls]
-            body["messages"].append(_assistant_message(message))
+            messages.append(_assistant_message(message))
             for call in gateway_calls:
                 function = call.get("function") or {}
                 name = function.get("name")
@@ -364,7 +367,7 @@ async def run_chat_tool_loop(fetch_chat, body: dict, spec: dict, *,
                                                search_fn, fetch_fn)
                 record["id"] = call.get("id") or record["id"]
                 record["public_id"] = _public_id()
-                body["messages"].append(_tool_message(record))
+                messages.append(_tool_message(record))
                 records.append(record)
             if client_calls:
                 # Client tools belong to the caller: surface their calls and stop;

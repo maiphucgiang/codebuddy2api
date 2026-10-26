@@ -24,13 +24,13 @@ def request_body(query: str, max_results: int = DEFAULT_RESULTS, *,
 def parse_results(payload) -> list:
     """Validate the upstream envelope and return its result items unchanged; raise ValueError on unusable bodies."""
     if not isinstance(payload, dict):
-        raise ValueError("search response must be a JSON object")
+        raise ValueError("搜索响应必须是 JSON 对象")
     code = payload.get("code")
     if code not in (None, 0, "0"):
-        raise ValueError(f"search failed: {payload.get('msg') or code}")
+        raise ValueError(f"搜索失败：{payload.get('msg') or code}")
     results = payload.get("results")
     if not isinstance(results, list):
-        raise ValueError("search response has no results list")
+        raise ValueError("搜索响应缺少 results 列表")
     return [item for item in results
             if isinstance(item, dict) and isinstance(item.get("url"), str) and item["url"]]
 

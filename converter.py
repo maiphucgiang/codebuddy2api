@@ -19,12 +19,13 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -2801,10 +2802,17 @@ def _check_admin_auth(authorization: Optional[str], x_api_key: Optional[str]):
     _check_auth(authorization, x_api_key)
 
 
-def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(), requirements=None):
-    """Select a fresh credential lease and headers, excluding tried accounts; report unavailable capacity."""
+def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(), requirements=None,
+              sticky=True):
+    """Select a fresh credential lease and headers, excluding tried accounts; report unavailable capacity.
+
+    ``sticky=False`` neither reads nor rebinds the session binding, for calls that serve a session
+    without being its conversation (internal tool calls failing over from a borrowed account).
+    """
     context = current_context()
-    raw_key = context.session_key if context is not None and context.scoped else session_key(payload)
+    raw_key = None
+    if sticky:
+        raw_key = context.session_key if context is not None and context.scoped else session_key(payload)
     skey = f"{region}:{raw_key}" if raw_key and region is not None else raw_key
     skey = model_policy.sticky_scope(CONFIG, skey, model)
     pool = CONFIG.get("cred_pool")
@@ -4807,8 +4815,8 @@ async def _routed_fetch(payload, canonical, model_name, rid, t0, fetch, routed, 
                  f"{_replay_cost_note(error)}")
 
 
-def _wrap_search_error(status: int, raw: bytes, error) -> HTTPException:
-    """Re-shape upstream or transport failures as gateway error envelopes for search consumers."""
+def _wrap_agenttool_error(status: int, raw: bytes, error) -> HTTPException:
+    """Re-shape upstream or transport failures as gateway error envelopes for agenttool consumers."""
     detail = _safe_err_raw(raw, status)
     err = detail.get("error") if isinstance(detail, dict) else None
     if not (isinstance(detail, dict) and isinstance(err, dict) and err.get("message")):
@@ -4823,132 +4831,119 @@ def _wrap_search_error(status: int, raw: bytes, error) -> HTTPException:
                          headers=error.headers if isinstance(error, UpstreamHTTPError) else None)
 
 
-async def _web_search(query: str, max_results: int, allowed_domains=None, freshness: str = "") -> list:
+@dataclass(frozen=True)
+class _AgentTool:
+    """One upstream agenttool endpoint: where it lives, how its reply is read and how it is reported."""
+    name: str                       # Route model and log tag, e.g. "web-search".
+    url_for: Callable[[dict], str]
+    timeout: float
+    parse: Callable[[Any], Any]     # Raises ValueError on an unusable body.
+    invalid_body: str               # Client-facing 502 text for a non-JSON body.
+    bad_response: str               # Failure code recorded for an unusable body.
+    summarize: Callable[[Any], str]
+
+
+_WEB_SEARCH = _AgentTool(
+    name="web-search", url_for=search_url_for_headers, timeout=web_search.QUERY_TIMEOUT,
+    parse=web_search.parse_results, invalid_body="搜索响应体不是有效的 JSON",
+    bad_response="bad_search_response", summarize=lambda results: f"{len(results)} 条")
+_WEB_FETCH = _AgentTool(
+    name="web-fetch", url_for=fetch_url_for_headers, timeout=web_fetch.FETCH_TIMEOUT,
+    parse=web_fetch.parse_content, invalid_body="网页抓取响应体不是有效的 JSON",
+    bad_response="bad_webfetch_response",
+    summarize=lambda content: f"{len(content.get('content') or '')} 字符")
+
+
+async def _agenttool_call(tool: _AgentTool, body: dict, rid: str, *, borrowed=None):
+    """POST one agenttool request with bounded credential failover; returns the parsed reply.
+
+    ``borrowed`` is a ``(cred, headers)`` lease the caller keeps owning: it serves the first
+    attempt and is never released here. Failover then leases other accounts outside the session
+    binding, so a conversation that lent its account never moves to another one.
+    """
+    label = tool.name.replace("-", " ").upper()
+    tried = []
+    recovered = None
+    while True:
+        owned = borrowed is None or bool(tried)
+        if owned:
+            cred, headers = await run_in_threadpool(lambda: _cred_for(
+                {"model": tool.name}, None, tried=tried, sticky=borrowed is None))
+        else:
+            cred, headers = borrowed
+        url = tool.url_for(headers)
+        profile = profile_for_headers(headers)
+        observe_route(public_model=tool.name, upstream_model=None, profile=profile,
+                      credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")))
+        t0 = time.time()
+        try:
+            async with _backend_stream(url, headers, body, timeout=tool.timeout,
+                                       rid=rid, model_name=tool.name) as response:
+                if response.status_code != 200:
+                    _check_upstream_status(response.status_code, await read_bounded_error(response),
+                                           cred, None, headers=response.headers)
+                raw = await response.aread()
+            try:
+                payload = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                raise ValueError(tool.invalid_body) from None
+            result = tool.parse(payload)
+        except (httpx.HTTPError, UpstreamResponseError) as error:
+            status, raw = _upstream_failure(error, tool.name, t0, rid)
+            recovered = observe_failure_seq()
+            tried.append(_cred_manager(cred))
+            limit = _failover_limit()
+            if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
+                raise _wrap_agenttool_error(status, raw, error) from None
+            _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | {tool.name} | 上游 HTTP {status}"
+                 f"{_replay_cost_note(error)}")
+            continue
+        except ValueError as error:
+            observe_failure(tool.bad_response)
+            raise HTTPException(status_code=502, detail={"error": {"message": str(error),
+                                             "type": "upstream_error"}}) from None
+        finally:
+            if owned:
+                release_credential(cred)
+        _note_cred_model_ok(cred, None)
+        if tried:
+            observe_recovery(recovered)
+        _log(f"[{rid}] ✔ {label} {tool.summarize(result)} | {profile} | {time.time() - t0:.1f}s")
+        return result
+
+
+async def _web_search(query: str, max_results: int, allowed_domains=None, freshness: str = "",
+                      *, borrowed=None) -> list:
     """Run one upstream web search with bounded credential failover; returns parsed results."""
     rid = _request_id()
     _log(f"[{rid}] ▶ WEB SEARCH | chars={len(query)} | max_results={max_results}")
     body = web_search.request_body(query, max_results, allowed_domains=allowed_domains,
                                     freshness=freshness)
-    tried = []
-    recovered = None
-    while True:
-        cred, headers = await run_in_threadpool(
-            lambda: _cred_for({"model": "web-search"}, None, tried=tried))
-        url = search_url_for_headers(headers)
-        profile = profile_for_headers(headers)
-        observe_route(public_model="web-search", upstream_model=None, profile=profile,
-                      credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")))
-        t0 = time.time()
-        try:
-            async with _backend_stream(url, headers, body, timeout=web_search.QUERY_TIMEOUT,
-                                       rid=rid, model_name="web-search") as response:
-                if response.status_code != 200:
-                    _check_upstream_status(response.status_code, await read_bounded_error(response),
-                                           cred, None, headers=response.headers)
-                raw = await response.aread()
-            try:
-                payload = json.loads(raw.decode("utf-8", "replace"))
-            except ValueError:
-                raise ValueError("invalid search response body") from None
-            results = web_search.parse_results(payload)
-        except (httpx.HTTPError, UpstreamResponseError) as error:
-            release_credential(cred)
-            status, raw = _upstream_failure(error, "web-search", t0, rid)
-            recovered = observe_failure_seq()
-            tried.append(_cred_manager(cred))
-            limit = _failover_limit()
-            if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
-                raise _wrap_search_error(status, raw, error) from None
-            _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | web-search | 上游 HTTP {status}"
-                 f"{_replay_cost_note(error)}")
-            continue
-        except ValueError as error:
-            release_credential(cred)
-            observe_failure("bad_search_response")
-            raise HTTPException(status_code=502, detail={"error": {"message": str(error),
-                                             "type": "upstream_error"}}) from None
-        release_credential(cred)
-        _note_cred_model_ok(cred, None)
-        if tried:
-            observe_recovery(recovered)
-        _log(f"[{rid}] ✔ WEB SEARCH {len(results)} 条 | {profile} | {time.time() - t0:.1f}s")
-        return results
+    return await _agenttool_call(_WEB_SEARCH, body, rid, borrowed=borrowed)
 
 
-async def _web_fetch(url: str, prompt: str = "", max_length: int | None = None) -> dict:
+async def _web_fetch(url: str, prompt: str = "", max_length: int | None = None, *,
+                     borrowed=None) -> dict:
     """Run one upstream web fetch with bounded credential failover; returns parsed content."""
     rid = _request_id()
     _log(f"[{rid}] ▶ WEB FETCH | chars={len(url)}")
     body = web_fetch.request_body(url, prompt, max_length or web_fetch.DEFAULT_MAX_LENGTH)
-    tried = []
-    recovered = None
-    while True:
-        cred, headers = await run_in_threadpool(
-            lambda: _cred_for({"model": "web-fetch"}, None, tried=tried))
-        target = fetch_url_for_headers(headers)
-        profile = profile_for_headers(headers)
-        observe_route(public_model="web-fetch", upstream_model=None, profile=profile,
-                      credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")))
-        t0 = time.time()
+    return await _agenttool_call(_WEB_FETCH, body, rid, borrowed=borrowed)
+
+
+def _mcp_tool(call, failure: str):
+    """Adapt a gateway web tool for the MCP layer; map gateway errors to tool text instead of HTTP failures."""
+    async def run(*args):
         try:
-            async with _backend_stream(target, headers, body, timeout=web_fetch.FETCH_TIMEOUT,
-                                       rid=rid, model_name="web-fetch") as response:
-                if response.status_code != 200:
-                    _check_upstream_status(response.status_code, await read_bounded_error(response),
-                                           cred, None, headers=response.headers)
-                raw = await response.aread()
-            try:
-                payload = json.loads(raw.decode("utf-8", "replace"))
-            except ValueError:
-                raise ValueError("invalid webfetch response body") from None
-            content = web_fetch.parse_content(payload)
-        except (httpx.HTTPError, UpstreamResponseError) as error:
-            release_credential(cred)
-            status, raw = _upstream_failure(error, "web-fetch", t0, rid)
-            recovered = observe_failure_seq()
-            tried.append(_cred_manager(cred))
-            limit = _failover_limit()
-            if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
-                raise _wrap_search_error(status, raw, error) from None
-            _log(f"[{rid}] ↻ 换凭证重放 {len(tried)}/{limit} | web-fetch | 上游 HTTP {status}"
-                 f"{_replay_cost_note(error)}")
-            continue
-        except ValueError as error:
-            release_credential(cred)
-            observe_failure("bad_webfetch_response")
-            raise HTTPException(status_code=502, detail={"error": {"message": str(error),
-                                             "type": "upstream_error"}}) from None
-        release_credential(cred)
-        _note_cred_model_ok(cred, None)
-        if tried:
-            observe_recovery(recovered)
-        _log(f"[{rid}] ✔ WEB FETCH {len(content.get('content') or '')} 字符 | {profile} | {time.time() - t0:.1f}s")
-        return content
+            return await call(*args), None
+        except HTTPException as error:
+            detail = error.detail.get("error", {}) if isinstance(error.detail, dict) else {}
+            message = str(detail.get("message") or error.detail or failure)
+            code = detail.get("code") if isinstance(detail, dict) else None
+            observe_failure(str(code) if code else f"http_{error.status_code}")
+            return None, message
+    return run
 
-
-async def _mcp_search(query: str, count: int):
-    """Adapter for the MCP tool layer; map gateway errors to tool text instead of HTTP failures."""
-    try:
-        return await _web_search(query, count), None
-    except HTTPException as error:
-        detail = error.detail.get("error", {}) if isinstance(error.detail, dict) else {}
-        message = str(detail.get("message") or error.detail or "web search failed")
-        code = detail.get("code") if isinstance(detail, dict) else None
-        observe_failure(str(code) if code else f"http_{error.status_code}")
-        return None, message
-
-
-
-async def _mcp_fetch(url: str, prompt: str):
-    """Adapter for the MCP fetch tool; map gateway errors to tool text instead of HTTP failures."""
-    try:
-        return await _web_fetch(url, prompt), None
-    except HTTPException as error:
-        detail = error.detail.get("error", {}) if isinstance(error.detail, dict) else {}
-        message = str(detail.get("message") or error.detail or "web fetch failed")
-        code = detail.get("code") if isinstance(detail, dict) else None
-        observe_failure(str(code) if code else f"http_{error.status_code}")
-        return None, message
 
 def _note_content_filter(rid, model_name, *, final):
     stage = "content_filter" if final else "content_filter_retry"
@@ -5059,24 +5054,32 @@ async def create_response(request: Request,
 async def _run_server_tool_chat(url, headers, routed, model_name, rid, cred, *, policy):
     """Fetch one Chat completion, running declared gateway web tools to completion."""
     spec = routed.get("_server_tools") or {}
+    continuing = False
 
     async def fetch_chat(tool_body):
-        # Continuations grow the body with fetched content; re-apply the size guard.
-        _guard_request_size(tool_body)
+        nonlocal continuing
+        if continuing:
+            # Continuations grow the body with fetched content. The first round was already
+            # measured by _prepare_chat_body and _route_chat.
+            await run_in_threadpool(_guard_request_size, tool_body)
+        continuing = True
         return await _fetch_checked_chat(url, headers, tool_body, model_name, rid, cred,
                                          filter_retry=True,
                                          max_collect_bytes=policy.max_collect_bytes)
     if not spec:
         return await fetch_chat(routed), []
     _log(f"[{rid}] ⚙ 内置联网工具已注入 | {sorted(spec)}")
-    # Tool calls are not requests of their own: they fold into this request's audit record.
+    # Tool calls are not requests of their own: they fold into this request's audit record,
+    # and they run on this attempt's account instead of leasing capacity or sticky binding.
+    borrowed = (cred, headers)
+
     async def search_fn(query, count, allowed, freshness):
         with observe_nested("web-search"):
-            return await _web_search(query, count, allowed, freshness)
+            return await _web_search(query, count, allowed, freshness, borrowed=borrowed)
 
     async def fetch_fn(url, prompt, max_length):
         with observe_nested("web-fetch"):
-            return await _web_fetch(url, prompt, max_length)
+            return await _web_fetch(url, prompt, max_length, borrowed=borrowed)
 
     result, records = await server_tools.run_chat_tool_loop(
         fetch_chat, routed, spec, search_fn=search_fn, fetch_fn=fetch_fn)
@@ -5380,7 +5383,8 @@ async def mcp_endpoint(request: Request,
         observe_discard()
     status, body = await mcp_server.dispatch(
         request.headers, message,
-        {"web_search": _mcp_search, "web_fetch": _mcp_fetch})
+        {"web_search": _mcp_tool(_web_search, "web search failed"),
+         "web_fetch": _mcp_tool(_web_fetch, "web fetch failed")})
     if status == 202 or body is None:
         return Response(status_code=202)
     return JSONResponse(body, status_code=status)

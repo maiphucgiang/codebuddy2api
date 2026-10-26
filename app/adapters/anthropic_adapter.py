@@ -358,7 +358,6 @@ class AnthropicStreamConverter:
         self.created_at = int(time.time())
 
         # Stream state
-        # Stream state
         self._emitted_start = False
         # Executed gateway web tools to prepend as protocol-native blocks.
         self._server_tool_seeds: list[dict] = []
@@ -843,7 +842,6 @@ class AnthropicStreamConverter:
         return ""
 
     def _build_content_blocks(self) -> list[dict]:
-        """Build content blocks for a non-streaming response."""
         """Build content blocks for a non-streaming response."""
         blocks: list[dict] = list(self._seed_blocks)
         # Thinking must precede text.

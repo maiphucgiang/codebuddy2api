@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
+import asyncio
 import base64
 import copy
 import json
@@ -189,6 +190,7 @@ class LoopTests(unittest.TestCase):
         state = {"rounds": list(rounds)}
 
         async def fetch_chat(tool_body):
+            self.sent_messages.append(copy.deepcopy(tool_body["messages"]))
             return state["rounds"].pop(0)
 
         async def search_fn(query, count, allowed, freshness):
@@ -199,7 +201,7 @@ class LoopTests(unittest.TestCase):
             self.fetches.append((url, prompt, max_length))
             return {"url": url, "title": "Example", "content": "body"}
 
-        self.queries, self.fetches = [], []
+        self.queries, self.fetches, self.sent_messages = [], [], []
         spec = spec if spec is not None else {"WebSearch": server_tools.SEARCH_FUNCTION and
                                               {"max_uses": None, "allowed_domains": [],
                                                "blocked_domains": [], "max_results": 5}}
@@ -215,9 +217,12 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result["choices"][0]["message"]["content"], "ok")
         self.assertEqual([record["kind"] for record in records], ["search"])
         self.assertEqual(records[0]["results"][0]["url"], URL)
-        roles = [message["role"] for message in body["messages"]]
-        self.assertEqual(roles, ["user", "assistant", "tool"])
-        self.assertEqual(body["messages"][2]["tool_call_id"], "call_1")
+        # What the continuation carried; the caller's own list never sees the tool turns.
+        self.assertEqual([message["role"] for message in self.sent_messages[0]], ["user"])
+        continuation = self.sent_messages[1]
+        self.assertEqual([message["role"] for message in continuation], ["user", "assistant", "tool"])
+        self.assertEqual(continuation[2]["tool_call_id"], "call_1")
+        self.assertEqual([message["role"] for message in body["messages"]], ["user"])
 
     def test_usage_is_summed_over_every_round(self):
         first = {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
@@ -251,11 +256,11 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn("usage", result)
 
     def test_search_tool_message_carries_snippets(self):
-        body, _, _ = self.run_loop([
+        self.run_loop([
             tool_call_result("WebSearch", {"query": QUERY}),
             {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
         ])
-        self.assertEqual(body["messages"][2]["content"],
+        self.assertEqual(self.sent_messages[1][2]["content"],
                          f"1. [Example]({URL})\n\n[1] Snippet.")
 
     def test_search_tool_message_empty_and_error_texts(self):
@@ -295,7 +300,7 @@ class LoopTests(unittest.TestCase):
 
 
     def test_mixed_calls_execute_server_and_surface_client(self):
-        body, result, records = self.run_loop([
+        _, result, records = self.run_loop([
             double_call_result("WebSearch", {"query": QUERY}, "client_tool", {"x": 1}),
             {"choices": [{"message": {"content": "never"}, "finish_reason": "stop"}]},
         ])
@@ -304,10 +309,11 @@ class LoopTests(unittest.TestCase):
         calls = result["choices"][0]["message"]["tool_calls"]
         self.assertEqual([call["id"] for call in calls], ["call_2"])
         self.assertEqual(calls[0]["function"]["name"], "client_tool")
-        roles = [message["role"] for message in body["messages"]]
-        self.assertEqual(roles, ["user", "assistant", "tool"])
-        self.assertEqual(body["messages"][2]["tool_call_id"], "call_1")
-        self.assertNotIn("[gateway]", body["messages"][2]["content"])
+        # No continuation goes out, so the tool turn is only observable as the record's message.
+        self.assertEqual(len(self.sent_messages), 1)
+        tool_message = server_tools._tool_message(records[0])
+        self.assertEqual((tool_message["role"], tool_message["tool_call_id"]), ("tool", "call_1"))
+        self.assertNotIn("[gateway]", tool_message["content"])
 
     def test_client_only_call_returns_immediately(self):
         body, result, records = self.run_loop([
@@ -316,8 +322,8 @@ class LoopTests(unittest.TestCase):
         ])
         self.assertEqual(records, [])
         self.assertEqual(result["choices"][0]["message"]["tool_calls"][0]["id"], "call_1")
-        self.assertEqual([message["role"] for message in body["messages"]],
-                         ["user", "assistant"])
+        self.assertEqual(len(self.sent_messages), 1)
+        self.assertEqual([message["role"] for message in body["messages"]], ["user"])
 
     def test_declared_domains_bound_model_arguments(self):
         spec = {"WebSearch": {"max_uses": None, "allowed_domains": ["allowed.com"],
@@ -342,7 +348,10 @@ class LoopTests(unittest.TestCase):
                 "finish_reason": "tool_calls"}]},
             {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}]}
 
+        sent = []
+
         async def fetch_chat(tool_body):
+            sent.append(copy.deepcopy(tool_body["messages"]))
             return state["rounds"].pop(0)
 
         async def search_fn(query, count, allowed, freshness):
@@ -355,8 +364,36 @@ class LoopTests(unittest.TestCase):
             fetch_chat, body, {"WebSearch": {"max_uses": None, "allowed_domains": None,
                                              "blocked_domains": None, "max_results": 5}},
             search_fn=search_fn, fetch_fn=fetch_fn))
-        assistant = body["messages"][1]
-        self.assertEqual(assistant["reasoning_content"], "thinking")
+        self.assertEqual(sent[1][1]["reasoning_content"], "thinking")
+
+    def test_tool_turns_never_reach_the_callers_message_list(self):
+        original = [{"role": "user", "content": "q"}]
+        body = {"messages": original, "tools": []}
+        sent = []
+        rounds = [tool_call_result("WebSearch", {"query": QUERY})]
+
+        async def fetch_chat(tool_body):
+            sent.append(tool_body["messages"])
+            if not rounds:
+                # A failover-safe failure on the continuation round.
+                raise RuntimeError("continuation failed")
+            return rounds.pop(0)
+
+        async def search_fn(query, count, allowed, freshness):
+            return [dict(SEARCH_RESULT)]
+
+        async def fetch_fn(url, prompt, max_length):
+            return {"url": url, "content": "body"}
+
+        with self.assertRaises(RuntimeError):
+            _run(server_tools.run_chat_tool_loop(
+                fetch_chat, body, self.SEARCH_SPEC, search_fn=search_fn, fetch_fn=fetch_fn))
+        # The continuation worked on its own list; the original list was restored untouched.
+        self.assertEqual(len(sent), 2)
+        self.assertIsNot(sent[1], original)
+        self.assertEqual([message["role"] for message in sent[1]], ["user", "assistant", "tool"])
+        self.assertIs(body["messages"], original)
+        self.assertEqual(original, [{"role": "user", "content": "q"}])
 
     def test_tool_choice_and_tools_restored_after_loop(self):
         body = {"messages": [{"role": "user", "content": "q"}],
@@ -466,9 +503,7 @@ class LoopTests(unittest.TestCase):
 
 
 def _run(coro):
-    import asyncio
-    return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(coro) \
-        if False else asyncio.run(coro)
+    return asyncio.run(coro)
 
 
 class DomainPolicyTests(unittest.TestCase):
@@ -827,11 +862,23 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         self.tool_requests = []
         self.fetch_content = "fetched body"
         self.search_status = 200
+        self.search_fail_uids = set()
+        self.tool_held = []
+        self.chat_held = []
+
+    def held(self):
+        """Per-account in-flight leases at this moment, by synthetic UID."""
+        counts = {uid: self.pool._capacity.count(self.pool._capacity_key(entry))
+                  for uid, entry in self.entries.items()}
+        return {uid: count for uid, count in counts.items() if count}
 
     def handle_upstream(self, request):
         if request.url.path in ("/agenttool/v1/search", "/agenttool/v1/webfetch"):
             self.tool_requests.append(request)
+            self.tool_held.append(self.held())
             if request.url.path == "/agenttool/v1/search":
+                if request.headers.get("x-user-id") in self.search_fail_uids:
+                    return httpx.Response(503, json={"code": 503, "msg": "synthetic outage"})
                 if self.search_status != 200:
                     return httpx.Response(self.search_status,
                                           json={"code": self.search_status, "msg": "synthetic failure"})
@@ -843,12 +890,16 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                                              "truncated": False, "status_code": 200})
         if request.url.path.endswith("/chat/completions"):
             self.chat_requests.append(request)
+            self.chat_held.append(self.held())
             # Run the base handler for its identity assertions and request log;
             # scripted rounds only override the body on the success path.
             base_response = super().handle_upstream(request)
             if self.response_status != 200:
                 return base_response
             body = self.chat_rounds.pop(0) if self.chat_rounds else fixtures.success_sse()
+            if isinstance(body, int):
+                # A scripted round may be an upstream error status instead of a body.
+                return httpx.Response(body, json={"error": {"message": "synthetic failure"}})
             return httpx.Response(200, content=body,
                                   headers={"Content-Type": "text/event-stream"})
         return super().handle_upstream(request)
@@ -1262,19 +1313,11 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
     # -- Audit: one record per request -------------------------------------
 
     def audited(self, profiles=("cn-cli", "intl-cli"), mode="legacy"):
-        """Serve the app through the audit middleware; web tools route away from the chat account."""
+        """Serve the app through the audit middleware."""
         self.configure(profiles=profiles)
         self.allowed_profiles = set(profiles)
         store = AuditStore(self.root / "tool-audit.sqlite3")
         self.addCleanup(store.close)
-        chat_account = self.entries["cn-cli"]["cm"]
-        real = converter._cred_for
-
-        def avoid_chat_account(payload, model=None, **kwargs):
-            if payload.get("model") in ("web-search", "web-fetch"):
-                kwargs["tried"] = [*kwargs.get("tried", ()), chat_account]
-            return real(payload, model, **kwargs)
-        self.enterContext(patch.object(converter, "_cred_for", side_effect=avoid_chat_account))
         client = self.enterContext(TestClient(
             AuditMiddleware(converter.app, {**converter.CONFIG, "audit_store": store,
                                             "request_context_mode": mode})))
@@ -1292,9 +1335,9 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
         response = client.post("/v1/messages", json=payload)
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(self.tool_requests[0].headers["x-user-id"], "intl-cli")
+        # The search borrows the request's own account instead of leasing another.
+        self.assertEqual(self.tool_requests[0].headers["x-user-id"], "cn-cli")
         record = self.only_record(store)
-        # The request keeps its inference route, not the search route.
         self.assertEqual((record["public_model"], record["profile"]), ("cn-cli-only", "cn-cli"))
         self.assertEqual(record["credential"], self.entries["cn-cli"]["account_key"])
         self.assertEqual(record["outcome"], "success")
@@ -1306,8 +1349,8 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                                       "duration_ms", "status_code", "upstream_request_id"})
         self.assertEqual(entry["upstream_request_id"], self.tool_requests[0].headers["x-request-id"])
         self.assertEqual((entry["model"], entry["outcome"], entry["profile"], entry["attempt"],
-                          entry["status_code"]), ("web-search", "success", "intl-cli", 1, 200))
-        self.assertEqual(entry["credential"], self.entries["intl-cli"]["account_key"])
+                          entry["status_code"]), ("web-search", "success", "cn-cli", 1, 200))
+        self.assertEqual(entry["credential"], self.entries["cn-cli"]["account_key"])
         self.assertGreaterEqual(entry["duration_ms"], 0)
         self.assertNotIn("error_code", entry)
         # The search left no low-level attempts of its own: only the two model rounds remain.
@@ -1349,7 +1392,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                          ("cn-cli-only", "cn-cli", "success"))
         entry = next(a for a in record["attempts"] if a["stage"] == "server_tool")
         self.assertEqual((entry["model"], entry["outcome"], entry["profile"], entry["attempt"]),
-                         ("web-fetch", "success", "intl-cli", 1))
+                         ("web-fetch", "success", "cn-cli", 1))
 
     def test_standalone_search_keeps_its_own_route_fields(self):
         store, client = self.audited()
@@ -1403,6 +1446,144 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
             response = self.client.post("/v1/messages", json=payload)
         self.assertEqual(response.status_code, 413, response.text)
         self.assertEqual(len(self.chat_requests), 1)
+
+
+    # -- Borrowed account lease --------------------------------------------
+
+    def search_payload(self, selected_model="shared-model"):
+        payload = self.payload(endpoint="messages", selected_model=selected_model)
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        return payload
+
+    def test_search_borrows_the_requests_account_instead_of_leasing_capacity(self):
+        self.configure(profiles=("cn-cli",))
+        self.allowed_profiles = {"cn-cli"}
+        self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
+        with patch.dict(converter.CONFIG, {"max_inflight_per_account": 1}):
+            response = self.client.post("/v1/messages", json=self.search_payload())
+        self.assertEqual(response.status_code, 200, response.text)
+        blocks = response.json()["content"]
+        self.assertEqual([block["type"] for block in blocks],
+                         ["server_tool_use", "web_search_tool_result", "text"])
+        self.assertEqual(blocks[1]["content"][0]["url"], URL)
+        self.assertEqual(len(self.tool_requests), 1)
+        # The request's own lease is still the only one held while the upstream serves the search.
+        self.assertEqual(self.tool_held, [{"cn-cli": 1}])
+        self.assertEqual(self.held(), {})
+
+    def test_search_follows_the_chat_account_and_leaves_the_sticky_binding_alone(self):
+        _, client = self.audited(profiles=("cn-cli", "cn-work"), mode="scoped")
+        payload = self.search_payload()
+        with patch.dict(converter.CONFIG, {"max_inflight_per_account": 1}), \
+                patch.object(self.pool, "pick", wraps=self.pool.pick) as pick:
+            # Two turns of one conversation.
+            for _ in range(2):
+                self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
+                response = client.post("/v1/messages", json=payload)
+                self.assertEqual(response.status_code, 200, response.text)
+        accounts = {request.headers["x-user-id"]
+                    for request in [*self.chat_requests, *self.tool_requests]}
+        self.assertEqual(len(self.chat_requests), 4)
+        self.assertEqual(len(self.tool_requests), 2)
+        self.assertEqual(len(accounts), 1, accounts)
+        # Only the chat selections touched the pool; the searches never picked an account.
+        self.assertEqual([call.args[1] for call in pick.call_args_list], ["shared-model"] * 2)
+        self.assertEqual([account for account, _ in self.pool._sticky.values()],
+                         [self.entries[accounts.pop()]["id"]])
+        self.assertEqual(self.held(), {})
+
+    def test_search_failing_on_the_borrowed_account_fails_over_outside_the_sticky_binding(self):
+        store, client = self.audited(profiles=("cn-cli", "cn-work"), mode="scoped")
+        self.search_fail_uids = {"cn-cli"}
+        self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
+        with patch.dict(converter.CONFIG, {"max_inflight_per_account": 1, "failover_max": 1}), \
+                patch.object(self.pool, "pick", wraps=self.pool.pick) as pick:
+            response = client.post("/v1/messages", json=self.search_payload("cn-cli-only"))
+        self.assertEqual(response.status_code, 200, response.text)
+        blocks = response.json()["content"]
+        self.assertEqual([block["type"] for block in blocks],
+                         ["server_tool_use", "web_search_tool_result", "text"])
+        self.assertEqual(blocks[1]["content"][0]["url"], URL)
+        self.assertEqual([request.headers["x-user-id"] for request in self.tool_requests],
+                         ["cn-cli", "cn-work"])
+        # The failover lease takes capacity beside the request's own and is released before the
+        # continuation; the borrowed lease stays with the request throughout.
+        self.assertEqual(self.tool_held, [{"cn-cli": 1}, {"cn-cli": 1, "cn-work": 1}])
+        self.assertEqual(self.chat_held, [{"cn-cli": 1}, {"cn-cli": 1}])
+        self.assertEqual(self.held(), {})
+        # The chat selection is the only sticky one; the failover pick carries no session key.
+        self.assertEqual([call.args[:2] for call in pick.call_args_list][1:], [(None, None)])
+        self.assertEqual([account for account, _ in self.pool._sticky.values()],
+                         [self.entries["cn-cli"]["id"]])
+        record = self.only_record(store)
+        self.assertEqual((record["profile"], record["credential"]),
+                         ("cn-cli", self.entries["cn-cli"]["account_key"]))
+        entry = next(a for a in record["attempts"] if a["stage"] == "server_tool")
+        # The server_tool entry names the account that actually served the search.
+        self.assertEqual((entry["profile"], entry["credential"], entry["outcome"]),
+                         ("cn-work", self.entries["cn-work"]["account_key"], "success"))
+
+    # -- Failover retries ----------------------------------------------------
+
+    def test_failover_retry_does_not_carry_the_failed_attempts_tool_turns(self):
+        for status in (429, 503):
+            with self.subTest(status=status):
+                self.configure()
+                self.chat_requests.clear()
+                self.tool_requests.clear()
+                # Attempt one searches, then its continuation fails; attempt two starts over.
+                self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), status,
+                                    tool_call_round("WebSearch", {"query": QUERY}), final_round()]
+                with patch.dict(converter.CONFIG, {"failover_max": 1}):
+                    response = self.client.post("/v1/messages", json=self.search_payload())
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(len(self.chat_requests), 4)
+                messages = [json.loads(request.content)["messages"] for request in self.chat_requests]
+                roles = [message["role"] for message in messages[0]]
+                self.assertEqual(roles[-1], "user")
+                self.assertEqual([message["role"] for message in messages[1]],
+                                 [*roles, "assistant", "tool"])
+                self.assertEqual(messages[2], messages[0])
+                self.assertEqual(messages[3], messages[1])
+                self.assertNotEqual(self.chat_requests[2].headers["x-user-id"],
+                                    self.chat_requests[0].headers["x-user-id"])
+                # Only the successful attempt's server tool blocks reach the client.
+                self.assertEqual([block["type"] for block in response.json()["content"]],
+                                 ["server_tool_use", "web_search_tool_result", "text"])
+
+    # -- Request size guard ------------------------------------------------
+
+    def guard_calls(self):
+        """Patch the size guard; each call records whether it ran on the event loop thread."""
+        real = converter._guard_request_size
+        calls = []
+
+        def recording(body):
+            try:
+                asyncio.get_running_loop()
+                calls.append("loop")
+            except RuntimeError:
+                calls.append("worker")
+            return real(body)
+        self.enterContext(patch.object(converter, "_guard_request_size", side_effect=recording))
+        return calls
+
+    def test_request_without_server_tools_adds_no_guard_pass_in_the_fetch(self):
+        for endpoint in ("messages", "responses", "chat/completions"):
+            with self.subTest(endpoint=endpoint):
+                calls = self.guard_calls()
+                response = self.client.post("/v1/" + endpoint, json=self.payload(endpoint=endpoint))
+                self.assertEqual(response.status_code, 200, response.text)
+                # Only the preparation pass, which already runs in the threadpool.
+                self.assertEqual(calls, ["worker"])
+
+    def test_only_continuation_rounds_are_measured_again_and_off_the_event_loop(self):
+        calls = self.guard_calls()
+        self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
+        response = self.client.post("/v1/messages", json=self.search_payload())
+        self.assertEqual(response.status_code, 200, response.text)
+        # The preparation pass plus the single continuation round.
+        self.assertEqual(calls, ["worker", "worker"])
 
 
 if __name__ == "__main__":
