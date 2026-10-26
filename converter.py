@@ -1538,6 +1538,16 @@ class CredentialPool:
                     self._remember_credential(e, e["last_error"])
         _log(f"[cred] 凭证熔断 {CRED_COOLDOWN}s: {Path(cm.path).name} {reason}")
 
+    def note_restriction(self, cm: CredentialManager | None, code, *, body=None, generation=None) -> bool:
+        """Disable a restricted account through the same path for inference and automation."""
+        code = str(code or "")
+        if cm is None or code not in RESTRICTED_CODES:
+            return False
+        self.cooldown(cm, reason=f"上游限制 {code}", generation=generation)
+        self._note_error_body(cm, body, generation=generation)
+        self._auto_disable(cm, f"上游限制 {code}", generation=generation)
+        return True
+
     def note_status(self, cm: CredentialManager | None, status: int,
                     model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None,
                     channel_fallback=False):
@@ -1565,12 +1575,13 @@ class CredentialPool:
                 self._cool_model(cm, model, time.time() + MODEL_RESTRICTION_COOLDOWN,
                                  generation=generation, reason=f"上游模型限制 {code}")
             return
+        if status == 403 and code in RESTRICTED_CODES:
+            self.note_restriction(cm, code, body=body, generation=generation)
+            return
         if status in (401, 403):
             self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
             self._note_error_body(cm, body, generation=generation)
-            if status == 403 and code in RESTRICTED_CODES:
-                self._auto_disable(cm, f"上游限制 {code}", generation=generation)
-            elif status == 401:
+            if status == 401:
                 self._note_fresh_401(cm, generation=generation)
             return
         if status == 400 and is_channel_check_error(raw):
@@ -1870,7 +1881,35 @@ def _bearer_token(headers: dict) -> str:
 _HOUSEKEEP_LOCK = threading.Lock()
 
 
+def _background_restriction_code(value):
+    """Read a restriction code from bounded automation results or exception diagnostics."""
+    if not isinstance(value, dict):
+        value = getattr(value, "diagnostics", None) or getattr(value, "details", None)
+    if not isinstance(value, dict):
+        return None
+    nodes = [value] + [value.get(key) for key in ("error", "details", "diagnostics")]
+    for node in nodes:
+        if isinstance(node, dict):
+            code = node.get("code")
+            if code is not None and str(code) in RESTRICTED_CODES:
+                return str(code)
+    return None
+
+
+def _sync_restriction(pool, ledger, entry, generation, phase, value) -> bool:
+    """Stop the current automation sweep after a confirmed account restriction."""
+    code = _background_restriction_code(value)
+    if code is None or not pool.note_restriction(entry["cm"], code, generation=generation):
+        return False
+    message = f"{phase}: 上游限制 {code}"
+    pool.apply_if_current(entry["cm"], generation, lambda: ledger.note_error(entry["id"], message))
+    _log(f"[{phase}] {Path(entry['id']).name} 上游限制 {code}，停止后续同步")
+    return True
+
+
 def _sync_error(pool, ledger, entry, generation, phase, error):
+    if _sync_restriction(pool, ledger, entry, generation, phase, error):
+        return
     message = f"{phase}: {_network_error_text(error)}"
     pool.apply_if_current(entry["cm"], generation, lambda: ledger.note_error(entry["id"], message))
     _log(f"[{phase}] {Path(entry['id']).name} 同步失败（保留旧数据）: {message}")
@@ -1953,6 +1992,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                     return (model_policy.credential_auto_checkin(CONFIG, entry)
                             and pool.apply_if_current(cm, generation, lambda: None))
                 result = checkin_service.perform(token, uid=uid, domain=domain, can_claim=can_claim)
+                if _sync_restriction(pool, ledger, entry, generation, "checkin", result):
+                    return None
                 if result["state"] == "cancelled":
                     if not pool.apply_if_current(cm, generation, lambda: None):
                         failed.add(cid)
@@ -1984,6 +2025,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                 trip = travel.perform(token, profile_for_headers(headers), can_write=can_travel,
                                       enterprise=entry.get("enterprise") is True,
                                       buddy_context=_buddy_context(entry, headers))
+                if _sync_restriction(pool, ledger, entry, generation, "travel", trip):
+                    return None
                 if not pool.apply_if_current(cm, generation, lambda: travel.remember(ledger, cid, trip)):
                     failed.add(cid)
                     return None
@@ -1998,6 +2041,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
         if checkin and model_policy.credential_auto_growth(CONFIG, entry):
             try:
                 summary = growth_tasks.sweep_account(token, uid=uid, domain=domain)
+                if _sync_restriction(pool, ledger, entry, generation, "growth", summary):
+                    return None
                 if summary.get("claimed") or summary.get("errors"):
                     _log(f"[growth] {Path(cid).name}: claimed={len(summary.get('claimed') or [])} "
                          f"accepted={len(summary.get('accepted') or [])} +{summary.get('credit', 0)}c "
@@ -2012,6 +2057,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                         base=chain_base, token=token, uid=uid, domain=domain,
                         headers=headers, lock_key=entry.get("account_key") or cid)
                     outcome = growth_chains.run(code, ctx)
+                    if _sync_restriction(pool, ledger, entry, generation, f"growth:{code}", outcome):
+                        return None
                     if outcome.get("skipped") or outcome.get("claimed"):
                         _log(f"[growth] {Path(cid).name} {code}: {outcome.get('message', '')}")
                 except Exception as error:
@@ -2031,6 +2078,8 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                 turn = daily_chat.perform(token, profile, uid=uid, domain=domain, can_write=can_chat,
                                           store=CONFIG.get("control_store"),
                                           identity=entry.get("account_key"))
+                if _sync_restriction(pool, ledger, entry, generation, "dailychat", turn):
+                    return None
                 _log(f"[dailychat] {Path(cid).name}: state={turn.get('state')} ok={turn.get('ok')}")
             except Exception as error:
                 _sync_error(pool, ledger, entry, generation, "dailychat", error)

@@ -76,17 +76,19 @@ def _growth_request(client, token, uid, domain, method, path, *, body=None, plat
             if len(raw) + len(chunk) > MAX_RESPONSE_BYTES:
                 raise Failure("protocol", response.status_code)
             raw.extend(chunk)
-        if response.status_code != 200:
-            raise Failure("http", response.status_code)
         try:
             payload = json.loads(raw)
         except (ValueError, RecursionError):
+            if response.status_code != 200:
+                raise Failure("http", response.status_code) from None
             raise Failure("protocol", response.status_code) from None
         code = payload.get("code") if isinstance(payload, dict) else None
+        message = str(payload.get("msg") or "")[:200] if isinstance(payload, dict) else ""
+        if response.status_code != 200:
+            raise Failure("http", response.status_code, code if type(code) is int else None, message)
         if code != 0:
             raise Failure("business", response.status_code,
-                          code if type(code) is int else None,
-                          str((payload or {}).get("msg") or "")[:200])
+                          code if type(code) is int else None, message)
         data = payload.get("data")
         return data if data is not None else {}
 
@@ -184,7 +186,10 @@ def sweep_account(token, uid="", domain=""):
                 claimed.append(code)
                 credit += got_credit
                 energy += got_energy
-        except Failure:
+        except Failure as error:
             errors += 1
+            if error.details.get("code") == 11140:
+                return {"ok": False, "error": error.details, "accepted": accepted, "claimed": claimed,
+                        "credit": credit, "energy": energy, "errors": errors}
     return {"ok": errors == 0, "accepted": accepted, "claimed": claimed, "credit": credit,
             "energy": energy, "errors": errors}
