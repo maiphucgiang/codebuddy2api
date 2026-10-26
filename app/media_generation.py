@@ -24,9 +24,9 @@ DEFAULT_IMAGE_MODEL = "hunyuan-image-v3.0"
 DEFAULT_IMAGE_EDIT_MODEL = "hunyuan-image-v2.0-general-edit"
 DEFAULT_VIDEO_MODEL = "minimax-video-h3"
 
-GEMINI_IMAGE_MODELS = frozenset(("gemini-3.0-pro-image", "gemini-3.1-flash-image", "gemini-2.5-flash-image"))
-
 MAX_IMAGE_ITEMS = 4          # Public n bound; the upstream contract allows 1..4.
+MAX_PROMPT_CHARS = 32000     # Shared by image and video prompts and image references.
+DEFAULT_IMAGE_SIZE = "1024x1024"
 VIDEO_RESOLUTIONS = ("768P", "2K")
 MAX_VIDEO_SECONDS = 60
 
@@ -34,9 +34,22 @@ MAX_VIDEO_SECONDS = 60
 VIDEO_STATUS_MAP = {"processing": "in_progress", "completed": "completed", "failed": "failed"}
 PUBLIC_VIDEO_STATUSES = ("queued", "in_progress", "completed", "failed")
 
+# Exact catalog tag → media kinds; tags never match by substring.
+CATALOG_TAG_KINDS = {"text-to-image": ("image",), "image-to-image": ("edit",),
+                     "text-to-video": ("video",), "image-to-video": ("video",)}
+
 _KIND_SOURCES = (
     ("image", IMAGE_TEXT_MODELS), ("edit", IMAGE_EDIT_MODELS), ("video", VIDEO_MODELS))
 _STATIC_MEDIA_MODELS = frozenset(model for _, models in _KIND_SOURCES for model in models)
+
+
+class MediaUpstreamError(Exception):
+    """An upstream reply envelope reported a non-zero business code."""
+
+    def __init__(self, code, message: str):
+        super().__init__(f"上游媒体接口返回错误 {code}: {message}")
+        self.upstream_code = code
+        self.message = message
 
 
 def model_kinds(model) -> tuple:
@@ -51,16 +64,15 @@ def model_kinds(model) -> tuple:
 
 
 def catalog_kinds(item) -> tuple:
-    """Classify an account-catalog model entry by its tags; only media tags count."""
+    """Classify an account-catalog model entry by its exact media tags."""
     tags = item.get("tags") if isinstance(item, dict) else None
     if not isinstance(tags, list):
         return ()
-    names = " ".join(str(tag).lower() for tag in tags if isinstance(tag, (str, int)))
     kinds = []
-    if "image" in names:
-        kinds.extend(("image", "edit"))
-    if "video" in names:
-        kinds.append("video")
+    for tag in tags:
+        for kind in CATALOG_TAG_KINDS.get(tag if isinstance(tag, str) else "", ()):
+            if kind not in kinds:
+                kinds.append(kind)
     return tuple(kinds)
 
 
@@ -89,33 +101,43 @@ def normalize_media_base_url(value):
     return value.rstrip("/")
 
 
-def _clean_text(value, field, limit=4096) -> str:
+def _clean_text(value, field, limit: int) -> str:
+    """Trim a short field, allowing whitespace controls and rejecting other C0 chars."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} 必须是非空字符串")
-    if len(value) > limit or any(ord(char) < 32 for char in value):
+    if len(value) > limit or any(ord(char) < 32 and char not in "\n\r\t" for char in value):
         raise ValueError(f"{field} 长度或字符无效")
     return value.strip()
 
 
+def _clean_prompt(value, field: str) -> str:
+    """Accept a prompt as-is: non-empty, within the shared bound, no odd control chars."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} 必须是非空字符串")
+    if len(value) > MAX_PROMPT_CHARS or any(ord(char) < 32 and char not in "\n\r\t" for char in value):
+        raise ValueError(f"{field} 长度或字符无效")
+    return value
+
+
 def image_request_body(model: str, prompt: str, *, size=None, n=1, quality=None,
                        images=None, input_fidelity=None) -> dict:
-    """Shape one /v2/images request mirroring the CLI ImageService payload."""
-    body = {"model": model, "prompt": _clean_text(prompt, "prompt")}
-    if size is not None:
-        body["size"] = _clean_text(size, "size", 64)
-    if model in GEMINI_IMAGE_MODELS:
-        # The gemini family returns base64 only when asked, like the CLI asks.
+    """Shape one /v2/images request mirroring the CLI ImageService buildBaseRequestBody."""
+    body = {"model": model, "prompt": _clean_prompt(prompt, "prompt"),
+            "size": _clean_text(size, "size", 64) if size is not None else DEFAULT_IMAGE_SIZE}
+    if model.startswith("hunyuan-"):
+        body["n"] = n if n else 1
+    elif model.startswith("gemini-"):
+        pass                     # The CLI sends no extra fields; n and quality are ignored.
+    else:
         body["response_format"] = "b64_json"
-        if n and n > 1:
+        if n and n > 1:            # The CLI omits n unless the client asked for more.
             body["n"] = n
         if quality is not None:
             body["quality"] = _clean_text(quality, "quality", 64)
-    elif n:
-        body["n"] = n
     if images is not None:
         if not isinstance(images, (list, tuple)) or not images:
             raise ValueError("images 必须是非空数组")
-        body["image"] = [_clean_text(item, "image_url", 262144) for item in images]
+        body["image"] = [_clean_text(item, "image_url", MAX_PROMPT_CHARS) for item in images]
         if input_fidelity is not None:
             body["input_fidelity"] = _clean_text(input_fidelity, "input_fidelity", 64)
     return body
@@ -126,7 +148,7 @@ def video_request_body(model: str, *, prompt=None, seconds=None, resolution=None
     """Shape one /v2/videos/generations request mirroring the CLI VideoService payload."""
     body = {"model": model, "watermark": True}
     if prompt is not None:
-        body["prompt"] = _clean_text(prompt, "prompt")
+        body["prompt"] = _clean_prompt(prompt, "prompt")
     if seconds is not None:
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or float(seconds).is_integer() is False:
             raise ValueError("seconds 必须是整数")
@@ -146,10 +168,19 @@ def video_request_body(model: str, *, prompt=None, seconds=None, resolution=None
     if extra:
         body["extra_parameters"] = extra
     if image_url is not None:
-        body["image_url"] = _clean_text(image_url, "image_url", 262144)
+        body["image_url"] = _clean_text(image_url, "image_url", MAX_PROMPT_CHARS)
     if "prompt" not in body and "image_url" not in body:
         raise ValueError("prompt 与 image_url 至少提供一个")
     return body
+
+
+def check_envelope(payload) -> None:
+    """Reject a business-error envelope: ``code`` present and non-zero fails the reply."""
+    if isinstance(payload, dict) and payload.get("code") not in (None, 0):
+        message = payload.get("msg") or payload.get("message") or ""
+        if not isinstance(message, str):
+            message = str(message)
+        raise MediaUpstreamError(payload.get("code"), message.strip()[:500] or "上游媒体接口错误")
 
 
 def _data_field(payload: dict):
@@ -165,6 +196,7 @@ def parse_image_reply(payload) -> tuple[list, float | None]:
     """
     if not isinstance(payload, dict):
         raise ValueError("图像响应必须是 JSON 对象")
+    check_envelope(payload)
     data = _data_field(payload)
     items = data.get("data") if isinstance(data.get("data"), list) else payload.get("data")
     if not isinstance(items, list) or not items:
@@ -190,6 +222,7 @@ def parse_video_submit(payload) -> str:
     """Return the upstream task id from a video generation reply."""
     if not isinstance(payload, dict):
         raise ValueError("视频响应必须是 JSON 对象")
+    check_envelope(payload)
     task_id = _data_field(payload).get("id") or payload.get("id")
     if not isinstance(task_id, str) or not task_id.strip():
         raise ValueError("视频响应缺少任务 ID")
@@ -204,22 +237,26 @@ def map_video_status(status) -> str:
 
 
 def parse_video_task(payload) -> tuple[str, list, float | None, str]:
-    """Return (public status, resource urls, credit, failure text) from a video task reply."""
+    """Return (public status, resource urls, credit, failure text) from a video task reply.
+
+    Failure text comes only from the task-level ``data`` object; the envelope ``msg``
+    on the outer level is a transport-level "ok" and never describes the task.
+    """
     if not isinstance(payload, dict):
         raise ValueError("视频任务响应必须是 JSON 对象")
+    check_envelope(payload)
     data = _data_field(payload)
     status = map_video_status(data.get("status") or payload.get("status"))
     rows = data.get("data") if isinstance(data.get("data"), list) else payload.get("data")
     urls = [item.get("url") for item in rows or []
             if isinstance(item, dict) and isinstance(item.get("url"), str) and item["url"]]
     message = ""
-    for source in (data, payload):
-        for key in ("error", "message", "msg", "fail_reason"):
-            value = source.get(key) if isinstance(source, dict) else None
-            if isinstance(value, str) and value.strip():
-                message = value.strip()[:500]
-                break
-        if message:
+    for key in ("error", "message", "fail_reason"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            value = value.get("message")
+        if isinstance(value, str) and value.strip():
+            message = value.strip()[:500]
             break
     for source in (data.get("usage"), payload.get("usage")):
         if isinstance(source, dict) and isinstance(source.get("credit"), (int, float)):

@@ -1,8 +1,10 @@
 """Local media assets and video task metadata in one sqlite-backed store.
 
 Files live under ``media/images|videos/<shard>/<id>.<ext>`` and are committed
-atomically; metadata stays out of ControlStore snapshots and backups. Writing
-first prunes expired objects and then evicts the oldest until the total fits.
+atomically from ``media/.incoming``; heavy work (sniffing, hashing, writing the
+pending file) stays outside the store lock. Metadata stays out of ControlStore
+snapshots and backups. Retention is always derived from the current TTL setting,
+so shrinking it applies to existing assets immediately.
 """
 from __future__ import annotations
 
@@ -16,8 +18,10 @@ import time
 from pathlib import Path
 
 DB_NAME = "media.sqlite3"
+SCHEMA_VERSION = 1              # v1 dropped assets.expires; retention is derived.
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
+INCOMING_DIR = ".incoming"
 
 # Fixed magic numbers, sniffed before anything is committed to disk.
 _MAGIC = (
@@ -32,6 +36,9 @@ _FTYP = (b"ftyp", 4)
 KIND_MIMES = {"image": ("image/png", "image/jpeg", "image/webp", "image/gif"),
               "video": ("video/mp4", "video/webm")}
 KIND_PREFIX = {"image": "img_", "video": "vid_"}
+
+# Distinguishes "leave error unchanged" from an explicit error=None to clear it.
+UNSET = object()
 
 
 def sniff(data: bytes):
@@ -48,6 +55,14 @@ def sniff(data: bytes):
     return None
 
 
+def is_expired(meta: dict, ttl_hours: float) -> bool:
+    """Retention is derived from the current TTL, never stored per asset."""
+    try:
+        return float(meta.get("created") or 0) + float(ttl_hours) * 3600 <= time.time()
+    except (TypeError, ValueError):
+        return True
+
+
 def security_headers(meta: dict) -> dict:
     """Serving headers shared by the public and admin read routes."""
     return {"ETag": f'"{meta["sha256"]}"', "Cache-Control": "public, max-age=31536000, immutable",
@@ -56,7 +71,7 @@ def security_headers(meta: dict) -> dict:
 
 
 def _row_to_asset(row) -> dict:
-    keys = ("id", "kind", "mime", "size", "sha256", "model", "created", "expires")
+    keys = ("id", "kind", "mime", "size", "sha256", "model", "created")
     return dict(zip(keys, row))
 
 
@@ -74,14 +89,20 @@ class MediaStore:
         self.directory = self.root / "media"
         self.path = self.root / DB_NAME
         self.directory.mkdir(parents=True, exist_ok=True)
+        (self.directory / INCOMING_DIR).mkdir(exist_ok=True)
         self._lock = threading.RLock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
+        self._create_schema()
+        self._migrate_schema()
+        self._db.commit()
+
+    def _create_schema(self):
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS assets(
                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL,
-                sha256 TEXT NOT NULL, model TEXT, created REAL NOT NULL, expires REAL NOT NULL);
+                sha256 TEXT NOT NULL, model TEXT, created REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS assets_created ON assets(created);
             CREATE TABLE IF NOT EXISTS tasks(
                 task_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, profile TEXT NOT NULL,
@@ -89,6 +110,16 @@ class MediaStore:
                 media_id TEXT, error TEXT, credit REAL);
             CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created);
         """)
+
+    def _migrate_schema(self):
+        """v0 databases stored a per-row expires column; retention is derived now."""
+        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+        if version >= SCHEMA_VERSION:
+            return
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(assets)").fetchall()}
+        if "expires" in columns:
+            self._db.execute("ALTER TABLE assets DROP COLUMN expires")
+        self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._db.commit()
 
     def close(self):
@@ -110,44 +141,50 @@ class MediaStore:
     def _total_bytes(self) -> int:
         return self._db.execute("SELECT COALESCE(SUM(size),0) FROM assets").fetchone()[0]
 
+    def _write_pending(self, ext: str, data: bytes, digest: str) -> Path:
+        """Write the payload to .incoming outside the store lock (heavy work)."""
+        pending = self.directory / INCOMING_DIR / f"{digest[:16]}-{secrets.token_hex(8)}.{ext}"
+        pending.write_bytes(data)
+        return pending
+
     def save_asset(self, kind: str, data: bytes, *, model=None, ttl_hours: float,
                    max_total_bytes: int) -> dict:
-        """Sniff, prune and evict, then commit one asset atomically."""
+        """Sniff, hash and stage outside the lock, then commit atomically inside it."""
         if kind not in KIND_MIMES or not isinstance(data, bytes) or not data:
             raise ValueError("媒体类型或内容无效")
         identified = sniff(data)
         if identified is None or identified[1] not in KIND_MIMES[kind]:
             raise ValueError("文件头不在允许的媒体类型白名单内")
         ext, mime = identified
-        with self._lock:
-            now = time.time()
-            self.cleanup(ttl_hours=ttl_hours, max_total_bytes=max(0, max_total_bytes - len(data)))
-            for _ in range(4):  # A collision keeps the existing object untouched.
-                asset_id = self._new_id(kind)
-                target = self._asset_path(asset_id, ext)
-                if not target.exists():
-                    break
-            else:
-                raise RuntimeError("无法分配新的媒体 ID")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            pending = target.with_name(".incoming-" + target.name)
-            pending.write_bytes(data)
-            try:
+        digest = hashlib.sha256(data).hexdigest()
+        pending = self._write_pending(ext, data, digest)
+        try:
+            with self._lock:
+                stale = self._cleanup_locked(ttl_hours=ttl_hours,
+                                             max_total_bytes=max(0, max_total_bytes - len(data)))
+                for _ in range(4):  # A collision keeps the existing object untouched.
+                    asset_id = self._new_id(kind)
+                    target = self._asset_path(asset_id, ext)
+                    if not target.exists():
+                        break
+                else:
+                    raise RuntimeError("无法分配新的媒体 ID")
+                target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(pending, target)
-            except OSError:
-                pending.unlink(missing_ok=True)
-                raise
-            try:
-                self._db.execute(
-                    "INSERT INTO assets VALUES(?,?,?,?,?,?,?,?)",
-                    (asset_id, kind, mime, len(data), hashlib.sha256(data).hexdigest(),
-                     model, now, now + ttl_hours * 3600))
-                self._db.commit()
-            except sqlite3.Error:
-                target.unlink(missing_ok=True)
-                raise
-            row = self._db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
-            return _row_to_asset(row)
+                try:
+                    self._db.execute(
+                        "INSERT INTO assets VALUES(?,?,?,?,?,?,?)",
+                        (asset_id, kind, mime, len(data), digest, model, time.time()))
+                    self._db.commit()
+                except sqlite3.Error:
+                    target.unlink(missing_ok=True)
+                    raise
+                row = self._db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+                meta = _row_to_asset(row)
+            self._unlink(stale)
+            return meta
+        finally:
+            pending.unlink(missing_ok=True)
 
     def get_asset(self, asset_id: str):
         with self._lock:
@@ -161,20 +198,39 @@ class MediaStore:
         path = self._asset_path(meta["id"], ext)
         return path if path.is_file() else None
 
-    def delete_asset(self, asset_id: str) -> bool:
-        """Remove one file and row; bound tasks keep their status with media_id cleared."""
-        with self._lock:
+    def _delete_rows(self, asset_ids) -> list:
+        """Delete metadata inside the lock and return the files to unlink outside."""
+        paths = []
+        for asset_id in asset_ids:
             row = self._db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
             if row is None:
-                return False
+                continue
             meta = _row_to_asset(row)
             self._db.execute("UPDATE tasks SET media_id=NULL WHERE media_id=?", (asset_id,))
             self._db.execute("DELETE FROM assets WHERE id=?", (asset_id,))
-            self._db.commit()
             file = self.asset_file(meta)
             if file is not None:
-                file.unlink(missing_ok=True)
-            return True
+                paths.append(file)
+        self._db.commit()
+        return paths
+
+    def delete_asset(self, asset_id: str) -> bool:
+        """Remove one file and row; bound tasks keep their status with media_id cleared."""
+        with self._lock:
+            exists = self._db.execute(
+                "SELECT 1 FROM assets WHERE id=?", (asset_id,)).fetchone() is not None
+            paths = self._delete_rows([asset_id]) if exists else []
+        self._unlink(paths)
+        return exists
+
+    @staticmethod
+    def _unlink(paths) -> None:
+        for file in paths:
+            file.unlink(missing_ok=True)
+            try:
+                file.parent.rmdir()
+            except OSError:
+                pass
 
     def list_assets(self, kind=None, cursor=None, limit=DEFAULT_PAGE_SIZE) -> dict:
         limit = max(1, min(int(limit), MAX_PAGE_SIZE))
@@ -212,43 +268,49 @@ class MediaStore:
             total += size
         return {"total_bytes": total, "images": by_kind["image"], "videos": by_kind["video"]}
 
+    def _cleanup_locked(self, *, ttl_hours: float, max_total_bytes: int) -> list:
+        """Drop expired and evicted rows under the lock; files are unlinked by the caller."""
+        now = time.time()
+        expired = [row[0] for row in self._db.execute(
+            "SELECT id FROM assets WHERE created<=?", (now - float(ttl_hours) * 3600,)).fetchall()]
+        paths = self._delete_rows(expired)
+        self._db.execute("DELETE FROM tasks WHERE created<=?", (now - float(ttl_hours) * 3600,))
+        while self._total_bytes() > max_total_bytes:
+            row = self._db.execute(
+                "SELECT id FROM assets ORDER BY created ASC, id ASC LIMIT 1").fetchone()
+            if row is None:
+                break
+            paths.extend(self._delete_rows([row[0]]))
+        self._db.commit()
+        return paths
+
     def cleanup(self, *, ttl_hours: float, max_total_bytes: int) -> dict:
         """Drop expired assets and task rows, then evict the oldest to fit the quota."""
-        removed = {"expired": 0, "evicted": 0}
-        now = time.time()
         with self._lock:
-            expired = self._db.execute(
-                "SELECT * FROM assets WHERE expires<=?", (now,)).fetchall()
-            for row in expired:
-                self.delete_asset(_row_to_asset(row)["id"])
-            removed["expired"] = len(expired)
-            self._db.execute("DELETE FROM tasks WHERE created<=?", (now - ttl_hours * 3600,))
-            self._db.commit()
-            while self._total_bytes() > max_total_bytes:
-                row = self._db.execute(
-                    "SELECT * FROM assets ORDER BY created ASC, id ASC LIMIT 1").fetchone()
-                if row is None:
-                    break
-                self.delete_asset(_row_to_asset(row)["id"])
-                removed["evicted"] += 1
-            self._db.commit()
-        return removed
+            before = self._db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+            paths = self._cleanup_locked(ttl_hours=ttl_hours, max_total_bytes=max_total_bytes)
+            after = self._db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+        self._unlink(paths)
+        return {"expired_or_evicted": before - after, "removed_files": len(paths)}
 
     # -- video tasks --------------------------------------------------------------------
 
-    def create_task(self, task_id: str, account_key: str, profile: str, model) -> None:
+    def create_task(self, task_id: str, account_key: str, profile: str, model) -> dict | None:
         with self._lock:
             now = time.time()
             self._db.execute("INSERT OR IGNORE INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?)",
                              (task_id, account_key, profile, model, now, now, "queued", None, None, None))
             self._db.commit()
+            return self.get_task(task_id)
 
     def get_task(self, task_id: str):
         with self._lock:
             row = self._db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             return _row_to_task(row) if row else None
 
-    def update_task(self, task_id: str, *, status=None, media_id=None, error=None, credit=None) -> None:
+    def update_task(self, task_id: str, *, status=None, media_id=None, error=UNSET,
+                    credit=None) -> None:
+        """Update selected fields; pass error=None explicitly to clear a stored failure."""
         with self._lock:
             current = self.get_task(task_id)
             if current is None:
@@ -258,7 +320,7 @@ class MediaStore:
                 (time.time(),
                  status if status is not None else current["status"],
                  media_id if media_id is not None else current["media_id"],
-                 error if error is not None else current["error"],
+                 current["error"] if error is UNSET else error,
                  credit if credit is not None else current["credit"],
                  task_id))
             self._db.commit()

@@ -178,8 +178,8 @@ function AssetPreview({
           size: bytes(number(item.size) ?? 0),
           sha256: typeof item.sha256 === "string" ? item.sha256.slice(0, 12) : item.sha256,
           model: item.model,
-          created: number(item.created),
-          expires: number(item.expires),
+          created_at: number(item.created_at),
+          expires_at: number(item.expires_at),
         }}
       />
       <div className={s.actions}>
@@ -192,7 +192,7 @@ function AssetPreview({
                 .then(() =>
                   notify({ key: `media-copy-${assetId}`, tone: "good", title: t("media.copied") }),
                 )
-                .catch(() => setError(errorMessage(new Error("clipboard unavailable"))));
+                .catch(() => setError(t("media.copyFailed")));
             }}
           >
             {t("media.copyLink")}
@@ -519,7 +519,7 @@ export function Media() {
             (assets.data.items.length ? (
               <div className={s.mediaGrid}>
                 {assets.data.items.map((item) => {
-                  const remaining = remainingLabel(item.expires);
+                  const remaining = remainingLabel(item.expires_at);
                   const isVideo = item.kind === "video";
                   return (
                     <button

@@ -44,8 +44,8 @@ function asset(id: string, kind: "image" | "video", model: string, configured: b
     size: 4096,
     sha256: "0".repeat(64),
     model,
-    created: now - 3600,
-    expires: now + 71 * 3600,
+    created_at: now - 3600,
+    expires_at: now + 71 * 3600,
     ...(configured ? { public_url: `https://media.example.com/v1/media/${kind}s/${id}` } : {}),
   };
 }

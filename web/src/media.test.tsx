@@ -54,8 +54,8 @@ const assets = {
       size: 4096,
       sha256: "0".repeat(64),
       model: "hunyuan-image-v3.0",
-      created: 1789000000,
-      expires: 1789000000 + 71 * 3600,
+      created_at: 1789000000,
+      expires_at: 1789000000 + 71 * 3600,
       public_url: "https://media.example.com/v1/media/images/img_" + "a".repeat(32),
     },
     {
@@ -65,8 +65,8 @@ const assets = {
       size: 8192,
       sha256: "1".repeat(64),
       model: "minimax-video-h3",
-      created: 1789000000,
-      expires: 1789000000 + 180 * 60,
+      created_at: 1789000000,
+      expires_at: 1789000000 + 180 * 60,
     },
   ],
   has_more: false,
@@ -167,7 +167,10 @@ describe("media page", () => {
   it("renders asset cards and hides copy-link until a base URL exists", () => {
     render(<Media />);
     fireEvent.click(screen.getAllByRole("button", { name: /hunyuan-image-v3\.0/ })[0]!);
-    expect(screen.getByRole("dialog")).toBeTruthy();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toBeTruthy();
+    expect(dialog.textContent).toContain("创建时间");
+    expect(dialog.textContent).toContain("到期时间"); // Derived from the current TTL setting.
     expect(screen.queryByRole("button", { name: "复制链接" })).toBeNull();
     expect(screen.getByRole("link", { name: "下载" })).toHaveProperty(
       "href",
@@ -181,6 +184,42 @@ describe("media page", () => {
     expect(screen.queryByRole("alert")).toBeNull();
     fireEvent.click(screen.getAllByRole("button", { name: /hunyuan-image-v3\.0/ })[0]!);
     expect(screen.getByRole("button", { name: "复制链接" })).toBeTruthy();
+  });
+
+  it("reports a copy failure through i18n", async () => {
+    mockResources({ summary: { configured: true, base_url: "https://media.example.com" } });
+    const writeText = vi.fn().mockRejectedValue(new Error("denied"));
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<Media />);
+    fireEvent.click(screen.getAllByRole("button", { name: /hunyuan-image-v3\.0/ })[0]!);
+    fireEvent.click(screen.getByRole("button", { name: "复制链接" }));
+    expect(writeText).toHaveBeenCalledWith(
+      "https://media.example.com/v1/media/images/img_" + "a".repeat(32),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("dialog").textContent).toContain("复制失败，请手动复制链接"),
+    );
+  });
+
+  it("labels catalog-only model sources", () => {
+    mockResources({
+      summary: {
+        models: [
+          ...summary.models,
+          {
+            id: "custom-video-model",
+            kinds: ["video"],
+            sources: ["catalog"],
+            defaults: [],
+            accounts: 1,
+          },
+        ],
+      },
+    });
+    render(<Media />);
+    fireEvent.click(screen.getByRole("tab", { name: "模型" }));
+    expect(screen.getByText("账号目录", { exact: true })).toBeTruthy();
+    expect(screen.getAllByText("静态清单").length).toBeGreaterThan(0);
   });
 
   it("requires a second click before deleting an asset", async () => {

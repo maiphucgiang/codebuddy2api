@@ -6,6 +6,7 @@ import base64
 
 import argparse
 import asyncio
+import weakref
 import hashlib
 import itertools
 import json
@@ -2604,8 +2605,9 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
             try:
                 removed = media.cleanup(ttl_hours=CONFIG.get("media_ttl_hours", 72),
                                         max_total_bytes=int(CONFIG.get("media_max_total_mb") or 1024) << 20)
-                if removed.get("expired") or removed.get("evicted"):
-                    _log(f"[housekeeper] 媒体清理：过期 {removed['expired']} 项，淘汰 {removed['evicted']} 项")
+                if removed.get("expired_or_evicted"):
+                    _log(f"[housekeeper] 媒体清理：移除 {removed['expired_or_evicted']} 项资产、"
+                         f"{removed.get('removed_files', 0)} 个文件")
             except Exception as error:
                 _log(f"[housekeeper] 媒体清理失败: {_network_error_text(error)}")
         ids = pool.begin_sync(all_entries=not pending_only)
@@ -4955,8 +4957,23 @@ _MEDIA_PUBLIC_KINDS = {"image": "images", "video": "videos"}
 
 
 class MediaDownloadError(RuntimeError):
-    """An upstream resource download failed or exceeded the local media quota."""
+    """A deterministic download failure: bad signature, refused type or over quota."""
 
+
+class MediaDownloadRetryable(RuntimeError):
+    """A transient download failure; the next query may retry the same resource."""
+
+
+# Per-task refresh locks: one concurrent upstream query and download per task id.
+_MEDIA_TASK_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
+
+
+def _media_task_lock(task_id: str) -> asyncio.Lock:
+    lock = _MEDIA_TASK_LOCKS.get(task_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _MEDIA_TASK_LOCKS[task_id] = lock
+    return lock
 
 @dataclass(frozen=True)
 class _MediaAction:
@@ -5004,12 +5021,13 @@ def _media_public_url(meta: dict) -> str:
 
 
 def _media_dynamic_kinds(model) -> list:
-    """Collect media kinds declared for this model across published account catalogs."""
-    kinds: list = []
+    """Media kinds declared for this model in account root tables (serves scope)."""
+    index = _catalog_index()
+    if index is not None:
+        return list(index.media_kinds.get(model, ()))
+    kinds: list = []  # No index yet: scan the published catalogs once.
     for account in (CONFIG.get("account_catalogs") or {}).values():
-        if not isinstance(account, dict):
-            continue
-        for item in account.get("models") or []:
+        for item in ((account or {}).get("serves") or []) if isinstance(account, dict) else []:
             if isinstance(item, dict) and item.get("id") == model:
                 kinds.extend(kind for kind in media_generation.catalog_kinds(item) if kind not in kinds)
     return kinds
@@ -5026,7 +5044,7 @@ _MEDIA_ENDPOINT_HINT = "媒体生成请使用 /v1/images/generations、/v1/image
 
 def _media_chat_guard(model) -> None:
     """Keep media models out of chat routing with one shared check."""
-    if model and _media_all_kinds(model):
+    if model and (media_generation.model_kinds(model) or _media_dynamic_kinds(model)):
         raise HTTPException(status_code=400, detail={"error": {
             "message": f"模型 {model} 是媒体生成模型，不走聊天接口；{_MEDIA_ENDPOINT_HINT}",
             "type": "invalid_request_error", "code": "media_model_not_chat"}})
@@ -5042,7 +5060,7 @@ def _media_check_model(model, kind: str) -> None:
 
 def _media_account_serves(account, model) -> bool:
     """Account catalog membership with a static-list fallback for unsynced accounts."""
-    items = _account_scope(account, "models") if isinstance(account, dict) else None
+    items = account.get("serves") if isinstance(account, dict) else None
     if items is None:
         return bool(media_generation.model_kinds(model))
     return any(isinstance(item, dict) and item.get("id") == model for item in items)
@@ -5170,6 +5188,12 @@ async def _media_call(action: _MediaAction, body: dict, rid: str, *, model, pars
                 raw = await response.aread()
             try:
                 result = parse(json.loads(raw.decode("utf-8", "replace")))
+            except media_generation.MediaUpstreamError as error:
+                # A business refusal may already be billed; never replay it on another account.
+                observe_failure("media_upstream_refused")
+                raise HTTPException(status_code=502, detail={"error": {
+                    "message": f"上游媒体接口返回错误 {error.upstream_code}：{error.message}",
+                    "type": "upstream_error", "upstream_code": error.upstream_code}}) from None
             except ValueError as error:
                 observe_failure("bad_media_response")
                 raise HTTPException(status_code=502, detail={"error": {
@@ -5213,13 +5237,17 @@ async def _media_download_bytes(url: str, rid: str) -> bytes:
         try:
             async with client.stream("GET", url) as response:
                 if response.status_code != 200:
-                    raise MediaDownloadError(f"资源下载失败（HTTP {response.status_code}）")
+                    if response.status_code >= 500:
+                        raise MediaDownloadRetryable(f"资源下载失败（HTTP {response.status_code}）")
+                    detail = "，签名可能已过期" if response.status_code in (403, 404) else ""
+                    raise MediaDownloadError(
+                        f"资源下载失败（HTTP {response.status_code}{detail}）")
                 async for chunk in response.aiter_bytes(64 * 1024):
                     data.extend(chunk)
                     if len(data) > limit:
                         raise MediaDownloadError("单个资源超过媒体容量上限")
         except httpx.HTTPError as error:
-            raise MediaDownloadError(f"资源下载失败：{type(error).__name__}") from None
+            raise MediaDownloadRetryable(f"资源下载失败：{type(error).__name__}") from None
     return bytes(data)
 
 
@@ -5238,48 +5266,77 @@ async def _media_save(kind: str, data: bytes, *, model, rid: str) -> dict:
 
 
 async def _media_video_refresh(task_id: str, rid: str) -> dict:
-    """Query one upstream video task on its bound account and persist the result."""
+    """Query one upstream video task on its bound account and persist the result.
+
+    One refresh lock per task keeps concurrent queries from downloading twice; the
+    task row is re-read under the lock so only the winner talks to the upstream.
+    """
     store = _media_store()
-    task = store.get_task(task_id)
+
+    async def load():
+        return await run_in_threadpool(store.get_task, task_id)
+
+    task = await load()
     if task is None:
         raise HTTPException(status_code=404, detail={"error": {
             "message": "视频任务不存在或已过期", "type": "not_found_error", "code": "task_not_found"}})
     if task["status"] in ("completed", "failed"):
         return task  # Repeated queries keep returning the same resource or error.
-    cred, headers = await run_in_threadpool(_media_bound_cred, task["account_key"])
-    status, urls, credit, message = await _media_call(
-        MEDIA_VIDEO_QUERY, {"task_id": task_id}, rid, model=task["model"],
-        parse=media_generation.parse_video_task, cred=cred, headers=headers, allow_failover=False)
-    if status == "failed":
-        store.update_task(task_id, status="failed",
-                          error=message or "视频生成失败", credit=credit)
-    elif status == "completed":
-        media_id = task["media_id"]
-        if media_id is None and urls:
-            try:
-                meta = await _media_save("video", await _media_download_bytes(urls[0], rid),
-                                         model=task["model"], rid=rid)
-                media_id = meta["id"]
-            except MediaDownloadError as error:
-                _log(f"[{rid}] ✗ 视频资源下载失败 | {task_id} | {error}")
-                store.update_task(task_id, status="completed",
-                                  error=f"资源下载失败：{error}", credit=credit)
-                return store.get_task(task_id)
-        store.update_task(task_id, status="completed", media_id=media_id, credit=credit)
-    else:
-        store.update_task(task_id, status=status, credit=credit)
-    return store.get_task(task_id)
+    async with _media_task_lock(task_id):
+        task = await load()
+        if task is None:
+            raise HTTPException(status_code=404, detail={"error": {
+                "message": "视频任务不存在或已过期", "type": "not_found_error", "code": "task_not_found"}})
+        if task["status"] in ("completed", "failed"):
+            return task
+        cred, headers = await run_in_threadpool(_media_bound_cred, task["account_key"])
+        status, urls, credit, message = await _media_call(
+            MEDIA_VIDEO_QUERY, {"task_id": task_id}, rid, model=task["model"],
+            parse=media_generation.parse_video_task, cred=cred, headers=headers, allow_failover=False)
+        media_id = None
+        if status == "failed":
+            await run_in_threadpool(store.update_task, task_id, status="failed",
+                                    error=message or "视频生成失败", credit=credit)
+        elif status == "completed":
+            media_id = task["media_id"]
+            if media_id is None and not urls:
+                # The upstream finished without a resource: nothing to retry.
+                await run_in_threadpool(store.update_task, task_id, status="failed",
+                                        error="上游未返回视频地址", credit=credit)
+            elif media_id is None:
+                try:
+                    meta = await _media_save("video", await _media_download_bytes(urls[0], rid),
+                                             model=task["model"], rid=rid)
+                    media_id = meta["id"]
+                except MediaDownloadError as error:   # Deterministic: signature gone or quota.
+                    _log(f"[{rid}] ✗ 视频资源下载失败 | {task_id} | {error}")
+                    await run_in_threadpool(store.update_task, task_id, status="failed",
+                                            error=f"视频资源下载失败：{error}", credit=credit)
+                except ValueError:                    # Sniffer rejected the payload (#8): terminal.
+                    await run_in_threadpool(store.update_task, task_id, status="failed",
+                                            error="资源类型不在允许的白名单内", credit=credit)
+                except MediaDownloadRetryable as error:
+                    # Transient network trouble: stay in progress and retry on the next query.
+                    _log(f"[{rid}] ↻ 视频资源下载暂缓 | {task_id} | {error}")
+                    await run_in_threadpool(store.update_task, task_id,
+                                            error=f"资源下载暂缓，下次查询重试：{error}", credit=credit)
+        if status == "completed" and media_id is not None:
+            await run_in_threadpool(store.update_task, task_id, status="completed",
+                                    media_id=media_id, error=None, credit=credit)
+        elif status not in ("completed", "failed"):
+            await run_in_threadpool(store.update_task, task_id, status=status, credit=credit)
+    return await load()
 
 
-def _media_video_response(task: dict) -> dict:
-    """Render one task row in the public video shape."""
+def _media_video_response(task: dict, meta) -> dict:
+    """Render one task row in the public video shape; meta is the pre-fetched asset."""
     body = {"id": task["task_id"], "object": "video", "status": task["status"],
             "model": task["model"], "created_at": int(task["created"])}
     if task["status"] == "completed":
-        meta = _media_store().get_asset(task["media_id"]) if task["media_id"] else None
-        if meta is not None and _media_base_url():
+        expired = meta is not None and media_store.is_expired(meta, _media_ttl_hours())
+        if meta is not None and not expired and _media_base_url():
             body["video"] = {"url": _media_public_url(meta)}
-        elif meta is not None:
+        elif meta is not None and not expired:
             body["message"] = "视频已保存到网关本地；设置资源访问地址（media_public_base_url）后可获取链接"
         elif task["error"]:
             body["message"] = task["error"]
@@ -5287,6 +5344,8 @@ def _media_video_response(task: dict) -> dict:
             body["message"] = "视频资源已删除或过期，不再重新下载"
     elif task["status"] == "failed":
         body["error"] = {"message": task["error"] or "视频生成失败"}
+    else:
+        body["message"] = task["error"]  # A retryable download hint, if any.
     if task["credit"] is not None:
         body["usage"] = {"credit": task["credit"]}
     return body
@@ -5307,41 +5366,59 @@ async def _media_json(request: Request) -> dict:
     return payload
 
 
-def _media_optional_text(value, field: str, limit: int = 262144):
+def _media_optional_text(value, field: str, limit: int = media_generation.MAX_PROMPT_CHARS):
     """Accept an optional public string field; None passes through untouched."""
     if value is None:
         return None
-    if not isinstance(value, str) or len(value) > limit or any(ord(c) < 32 for c in value):
+    if (not isinstance(value, str) or len(value) > limit
+            or any(ord(c) < 32 and c not in "\n\r\t" for c in value)):
         raise _media_bad_request(f"{field} 必须是不超过 {limit} 字符的字符串")
     return value
 
 
+async def _media_image_item(item: dict, model, rid: str, *, persist: bool):
+    """Convert one upstream item; returns (payload, persisted_id, error)."""
+    revised = {"revised_prompt": item["revised_prompt"]} if item.get("revised_prompt") else {}
+    try:
+        if item.get("b64_json"):
+            if persist:
+                meta = await _media_save("image", base64.b64decode(item["b64_json"]),
+                                         model=model, rid=rid)
+                return {"url": _media_public_url(meta), **revised}, meta["id"], None
+            return {"b64_json": item["b64_json"], **revised}, None, None
+        data = await _media_download_bytes(item["url"], rid)
+        if persist:
+            meta = await _media_save("image", data, model=model, rid=rid)
+            return {"url": _media_public_url(meta), **revised}, meta["id"], None
+        return {"b64_json": base64.b64encode(data).decode("ascii"), **revised}, None, None
+    except (MediaDownloadError, MediaDownloadRetryable, ValueError) as error:
+        return None, None, str(error)
+
+
 async def _media_image_reply(items: list, model, rid: str, *, persist: bool) -> list:
-    """Convert upstream image items to the public shape, persisting only when serving URLs."""
-    out = []
-    for item in items:
-        revised = {"revised_prompt": item["revised_prompt"]} if item.get("revised_prompt") else {}
-        try:
-            if item.get("b64_json"):
-                if persist:
-                    meta = await _media_save("image", base64.b64decode(item["b64_json"]),
-                                             model=model, rid=rid)
-                    out.append({"url": _media_public_url(meta), **revised})
-                else:
-                    out.append({"b64_json": item["b64_json"], **revised})
-            else:
-                data = await _media_download_bytes(item["url"], rid)
-                if persist:
-                    meta = await _media_save("image", data, model=model, rid=rid)
-                    out.append({"url": _media_public_url(meta), **revised})
-                else:
-                    out.append({"b64_json": base64.b64encode(data).decode("ascii"), **revised})
-        except MediaDownloadError as error:
-            raise HTTPException(status_code=502, detail={"error": {
-                "message": str(error), "type": "upstream_error"}}) from None
-        except ValueError as error:
-            raise HTTPException(status_code=502, detail={"error": {
-                "message": f"图像内容无效，无法保存或编码：{error}", "type": "upstream_error"}}) from None
+    """Download all image items concurrently; keep successes and never orphan files."""
+    results = await asyncio.gather(*(_media_image_item(item, model, rid, persist=persist)
+                                     for item in items[:media_generation.MAX_IMAGE_ITEMS]))
+    out, persisted, failures, first_error = [], [], 0, ""
+    for payload, asset_id, error in results:
+        if error is None:
+            out.append(payload)
+            if asset_id:
+                persisted.append(asset_id)
+        else:
+            failures += 1
+            first_error = first_error or error
+    if failures == len(items):
+        store = CONFIG.get("media_store")
+        if store is not None and persisted:
+            await run_in_threadpool(
+                lambda: [store.delete_asset(asset_id) for asset_id in persisted])
+        raise HTTPException(status_code=502, detail={"error": {
+            "message": f"全部 {len(items)} 张图片下载或保存失败：{first_error}",
+            "type": "upstream_error"}})
+    if failures:
+        _log(f"[{rid}] ✗ 图片部分失败 {failures}/{len(items)} | {first_error}")
+        observe_failure("image_item_failed")
     return out
 
 
@@ -5365,23 +5442,37 @@ def _media_model_accounts(model) -> int:
 
 
 def admin_media_models() -> list:
-    """Model table for the media page: static families plus tagged catalog entries."""
+    """Model table for the media page: static families plus catalog-tagged entries."""
     defaults = {"image": media_generation.DEFAULT_IMAGE_MODEL,
                 "edit": media_generation.DEFAULT_IMAGE_EDIT_MODEL,
                 "video": media_generation.DEFAULT_VIDEO_MODEL}
-    table: dict = {}
+    static_kinds: dict = {}
     for kind, models in (("image", media_generation.IMAGE_TEXT_MODELS),
                          ("edit", media_generation.IMAGE_EDIT_MODELS),
                          ("video", media_generation.VIDEO_MODELS)):
         for model in models:
-            table.setdefault(model, {"kinds": [], "catalog": False})["kinds"].append(kind)
-    for account in (CONFIG.get("account_catalogs") or {}).values():
-        for item in ((account or {}).get("models") or []):
-            if isinstance(item, dict) and media_generation.catalog_kinds(item) \
-                    and isinstance(item.get("id"), str):
-                table.setdefault(item["id"], {"kinds": [], "catalog": False})["catalog"] = True
-    return [{"id": model, "kinds": entry["kinds"],
-             "sources": ["static"] + (["catalog"] if entry["catalog"] else []),
+            static_kinds.setdefault(model, []).append(kind)
+    catalog_kinds_map = _catalog_index().media_kinds if _catalog_index() is not None else None
+    if catalog_kinds_map is None:
+        catalog_kinds_map = {}  # No index yet: derive kinds from the published serves scan.
+        for account in (CONFIG.get("account_catalogs") or {}).values():
+            for item in ((account or {}).get("serves") or []) if isinstance(account, dict) else []:
+                if (isinstance(item, dict) and isinstance(item.get("id"), str)
+                    and media_generation.catalog_kinds(item)):
+                    known = catalog_kinds_map.setdefault(item["id"], ())
+                    catalog_kinds_map[item["id"]] = tuple(
+                        dict.fromkeys(known + media_generation.catalog_kinds(item)))
+    table = {model: {"kinds": tuple(kinds), "catalog": False}
+             for model, kinds in static_kinds.items()}
+    for model, kinds in catalog_kinds_map.items():
+        if not kinds:
+            continue  # Only tagged media entries join the table.
+        entry = table.setdefault(model, {"kinds": (), "catalog": False})
+        entry["catalog"] = True
+        entry["kinds"] = tuple(dict.fromkeys(entry["kinds"] + kinds))
+    return [{"id": model, "kinds": list(entry["kinds"]),
+             "sources": (["static"] if model in static_kinds else [])
+                        + (["catalog"] if entry["catalog"] else []),
              "default": [kind for kind, name in defaults.items() if name == model],
              "accounts": _media_model_accounts(model)}
             for model, entry in sorted(table.items())]
@@ -5825,7 +5916,7 @@ async def images_generations(request: Request,
     payload = await _media_json(request)
     model = payload.get("model") or media_generation.DEFAULT_IMAGE_MODEL
     _media_check_model(model, "image")
-    if not isinstance(payload.get("prompt"), str) or not payload["prompt"].strip():
+    if not isinstance(payload.get("prompt"), str) or not payload["prompt"]:
         raise _media_bad_request("prompt 必须是非空字符串")
     n, problem = _validated_count(payload.get("n"), 1, 1, media_generation.MAX_IMAGE_ITEMS, "n")
     if problem:
@@ -5834,8 +5925,13 @@ async def images_generations(request: Request,
         raise _media_bad_request("response_format 必须是 url 或 b64_json")
     size = _media_optional_text(payload.get("size"), "size", 64)
     quality = _media_optional_text(payload.get("quality"), "quality", 64)
-    body = media_generation.image_request_body(model, payload["prompt"], size=size, n=n, quality=quality)
+    try:
+        body = media_generation.image_request_body(model, payload["prompt"], size=size, n=n, quality=quality)
+    except ValueError as error:
+        raise _media_bad_request(str(error)) from None
     rid = _request_id()
+    if bool(_media_base_url()) and payload.get("response_format") != "b64_json":
+        _media_store()  # Refuse before the billed upstream round when persistence is impossible.
     _log(f"[{rid}] ▶ IMAGE | {model} | n={n} | chars={len(payload['prompt'])}")
     items, credit = await _media_call(MEDIA_IMAGE_GENERATE, body, rid, model=model,
                                       parse=media_generation.parse_image_reply)
@@ -5856,7 +5952,7 @@ async def images_edits(request: Request,
     payload = await _media_json(request)
     model = payload.get("model") or media_generation.DEFAULT_IMAGE_EDIT_MODEL
     _media_check_model(model, "edit")
-    if not isinstance(payload.get("prompt"), str) or not payload["prompt"].strip():
+    if not isinstance(payload.get("prompt"), str) or not payload["prompt"]:
         raise _media_bad_request("prompt 必须是非空字符串")
     raw_images = payload.get("images")
     if not isinstance(raw_images, list) or not raw_images:
@@ -5874,9 +5970,14 @@ async def images_edits(request: Request,
     size = _media_optional_text(payload.get("size"), "size", 64)
     quality = _media_optional_text(payload.get("quality"), "quality", 64)
     fidelity = _media_optional_text(payload.get("input_fidelity"), "input_fidelity", 64)
-    body = media_generation.image_request_body(model, payload["prompt"], size=size, n=1,
-                                               quality=quality, images=images, input_fidelity=fidelity)
+    try:
+        body = media_generation.image_request_body(model, payload["prompt"], size=size, n=1,
+                                                   quality=quality, images=images, input_fidelity=fidelity)
+    except ValueError as error:
+        raise _media_bad_request(str(error)) from None
     rid = _request_id()
+    if bool(_media_base_url()) and payload.get("response_format") != "b64_json":
+        _media_store()  # Refuse before the billed upstream round when persistence is impossible.
     _log(f"[{rid}] ▶ IMAGE EDIT | {model} | images={len(images)} | chars={len(payload['prompt'])}")
     items, credit = await _media_call(MEDIA_IMAGE_EDIT, body, rid, model=model,
                                       parse=media_generation.parse_image_reply)
@@ -5922,9 +6023,8 @@ async def create_video(request: Request,
     note = {}
     task_id = await _media_call(MEDIA_VIDEO_SUBMIT, body, rid, model=model,
                                 parse=media_generation.parse_video_submit, lease_note=note)
-    await run_in_threadpool(store.create_task, task_id, note.get("credential"),
-                            note.get("profile"), model)
-    task = store.get_task(task_id)
+    task = await run_in_threadpool(store.create_task, task_id, note.get("credential"),
+                                   note.get("profile"), model)
     return {"id": task_id, "object": "video", "status": "queued", "model": model,
             "created_at": int((task or {}).get("created") or time.time())}
 
@@ -5936,7 +6036,10 @@ async def get_video(task_id: str,
     """Report one video task, refreshing in-flight state from its bound account."""
     _check_auth(authorization, x_api_key)
     task = await _media_video_refresh(task_id, _request_id())
-    return _media_video_response(task)
+    meta = None
+    if task["status"] == "completed" and task["media_id"]:
+        meta = await run_in_threadpool(_media_store().get_asset, task["media_id"])
+    return _media_video_response(task, meta)
 
 
 @app.get("/v1/videos/{task_id}/content")
@@ -5952,7 +6055,9 @@ async def get_video_content(task_id: str,
     task = await _media_video_refresh(task_id, _request_id())
     meta = None
     if task["status"] == "completed" and task["media_id"]:
-        meta = _media_store().get_asset(task["media_id"])
+        meta = await run_in_threadpool(_media_store().get_asset, task["media_id"])
+    if meta is not None and media_store.is_expired(meta, _media_ttl_hours()):
+        meta = None
     if meta is None:
         raise HTTPException(status_code=409, detail={"error": {
             "message": "视频资源尚不可用（任务未完成或资源已清理）",
@@ -5971,8 +6076,13 @@ async def media_asset(kind: str, asset_id: str, request: Request):
     if store is None:
         raise HTTPException(status_code=503, detail={"error": {
             "message": "媒体存储不可用", "type": "service_unavailable"}})
-    meta = store.get_asset(asset_id)
-    file = store.asset_file(meta) if meta is not None else None
+    def lookup():
+        meta = store.get_asset(asset_id)
+        if meta is not None and media_store.is_expired(meta, _media_ttl_hours()):
+            return None, None  # Expired reads fail now, not at the next hourly sweep.
+        return (meta, store.asset_file(meta)) if meta is not None else (None, None)
+
+    meta, file = await run_in_threadpool(lookup)
     if file is None:
         raise HTTPException(status_code=404, detail={"error": {
             "message": "媒体资源不存在或已清理", "type": "not_found_error"}})

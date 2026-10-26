@@ -55,7 +55,7 @@ The **Media** page shows locally stored generation results: usage against the ca
 
 - **Library** lists assets newest first with model, size and remaining retention; a card opens the preview drawer with metadata, download and a two-step delete. **Video tasks** refresh in-flight tasks on their bound account and link finished videos back to the library. **Models** is a read-only table of media models and how many accounts could currently serve them.
 - Images are only stored when an asset base URL is configured; without it they are returned inline as base64. Videos are always stored locally, and their link appears once the base URL is set.
-- **Media settings** (`media_public_base_url`, `media_max_total_mb`, `media_ttl_hours`) set the public link prefix, capacity (64–1048576 MB) and retention (1–8760 hours). Shrinking either evicts the oldest assets on the next write or scheduled cleanup. Assets are also served publicly at `/v1/media/…` with immutable caching; see [Media generation](clients.md#media-generation).
+- **Media settings** (`media_public_base_url`, `media_max_total_mb`, `media_ttl_hours`) set the public link prefix, capacity (64–1048576 MB) and retention (1–8760 hours). Retention is derived from each asset's creation time and the current setting, so shrinking it expires existing assets immediately; the oldest are evicted on the next write or scheduled cleanup. Assets are also served publicly at `/v1/media/…` with immutable caching; see [Media generation](clients.md#media-generation).
 
 ## Settings
 

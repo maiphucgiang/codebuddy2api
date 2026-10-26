@@ -170,6 +170,7 @@ SCHEMA = {
                                 env="CODEBUDDY2API_MEDIA_MAX_TOTAL_MB", minimum=64, maximum=1048576),
     "media_ttl_hours": _item(72, "integer", "媒体保留时长（小时）",
                              env="CODEBUDDY2API_MEDIA_TTL_HOURS", minimum=1, maximum=8760),
+    # Interface preference: WebUI and `--lang` write it, nothing maps it from the environment.
     "language": _item("auto", "string", "界面语言", choices=["auto", "zh", "en"],
                       env_scope="ui", lockable=False),
     # One-time migration notice; written by `config migrate` and the WebUI dismiss button.

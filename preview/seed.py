@@ -164,8 +164,7 @@ def write_media(directory, now: float | None = None):
         store.save_asset("image", PNG_BYTES, model="hunyuan-image-v3.0", **quota)
         # A second image a moment older keeps the newest-first listing meaningful.
         first = store.save_asset("image", PNG_BYTES_ALT, model="hy-image-3.5", **quota)
-        store._db.execute("UPDATE assets SET created=?, expires=? WHERE id=?",
-                          (now - 3600, now - 3600 + 72 * 3600, first["id"]))
+        store._db.execute("UPDATE assets SET created=? WHERE id=?", (now - 3600, first["id"]))
         store._db.commit()
         video = store.save_asset("video", MP4_BYTES, model="minimax-video-h3", **quota)
         aurora = account_key("cn-cli", "100001", "")

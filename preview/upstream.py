@@ -303,14 +303,15 @@ class Upstream:
                    "descriptionZh": f"{MODELS[key]['name']}（预览数据）",
                    "descriptionEn": f"{MODELS[key]['name']} (preview data)"}
                   for key in state.account.models]
-        # Media models stay out of chat routing (supportsToolCall False) but join the
-        # account catalog so the gateway's media selection sees them as members.
+        # Media models live in the root table only (the account/serves scope) with the
+        # real upstream tags; the cli selector never lists them, so chat is unaffected.
+        kind_tags = {"image": "text-to-image", "edit": "image-to-image", "video": "text-to-video"}
         models.extend({"id": name, "name": name, "supportsToolCall": False,
-                       "tags": ["video" if name in media_generation.VIDEO_MODELS else "image"],
+                       "tags": [kind_tags[kind] for kind in media_generation.model_kinds(name)],
                        "credits": "x1.00"}
                       for name in state.account.media)
         agents = [{"name": "cli", "tags": ["default"],
-                   "models": list(state.account.models) + list(state.account.media)}]
+                   "models": list(state.account.models)}]
         models[0]["isDefault"] = True
         return ok({"models": models, "agents": agents})
 

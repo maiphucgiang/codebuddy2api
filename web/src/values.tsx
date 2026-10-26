@@ -82,8 +82,6 @@ const labels: Record<string, string> = {
   fetched_at: "同步时间",
   updated_at: "更新时间",
   created_at: "创建时间",
-  created: "创建时间",
-  expires: "过期时间",
   mime: "MIME 类型",
   sha256: "SHA-256",
   generated_at: "生成时间",
