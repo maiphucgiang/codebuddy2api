@@ -186,6 +186,22 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                             self.assertNotEqual(first.json()["id"], first.headers["X-Request-ID"])
                         self.assertNotIn("metadata", json.loads(request.content))
 
+    def test_channel_identity_guard_reaches_all_protocols_when_desensitize_off(self):
+        source = "You are an AI agent powered by DeepSeek Harness."
+        for route in fixtures.fixtures.GENERATIONS:
+            with self.subTest(route=route):
+                self.fx.configure(profiles=("cn-cli",))
+                body = self.fx.payload(route, system=source)
+                key = "input" if route == "responses" else "messages"
+                body[key] = [*body[key], {"role": "assistant", "content": source},
+                             {"role": "user", "content": "next"}]
+                with patch.dict(gateway.CONFIG, {"desensitize": False}):
+                    response = self.fx.client.post("/v1/" + route, json=body)
+                self.assertEqual(response.status_code, 200, response.text)
+                upstream = self.fx.requests[-1].content.decode("utf-8")
+                self.assertNotIn(source, upstream)
+                self.assertGreaterEqual(upstream.count("You are a helpful AI assistant"), 2)
+
     def test_legacy_workbuddy_attempt_ids_are_independent(self):
         for profile in ("cn-work", "intl-work"):
             with self.subTest(profile=profile):

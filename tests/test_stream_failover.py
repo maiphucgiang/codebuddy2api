@@ -476,8 +476,8 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
                 self.assertEqual(self.failover_lines(), [])
 
     def test_model_scoped_error_codes_are_not_replayed(self):
-        cases = ((500, 11134), (503, 11134), (400, 11102), (400, 11129),
-                 (400, 11150), (400, 11158))
+        cases = ((500, 11134), (503, 11134), (400, 11102), (503, 11102),
+                 (400, 11129), (400, 11150), (400, 11158))
         for status, code in cases:
             for wrapped in (False, True):
                 with self.subTest(status=status, code=code, wrapped=wrapped):

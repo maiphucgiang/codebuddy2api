@@ -4661,6 +4661,9 @@ def _failover_safe(error, raw=b"") -> bool:
     if is_filter_error(raw):
         return False
     code, _, _ = _upstream_diagnostic(raw)
+    if code == "11102":
+        return (isinstance(error, UpstreamHTTPError) and error.from_channel_fallback
+                and _parse_not_servable(raw, error.status) is not None)
     if code in NO_FAILOVER_UPSTREAM_CODES:
         return False
     if isinstance(error, UpstreamHTTPError):
