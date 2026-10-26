@@ -65,23 +65,31 @@ def anthropic_request_to_chat(body: dict) -> dict:
         chat["max_tokens"] = body["max_tokens"]
 
     # tools; Anthropic server-side web tools are executed by the gateway itself.
+    server_spec: dict = {}
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
         plain, spec = server_tools.split_server_tools(tools)
         converted = _convert_anthropic_tools(plain)
-        if spec:
-            taken = {t.get("name") for t in plain if isinstance(t, dict)}
-            converted = converted + server_tools.injected_chat_tools(spec, taken)
-            chat["_server_tools"] = spec
-        if converted:
-            chat["tools"] = converted
+        merged, active = server_tools.merge_injected(converted, spec)
+        if active:
+            server_spec = active
+            chat["_server_tools"] = active
+        if merged:
+            chat["tools"] = merged
 
     if "tool_choice" in body:
         tc = body["tool_choice"]
         if isinstance(tc, dict):
             kind = tc.get("type")
             if kind == "tool":
-                chat["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+                # Anthropic names the hosted tools web_search / web_fetch; map
+                # declared server-tool names onto the injected gateway names.
+                name = tc.get("name", "")
+                if name == "web_search" and server_spec and server_tools.TOOL_SEARCH in server_spec:
+                    name = server_tools.TOOL_SEARCH
+                elif name == "web_fetch" and server_spec and server_tools.TOOL_FETCH in server_spec:
+                    name = server_tools.TOOL_FETCH
+                chat["tool_choice"] = {"type": "function", "function": {"name": name}}
             elif kind in ("auto", "none", "any"):
                 chat["tool_choice"] = "required" if kind == "any" else kind
             else:
@@ -406,14 +414,15 @@ class AnthropicStreamConverter:
             self._next_block_idx += 1
             res_idx = self._next_block_idx
             self._next_block_idx += 1
+            use_id = record.get("public_id") or _rand_id("srvtoolu_")
             use_block = {"type": "server_tool_use",
-                         "id": record.get("id") or _rand_id("srvtoolu_"),
+                         "id": use_id,
                          "name": record.get("name") or "web_search",
                          "input": record.get("input") or {}}
             events.append(self._evt("content_block_start",
                                     {"index": use_idx, "content_block": use_block}))
             events.append(self._evt("content_block_stop", {"index": use_idx}))
-            result_block = self._tool_result_block(record)
+            result_block = self._tool_result_block(record, use_id)
             events.append(self._evt("content_block_start",
                                     {"index": res_idx, "content_block": result_block}))
             events.append(self._evt("content_block_stop", {"index": res_idx}))
@@ -423,13 +432,13 @@ class AnthropicStreamConverter:
         self._seed_blocks = blocks
         return events
 
-    def _tool_result_block(self, record: dict) -> dict:
-        tool_use_id = record.get("id") or ""
+    def _tool_result_block(self, record: dict, use_id: str) -> dict:
+        """Render one executed call as the protocol-native result block."""
         if record.get("error"):
-            error_type = record["error"] if record["error"] == "max_uses_exceeded" else (
-                "web_search_error" if record.get("kind") == "search" else "web_fetch_error")
-            return {"type": f"{record.get('name')}_tool_result", "tool_use_id": tool_use_id,
-                    "content": None, "error": {"type": error_type, "message": record["error"]}}
+            error_code = record.get("error_code") or "unavailable"
+            return {"type": f"{record.get('name')}_tool_result", "tool_use_id": use_id,
+                    "content": {"type": f"{record.get('name')}_tool_result_error",
+                                "error_code": error_code}}
         if record.get("kind") == "search":
             results = []
             for item in record.get("results") or []:
@@ -438,13 +447,17 @@ class AnthropicStreamConverter:
                 if item.get("page_age"):
                     entry["page_age"] = item["page_age"]
                 results.append(entry)
-            return {"type": "web_search_tool_result", "tool_use_id": tool_use_id,
+            return {"type": "web_search_tool_result", "tool_use_id": use_id,
                     "content": results}
         fetched = record.get("content") or {}
-        page = {"type": "web_result",
+        page = {"type": "web_fetch_result",
                 "url": fetched.get("url") or (record.get("input") or {}).get("url"),
-                "title": fetched.get("title"), "content": fetched.get("content") or ""}
-        return {"type": "web_fetch_tool_result", "tool_use_id": tool_use_id, "content": [page]}
+                "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "content": {"type": "document",
+                            "title": fetched.get("title"),
+                            "source": {"type": "text", "media_type": "text/plain",
+                                       "data": fetched.get("content") or ""}}}
+        return {"type": "web_fetch_tool_result", "tool_use_id": use_id, "content": page}
 
     def get_nonstream_response(self) -> dict:
         """Return the complete non-streaming Message response."""

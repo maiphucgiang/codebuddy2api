@@ -7,9 +7,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct exe
 
 import json
 import unittest
+from unittest.mock import patch
 
 import httpx
 
+
+import converter
 from app import server_tools
 from app.adapters.anthropic_adapter import AnthropicStreamConverter
 from app.adapters.responses_adapter import ResponsesStreamConverter
@@ -47,6 +50,32 @@ def tool_call_round(name, arguments):
     ])
 
 
+def double_call_round(server_name, server_args, client_name, client_args):
+    return sse([
+        {"id": "round", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
+            {"index": 0, "id": "call_1", "type": "function",
+             "function": {"name": server_name, "arguments": json.dumps(server_args)}},
+            {"index": 1, "id": "call_2", "type": "function",
+             "function": {"name": client_name, "arguments": json.dumps(client_args)}}]},
+            "finish_reason": None}]},
+        {"id": "round", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+         "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}},
+    ])
+
+
+def double_call_result(server_name, server_args, client_name, client_args):
+    """One merged completion issuing one gateway call and one client call."""
+    return {"choices": [{"index": 0, "message": {
+        "role": "assistant", "content": None,
+        "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": server_name, "arguments": json.dumps(server_args)}},
+            {"id": "call_2", "type": "function",
+             "function": {"name": client_name, "arguments": json.dumps(client_args)}}]},
+        "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}}
+
+
 def final_round(text="ok"):
     return sse([
         {"id": "round", "choices": [{"index": 0,
@@ -79,7 +108,7 @@ class SplitTests(unittest.TestCase):
         self.assertEqual(spec["WebSearch"]["max_results"], 8)
         self.assertEqual(spec["WebSearch"]["allowed_domains"], ["a.com"])
         # allowed wins when both are present, mirroring the mutual exclusion rule.
-        self.assertEqual(spec["WebSearch"]["blocked_domains"], [])
+        self.assertIsNone(spec["WebSearch"]["blocked_domains"])
 
     def test_options_config(self):
         config = server_tools.search_config_from_options({"search_context_size": "low"})
@@ -89,6 +118,30 @@ class SplitTests(unittest.TestCase):
         spec = {"WebSearch": {}, "WebFetch": {}}
         injected = server_tools.injected_chat_tools(spec, {"WebSearch"})
         self.assertEqual([t["function"]["name"] for t in injected], ["WebFetch"])
+
+
+    def test_client_owned_names_drop_spec_entries(self):
+        tools = [{"type": "web_search_20250305", "name": "web_search"},
+                 {"name": "WebSearch", "input_schema": {"type": "object"}}]
+        plain, spec = server_tools.split_server_tools(tools)
+        # The client's own WebSearch wins; no gateway execution for that name.
+        self.assertEqual(spec, {})
+        merged, active = server_tools.merge_injected(
+            [{"type": "function", "function": {"name": "WebSearch"}}], spec)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(active, {})
+
+    def test_merge_injected_filters_active_spec(self):
+        spec = {"WebSearch": {"max_uses": 2}, "WebFetch": {"max_uses": 1}}
+        merged, active = server_tools.merge_injected([], spec)
+        self.assertEqual([t["function"]["name"] for t in merged], ["WebSearch", "WebFetch"])
+        self.assertEqual(set(active), {"WebSearch", "WebFetch"})
+        # A client-owned WebFetch drops out of both injection and execution.
+        client_tools = [{"type": "function", "function": {"name": "WebFetch"}}]
+        merged, active = server_tools.merge_injected(client_tools, spec)
+        self.assertEqual([t["function"]["name"] for t in merged],
+                         ["WebFetch", "WebSearch"])
+        self.assertEqual(set(active), {"WebSearch"})
 
 
 class LoopTests(unittest.TestCase):
@@ -155,6 +208,71 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(self.fetches, [(URL, "summarize", None)])
 
 
+    def test_mixed_calls_execute_server_and_surface_client(self):
+        body, result, records = self.run_loop([
+            double_call_result("WebSearch", {"query": QUERY}, "client_tool", {"x": 1}),
+            {"choices": [{"message": {"content": "never"}, "finish_reason": "stop"}]},
+        ])
+        # The gateway ran its search, then handed the client call back untouched.
+        self.assertEqual([record["kind"] for record in records], ["search"])
+        calls = result["choices"][0]["message"]["tool_calls"]
+        self.assertEqual([call["id"] for call in calls], ["call_2"])
+        self.assertEqual(calls[0]["function"]["name"], "client_tool")
+        roles = [message["role"] for message in body["messages"]]
+        self.assertEqual(roles, ["user", "assistant", "tool"])
+        self.assertEqual(body["messages"][2]["tool_call_id"], "call_1")
+        self.assertNotIn("[gateway]", body["messages"][2]["content"])
+
+    def test_client_only_call_returns_immediately(self):
+        body, result, records = self.run_loop([
+            tool_call_result("client_tool", {"x": 1}),
+            {"choices": [{"message": {"content": "never"}, "finish_reason": "stop"}]},
+        ])
+        self.assertEqual(records, [])
+        self.assertEqual(result["choices"][0]["message"]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual([message["role"] for message in body["messages"]],
+                         ["user", "assistant"])
+
+    def test_declared_domains_bound_model_arguments(self):
+        spec = {"WebSearch": {"max_uses": None, "allowed_domains": ["allowed.com"],
+                              "blocked_domains": None, "max_results": 5}}
+        _, _, records = self.run_loop([
+            tool_call_result("WebSearch", {"query": QUERY,
+                                           "allowed_domains": ["evil.com"]}),
+            {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+        ], spec=spec)
+        # The declaration replaces the model-given filter on the wire and on results.
+        self.assertEqual(self.queries[0][2], ["allowed.com"])
+        self.assertEqual(records[0]["results"], [])
+
+    def test_tool_choice_and_tools_restored_after_loop(self):
+        body = {"messages": [{"role": "user", "content": "q"}],
+                "tools": [{"type": "function", "function": {"name": "WebSearch"}}],
+                "tool_choice": "required"}
+        state = {"rounds": [tool_call_result("WebSearch", {"query": QUERY}),
+                            {"choices": [{"message": {"content": "ok"},
+                                          "finish_reason": "stop"}]}]}
+        seen = []
+
+        async def fetch_chat(tool_body):
+            seen.append(tool_body.get("tool_choice"))
+            return state["rounds"].pop(0)
+
+        async def search_fn(query, count, allowed, freshness):
+            return [dict(SEARCH_RESULT)]
+
+        async def fetch_fn(url, prompt, max_length):
+            return {"url": url, "content": "body"}
+
+        _run(server_tools.run_chat_tool_loop(
+            fetch_chat, body, {"WebSearch": {"max_uses": None, "allowed_domains": None,
+                                             "blocked_domains": None, "max_results": 5}},
+            search_fn=search_fn, fetch_fn=fetch_fn))
+        self.assertEqual(seen, ["required", "auto"])
+        self.assertEqual(body["tool_choice"], "required")
+        self.assertEqual([t["function"]["name"] for t in body["tools"]], ["WebSearch"])
+
+
 def _run(coro):
     import asyncio
     return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(coro) \
@@ -163,10 +281,11 @@ def _run(coro):
 
 class SeedTests(unittest.TestCase):
     RECORDS = [
-        {"kind": "search", "name": "web_search", "id": "srv_1", "input": {"query": QUERY},
-         "results": [dict(SEARCH_RESULT)], "error": None},
-        {"kind": "fetch", "name": "web_fetch", "id": "srv_2", "input": {"url": URL},
-         "content": {"url": URL, "title": "Example", "content": "body"}, "error": None},
+        {"kind": "search", "name": "web_search", "id": "srv_1", "public_id": "srvtoolu_1",
+         "input": {"query": QUERY}, "results": [dict(SEARCH_RESULT)], "error": None},
+        {"kind": "fetch", "name": "web_fetch", "id": "srv_2", "public_id": "srvtoolu_2",
+         "input": {"url": URL}, "error": None,
+         "content": {"url": URL, "title": "Example", "content": "body"}},
     ]
 
     def feed(self, converter, seeded=True):
@@ -192,24 +311,27 @@ class SeedTests(unittest.TestCase):
         self.assertIn('"server_tool_use"', events)
         self.assertIn('"web_search_tool_result"', events)
         self.assertIn('"web_fetch_tool_result"', events)
-        self.assertIn('"web_result"', events)
+        self.assertIn('"web_fetch_result"', events)
         content = converter.get_nonstream_response()["content"]
         self.assertEqual([block["type"] for block in content],
                          ["server_tool_use", "web_search_tool_result",
                           "server_tool_use", "web_fetch_tool_result", "text"])
-        self.assertEqual(content[1]["tool_use_id"], "srv_1")
+        self.assertEqual(content[1]["tool_use_id"], "srvtoolu_1")
         self.assertEqual(content[1]["content"][0]["url"], URL)
-        self.assertEqual(content[3]["content"][0]["content"], "body")
+        self.assertEqual(content[3]["content"]["content"]["source"]["data"], "body")
 
     def test_anthropic_error_record_shape(self):
         converter = AnthropicStreamConverter(model="m")
         converter.seed_server_tools([{"kind": "search", "name": "web_search", "id": "srv_e",
-                                      "input": {"query": "q"}, "results": None,
-                                      "error": "max_uses_exceeded"}])
+                                      "public_id": "srvtoolu_e", "input": {"query": "q"},
+                                      "results": None, "error": "max_uses_exceeded",
+                                      "error_code": "max_uses_exceeded"}])
         self.feed(converter, seeded=False)
         block = converter.get_nonstream_response()["content"][1]
-        self.assertEqual(block["error"]["type"], "max_uses_exceeded")
-        self.assertIsNone(block["content"])
+        self.assertEqual(block["content"],
+                         {"type": "web_search_tool_result_error",
+                          "error_code": "max_uses_exceeded"})
+        self.assertEqual(block["tool_use_id"], "srvtoolu_e")
 
     def test_responses_search_call_items_lead(self):
         converter = ResponsesStreamConverter(model="m")
@@ -221,6 +343,19 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(output[0]["type"], "web_search_call")
         self.assertEqual(output[0]["action"]["queries"], [QUERY])
         self.assertEqual(output[1]["type"], "message")
+        self.assertEqual(output[0]["status"], "completed")
+        self.assertIn('"status": "completed"', events)
+        self.assertIn('"status": "in_progress"', events)
+
+    def test_responses_search_call_failed_status(self):
+        converter = ResponsesStreamConverter(model="m")
+        converter.seed_web_search_calls([
+            {"kind": "search", "name": "web_search", "id": "srv_e", "public_id": "srvtoolu_e",
+             "input": {"query": "q"}, "results": None, "error": "boom",
+             "error_code": "unavailable"}])
+        self.feed(converter, seeded=False)
+        output = converter.get_nonstream_response()["output"]
+        self.assertEqual(output[0]["status"], "failed")
 
 
 class ServerToolEndpointTests(fixtures.RegionRoutingTests):
@@ -232,6 +367,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         self.chat_rounds = []
         self.chat_requests = []
         self.tool_requests = []
+        self.fetch_content = "fetched body"
 
     def handle_upstream(self, request):
         if request.url.path in ("/agenttool/v1/search", "/agenttool/v1/webfetch"):
@@ -240,7 +376,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                 return httpx.Response(200, json={"results": [dict(SEARCH_RESULT)],
                                                  "total_results": 1})
             return httpx.Response(200, json={"url": URL, "title": "Example",
-                                             "content": "fetched body",
+                                             "content": self.fetch_content,
                                              "content_type": "text/markdown",
                                              "truncated": False, "status_code": 200})
         if request.url.path.endswith("/chat/completions"):
@@ -293,8 +429,8 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 200, response.text)
         text = response.text
         for fragment in ('"type": "server_tool_use"', '"name": "web_fetch"',
-                         '"type": "web_fetch_tool_result"', '"type": "web_result"',
-                         '"type": "text_delta"', "message_stop"):
+                         '"type": "web_fetch_tool_result"', '"type": "web_fetch_result"',
+                         '"type": "document"', '"type": "text_delta"', "message_stop"):
             self.assertIn(fragment, text)
         sent = json.loads(self.tool_requests[0].content)
         self.assertEqual(sent["url"], URL)
@@ -335,6 +471,104 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         sent = json.loads(self.chat_requests[0].content)
         self.assertEqual([t["function"]["name"] for t in sent["tools"]], ["client_tool"])
         self.assertEqual(self.tool_requests, [])
+
+
+    def test_messages_mixed_calls_surface_client_tool(self):
+        self.chat_rounds = [double_call_round("WebSearch", {"query": QUERY},
+                                              "client_tool", {"x": 1}), final_round()]
+        payload = self.payload(endpoint="messages")
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"},
+                            {"name": "client_tool", "description": "d",
+                             "input_schema": {"type": "object", "properties": {}}}]
+        response = self.client.post("/v1/messages", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        # The gateway executed its search, then stopped and surfaced the client call.
+        self.assertEqual(len(self.chat_requests), 1)
+        types = [block["type"] for block in data["content"]]
+        self.assertEqual(types, ["server_tool_use", "web_search_tool_result", "tool_use"])
+        self.assertEqual(data["content"][2]["name"], "client_tool")
+        self.assertEqual(data["stop_reason"], "tool_use")
+        self.assertEqual(len(self.tool_requests), 1)
+
+    def test_messages_tool_choice_any_completes(self):
+        self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
+        payload = self.payload(endpoint="messages")
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        payload["tool_choice"] = {"type": "any"}
+        response = self.client.post("/v1/messages", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["content"][-1]["type"], "text")
+        # The continuation round ran with a relaxed choice.
+        second = json.loads(self.chat_requests[1].content)
+        self.assertEqual(second["tool_choice"], "auto")
+
+    def test_messages_tool_choice_named_web_search(self):
+        self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
+        payload = self.payload(endpoint="messages")
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        payload["tool_choice"] = {"type": "tool", "name": "web_search"}
+        response = self.client.post("/v1/messages", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        first = json.loads(self.chat_requests[0].content)
+        self.assertEqual(first["tool_choice"], "required")
+        self.assertEqual([t["function"]["name"] for t in first["tools"]], ["WebSearch"])
+
+    def test_responses_hosted_tool_choice(self):
+        self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
+        payload = self.payload(endpoint="responses")
+        payload["tools"] = [{"type": "web_search"}]
+        payload["tool_choice"] = {"type": "web_search"}
+        response = self.client.post("/v1/responses", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        sent = json.loads(self.chat_requests[0].content)
+        self.assertEqual(sent["tool_choice"], "required")
+
+    def test_client_owned_websearch_name_stays_client(self):
+        self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY})]
+        payload = self.payload(endpoint="messages")
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"},
+                            {"name": "WebSearch", "description": "client",
+                             "input_schema": {"type": "object", "properties": {}}}]
+        response = self.client.post("/v1/messages", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        # No gateway injection or execution; the client's own tool call passes through.
+        sent = json.loads(self.chat_requests[0].content)
+        self.assertEqual([t["function"]["name"] for t in sent["tools"]], ["WebSearch"])
+        self.assertEqual(self.tool_requests, [])
+        self.assertEqual(response.json()["stop_reason"], "tool_use")
+
+    def test_history_echo_blocks_are_accepted(self):
+        payload = self.payload(endpoint="messages", text="follow-up question")
+        payload["messages"] = [
+            {"role": "user", "content": "search please"},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_x", "name": "web_search",
+                 "input": {"query": "q"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_x",
+                 "content": [{"type": "web_search_result", "url": URL, "title": "T",
+                              "encrypted_content": ""}]},
+                {"type": "text", "text": "based on results"}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "other",
+                 "content": "client result"},
+                {"type": "text", "text": "and now?"}]},
+        ]
+        response = self.client.post("/v1/messages", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+
+
+    def test_messages_fetch_continuation_guard(self):
+        # The chat endpoint has no hosted fetch tool type; drive the loop through the
+        # messages endpoint, which declares web_fetch_* and runs the same guard.
+        self.fetch_content = "x" * 3000
+        self.chat_rounds = [tool_call_round("WebFetch", {"url": URL}), final_round()]
+        with patch.dict(converter.CONFIG, {"max_request_bytes": 2000}):
+            payload = self.payload(endpoint="messages")
+            payload["tools"] = [{"type": "web_fetch_20250910", "name": "web_fetch"}]
+            response = self.client.post("/v1/messages", json=payload)
+        self.assertEqual(response.status_code, 413, response.text)
+        self.assertEqual(len(self.chat_requests), 1)
 
 
 if __name__ == "__main__":

@@ -3866,17 +3866,22 @@ async def chat_completions(request: Request,
     # Gateway-executed web tools: hosted web_search tool types plus web_search_options.
     server_spec: dict = {}
     if isinstance(body.get("tools"), list) and body["tools"]:
-        plain_tools, server_spec = server_tools.split_server_tools(body["tools"], openai_types=True)
-        taken_names = {t.get("function", {}).get("name") for t in plain_tools
-                       if isinstance(t, dict)}
-        injected = server_tools.injected_chat_tools(server_spec, taken_names)
-        body["tools"] = plain_tools + injected
-    if isinstance(payload.get("web_search_options"), dict) and "WebSearch" not in server_spec:
-        server_spec["WebSearch"] = server_tools.search_config_from_options(
-            payload["web_search_options"])
-        body["tools"] = list(body.get("tools") or []) + server_tools.injected_chat_tools(server_spec)
+        plain_tools, split_spec = server_tools.split_server_tools(body["tools"], openai_types=True)
+        body["tools"], server_spec = server_tools.merge_injected(plain_tools, split_spec)
+    if isinstance(payload.get("web_search_options"), dict) and server_tools.TOOL_SEARCH not in server_spec:
+        options_spec = {"WebSearch": server_tools.search_config_from_options(
+            payload["web_search_options"])}
+        body["tools"], options_active = server_tools.merge_injected(body.get("tools") or [], options_spec)
+        server_spec.update(options_active)
     if server_spec:
         body["_server_tools"] = server_spec
+    hosted_choice = payload.get("tool_choice")
+    if isinstance(hosted_choice, dict) and hosted_choice.get("type") in server_tools.OPENAI_SEARCH_TYPES:
+        if server_tools.TOOL_SEARCH in server_spec:
+            payload = {**payload, "tool_choice": {
+                "type": "function", "function": {"name": server_tools.TOOL_SEARCH}}}
+        else:
+            payload = {**payload, "tool_choice": "auto"}
     body = await run_in_threadpool(_prepare_chat_body, body, session_payload=payload)
     stream_policy = _snapshot_stream_policy("chat", body)
     observe_stream_mode(stream_policy.mode)
@@ -5058,10 +5063,11 @@ async def _run_server_tool_chat(url, headers, routed, model_name, rid, cred, *, 
     spec = routed.get("_server_tools") or {}
 
     async def fetch_chat(tool_body):
+        # Continuations grow the body with fetched content; re-apply the size guard.
+        _guard_request_size(tool_body)
         return await _fetch_checked_chat(url, headers, tool_body, model_name, rid, cred,
                                          filter_retry=True,
                                          max_collect_bytes=policy.max_collect_bytes)
-
     if not spec:
         return await fetch_chat(routed), []
     _log(f"[{rid}] ⚙ 内置联网工具已注入 | {sorted(spec)}")

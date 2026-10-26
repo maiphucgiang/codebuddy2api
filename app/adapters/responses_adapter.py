@@ -62,13 +62,12 @@ def responses_request_to_chat(body: dict) -> dict:
             if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list):
                 raw_tools.extend(item["tools"])
 
+
     # OpenAI hosted web_search tools are executed by the gateway itself.
-    plain_tools, server_spec = server_tools.split_server_tools(raw_tools, openai_types=True)
+    plain_tools, spec = server_tools.split_server_tools(raw_tools, openai_types=True)
     registry, chat_tools = _build_tool_registry_and_chat_tools(
         plain_tools, input_items=inp if isinstance(inp, list) else None)
-    if server_spec:
-        taken = {t.get("name") for t in plain_tools if isinstance(t, dict)}
-        chat_tools = chat_tools + server_tools.injected_chat_tools(server_spec, taken)
+    chat_tools, active_spec = server_tools.merge_injected(chat_tools, spec)
 
     messages: list[dict] = []
 
@@ -94,10 +93,18 @@ def responses_request_to_chat(body: dict) -> dict:
         chat["tools"] = chat_tools
     if registry.upstream_to_identity:
         chat["_tool_registry"] = registry.to_dict()
-    if server_spec:
-        chat["_server_tools"] = server_spec
+    if active_spec:
+        chat["_server_tools"] = active_spec
     if "tool_choice" in body:
-        chat["tool_choice"] = _convert_tool_choice_for_chat(body["tool_choice"], tool_registry=registry)
+        choice = body["tool_choice"]
+        if isinstance(choice, dict) and choice.get("type") in server_tools.OPENAI_SEARCH_TYPES \
+                and server_tools.TOOL_SEARCH in active_spec:
+            # Hosted tool_choice maps onto the injected gateway function, which the
+            # plain-tool registry does not know.
+            chat["tool_choice"] = {"type": "function",
+                                   "function": {"name": server_tools.TOOL_SEARCH}}
+        else:
+            chat["tool_choice"] = _convert_tool_choice_for_chat(choice, tool_registry=registry)
 
     # Forward supported parameters.
     for key in ("temperature", "top_p", "stop", "seed",
@@ -571,9 +578,10 @@ class ResponsesStreamConverter:
                                    if record.get("kind") == "search"]
         self._seeds_emitted = False
 
-    def _search_call_item(self, record: dict) -> dict:
+    def _search_call_item(self, record: dict, status: str) -> dict:
         query = (record.get("input") or {}).get("query") or ""
         return {"type": "web_search_call", "id": record.get("id") or _rand_id("ws_"),
+                "status": status,
                 "action": {"type": "search", "queries": [query] if query else []}}
 
     def _seed_events(self) -> list[str]:
@@ -583,13 +591,15 @@ class ResponsesStreamConverter:
         self._seeds_emitted = True
         events: list[str] = []
         for record in self._seed_search_calls:
-            item = self._search_call_item(record)
+            final_status = "failed" if record.get("error") else "completed"
             index = self._next_output_idx
             self._next_output_idx += 1
             events.append(self._evt("response.output_item.added",
-                                    {"output_index": index, "item": item}))
+                                    {"output_index": index,
+                                     "item": self._search_call_item(record, "in_progress")}))
             events.append(self._evt("response.output_item.done",
-                                    {"output_index": index, "item": item}))
+                                    {"output_index": index,
+                                     "item": self._search_call_item(record, final_status)}))
         return events
 
     # Public methods
@@ -1005,7 +1015,7 @@ class ResponsesStreamConverter:
         return item
 
     def _response_obj(self, status: str, incomplete_reason: str | None = None) -> dict:
-        output = [self._search_call_item(record)
+        output = [self._search_call_item(record, "failed" if record.get("error") else "completed")
                   for record in self._seed_search_calls]
         if self._realtime:
             for kind, index in self._output_order:
