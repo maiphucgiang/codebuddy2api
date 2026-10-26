@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 import zlib
 
@@ -45,6 +46,7 @@ PNG_BYTES = _png()
 MP4_BYTES = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"\x00" * 512
 COS = "https://cos.example"
 IMAGE_PATHS = ("/v2/images/generations", "/v2/images/edits")
+MEDIA_PATHS = IMAGE_PATHS + ("/v2/videos/generations", "/v2/videos/tasks")
 
 
 class ContractTests(unittest.TestCase):
@@ -441,6 +443,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.image_statuses = []  # Per-request override; pops take priority over image_status.
         self.image_envelope_error = False   # Image replies become business-error envelopes.
         self.image_urls = None              # Explicit COS urls returned per image item.
+        self.media_replies = []             # (status, json) answers for the next media requests.
         self.video_envelope_error = False   # Video task replies become error envelopes.
         self.video_task_no_url = False      # Completed tasks omit the resource url.
         self.cos_handlers = []              # (suffix, status, content?) rules, first match wins.
@@ -471,6 +474,10 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
                     return httpx.Response(status, json={"error": {"message": "cos refused"}})
             content = MP4_BYTES if path.endswith(".mp4") else PNG_BYTES
             return httpx.Response(200, content=content)
+        if path in MEDIA_PATHS and self.media_replies:
+            self.media_requests.append(request)
+            status, payload = self.media_replies.pop(0)
+            return httpx.Response(status, json=payload)
         if path in IMAGE_PATHS:
             self.media_requests.append(request)
             if self.image_envelope_error:
@@ -995,6 +1002,120 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         result = self.client.post("/v1/images/generations", json={"prompt": "x"})
         self.assertEqual(result.status_code, 401)
 
+    # -- account restrictions and session headers ------------------------------------------
+
+    def restricted_pair(self):
+        """Two eligible accounts with failover on, so a replay shows up as a second request."""
+        self.add_account("cn2", "cn-cli")
+        self.configure_media(profiles=("cn-cli", "cn2", "cn-work", "intl-cli", "intl-work"))
+        # A real control store lets a restriction disable the account instead of only cooling it.
+        store = ControlStore(self.root / f"control-{self.fixture_sequence}.sqlite3")
+        self.addCleanup(store.close)
+        management = SimpleNamespace(gateway=SimpleNamespace(invalidate_model_table=lambda: None))
+        self.enterContext(patch.dict(converter.CONFIG, {
+            "failover_max": 2, "control_store": store, "management": management}))
+        self.media_requests.clear()
+
+    def assert_health(self, restricted=None):
+        """Only the restricted account is cooled and disabled; the other stays healthy."""
+        for uid in ("cn-cli", "cn2"):
+            state = self.entry_state(uid)
+            enabled = converter.model_policy.credential_enabled(converter.CONFIG, state)
+            if uid == restricted:
+                self.assertGreater(state["fail_until"], time.time(), uid)
+                self.assertTrue(state["auto_disabled"], uid)
+                self.assertFalse(enabled, uid)
+            else:
+                self.assertLess(state["fail_until"], time.time(), uid)
+                self.assertFalse(state.get("auto_disabled"), uid)
+                self.assertTrue(enabled, uid)
+
+    def test_http_restriction_code_disables_the_account_without_replay(self):
+        flat = {"code": 11140, "msg": "request illegal"}
+        nested = {"code": "error", "error": {"code": "11140", "message": "request illegal"}}
+        for status, body in ((403, flat), (429, nested), (500, flat)):
+            with self.subTest(status=status):
+                self.restricted_pair()
+                self.media_replies = [(status, body)]
+                result = self.client.post("/v1/images/generations", json={"prompt": "x"})
+                self.assertEqual(result.status_code, status, result.text)
+                self.assertEqual(len(self.media_requests), 1)
+                self.assert_health(self.media_requests[0].headers["x-user-id"])
+
+    def test_envelope_restriction_code_disables_the_account(self):
+        for path, payload in (("/v1/images/generations", {"prompt": "x"}), ("/v1/videos", {"prompt": "dance"})):
+            with self.subTest(path=path):
+                self.restricted_pair()
+                self.media_replies = [(200, {"code": 11140, "msg": "request illegal"})]
+                result = self.client.post(path, json=payload)
+                self.assertEqual(result.status_code, 502, result.text)
+                self.assertEqual(result.json()["error"]["upstream_code"], 11140)
+                self.assertEqual(len(self.media_requests), 1)
+                self.assert_health(self.media_requests[0].headers["x-user-id"])
+
+    def test_bound_video_query_records_the_restriction_and_keeps_the_task(self):
+        self.restricted_pair()
+        self.video_task_status = "processing"
+        task_id = self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
+        bound = self.media_requests[0].headers["x-user-id"]
+        self.media_replies = [(403, {"code": 11140, "msg": "request illegal"})]
+        result = self.client.get(f"/v1/videos/{task_id}")
+        self.assertEqual(result.status_code, 403, result.text)
+        self.assertEqual([r.headers["x-user-id"] for r in self.media_requests], [bound, bound])
+        self.assert_health(bound)
+        self.assertEqual(self.store.get_task(task_id)["status"], "queued")
+
+    def test_model_scoped_codes_are_not_replayed_and_do_not_cool(self):
+        for status, code in ((429, 11129), (403, 11129), (403, 11148)):
+            with self.subTest(status=status, code=code):
+                self.restricted_pair()
+                self.media_replies = [(status, {"code": code, "msg": "synthetic model refusal"})]
+                result = self.client.post("/v1/images/generations", json={"prompt": "x"})
+                self.assertEqual(result.status_code, status, result.text)
+                self.assertEqual(len(self.media_requests), 1)
+                self.assert_health()
+
+    def test_unrelated_business_code_keeps_replaying_without_cooling(self):
+        self.restricted_pair()
+        self.media_replies = [(403, {"code": 10001, "msg": "synthetic refusal"})]
+        result = self.client.post("/v1/images/generations", json={"prompt": "x"})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(len(self.media_requests), 2)
+        self.assert_health()
+
+    def test_media_requests_carry_session_and_trace_headers(self):
+        self.assertEqual(self.client.post("/v1/images/generations", json={"prompt": "x"}).status_code, 200)
+        task_id = self.client.post("/v1/videos", json={"prompt": "dance"}).json()["id"]
+        self.assertEqual(self.client.get(f"/v1/videos/{task_id}").status_code, 200)
+        self.assertEqual([r.url.path for r in self.media_requests],
+                         ["/v2/images/generations", "/v2/videos/generations", "/v2/videos/tasks"])
+        for request in self.media_requests:
+            headers = request.headers
+            for name in ("x-conversation-id", "x-request-id", "x-conversation-message-id", "traceparent"):
+                self.assertTrue(headers.get(name), (request.url.path, name))
+            # cn-cli reuses one id for the request and the message.
+            self.assertEqual(headers["x-request-id"], headers["x-conversation-message-id"])
+            self.assertRegex(headers["traceparent"], r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
+        # Media calls are not session-sticky: each one is its own conversation.
+        self.assertEqual(len({r.headers["x-conversation-id"] for r in self.media_requests}), 3)
+
+    def test_single_credential_media_requests_carry_session_headers(self):
+        self.enterContext(patch.dict(converter.CONFIG, {
+            "cred_pool": None, "cred": self.entries["cn-cli"]["cm"]}))
+        result = self.client.post("/v1/images/generations", json={"prompt": "x"})
+        self.assertEqual(result.status_code, 200, result.text)
+        headers = self.media_requests[0].headers
+        for name in ("x-conversation-id", "x-request-id", "x-conversation-message-id", "traceparent"):
+            self.assertTrue(headers.get(name), name)
+
+    def test_scoped_mode_media_requests_carry_the_request_conversation(self):
+        self.enterContext(patch.dict(converter.CONFIG, {"request_context_mode": "scoped"}))
+        result = self.client.post("/v1/images/generations", json={"prompt": "x"})
+        self.assertEqual(result.status_code, 200, result.text)
+        headers = self.media_requests[0].headers
+        self.assertRegex(headers["x-conversation-id"], r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+        self.assertEqual(headers["x-root-request-id"], result.headers["x-request-id"])
+        self.assertEqual(headers["x-request-id"], headers["x-conversation-message-id"])
 
     def test_admin_media_view_lists_models_and_usage(self):
         result = self.client.post("/v1/images/generations", json={"prompt": "x"})

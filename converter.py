@@ -2872,6 +2872,15 @@ def _check_admin_auth(authorization: Optional[str], x_api_key: Optional[str]):
     _check_auth(authorization, x_api_key)
 
 
+def _apply_session_headers(headers: dict, profile, skey: str | None, context) -> None:
+    """Add the conversation and trace headers every upstream call carries."""
+    identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
+    if context is not None and context.scoped:
+        headers["X-Conversation-ID"] = context.conversation_id(profile, identity)
+    else:
+        headers.update(_dynamic_request_headers(f"{profile}:{identity}:{skey}" if skey else None, profile=profile))
+
+
 def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(), requirements=None,
               sticky=True):
     """Select a fresh credential lease and headers, excluding tried accounts; report unavailable capacity.
@@ -2924,11 +2933,7 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(),
     profile = profile_for_headers(headers)
     if not _in_region(profile, region):
         raise HTTPException(status_code=503, detail={"error": {"message": "未找到指定地域凭据", "type": "auth_error"}})
-    identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
-    if context is not None and context.scoped:
-        headers["X-Conversation-ID"] = context.conversation_id(profile, identity)
-    else:
-        headers.update(_dynamic_request_headers(f"{profile}:{identity}:{skey}" if skey else None, profile=profile))
+    _apply_session_headers(headers, profile, skey, context)
     return cm, headers
 
 
@@ -5130,9 +5135,11 @@ def _media_cred_for(model, tried=()):
                 "message": "未找到可用的媒体生成凭证，请先在桌面端登录 CodeBuddy", "type": "auth_error"}})
         with cm._lock:
             headers = cm.get_headers()
-        if profile_for_headers(headers) not in media_generation.MEDIA_PROFILES:
+        profile = profile_for_headers(headers)
+        if profile not in media_generation.MEDIA_PROFILES:
             raise HTTPException(status_code=503, detail={"error": {
                 "message": "当前凭证产品不支持媒体生成", "type": "auth_error"}})
+        _apply_session_headers(headers, profile, None, current_context())
         return cm, headers
     policy = model_policy.view(CONFIG)
     accounts = CONFIG.get("account_catalogs") or {}
@@ -5163,7 +5170,8 @@ def _media_cred_for(model, tried=()):
         except Exception as error:
             pool.cooldown(cm, reason=str(error), generation=cm._generation)
             continue
-        if profile_for_headers(headers) not in media_generation.MEDIA_PROFILES:
+        profile = profile_for_headers(headers)
+        if profile not in media_generation.MEDIA_PROFILES:
             continue
         lease = pool._capacity.acquire(pool._capacity_key(entry),
                                        CONFIG.get("max_inflight_per_account", 0), cm, generation)
@@ -5173,6 +5181,7 @@ def _media_cred_for(model, tried=()):
         resources = request_resources.get()
         if resources is not None:
             resources.add(lease)
+        _apply_session_headers(headers, profile, None, current_context())
         return lease, headers
     if busy:
         raise HTTPException(status_code=503, headers={"Retry-After": "3"}, detail={"error": {
@@ -5191,23 +5200,36 @@ def _media_bound_cred(account_identity: str):
         if cm is None:
             raise HTTPException(status_code=503, detail={"error": {
                 "message": "任务绑定的凭证不存在，无法查询", "type": "auth_error"}})
-        with cm._lock:
-            return cm, cm.get_headers()
-    with pool._lock:
-        entry = next((e for e in pool._entries if e.get("account_key") == account_identity), None)
-    if entry is None:
-        raise HTTPException(status_code=409, detail={"error": {
-            "message": "提交该任务的账号已移出凭证池，无法查询；请重新提交任务",
-            "type": "invalid_request_error", "code": "account_removed"}})
-    with entry["cm"]._lock:
-        return entry["cm"], entry["cm"].get_headers()
+    else:
+        with pool._lock:
+            entry = next((e for e in pool._entries if e.get("account_key") == account_identity), None)
+        if entry is None:
+            raise HTTPException(status_code=409, detail={"error": {
+                "message": "提交该任务的账号已移出凭证池，无法查询；请重新提交任务",
+                "type": "invalid_request_error", "code": "account_removed"}})
+        cm = entry["cm"]
+    with cm._lock:
+        headers = cm.get_headers()
+    _apply_session_headers(headers, profile_for_headers(headers), None, current_context())
+    return cm, headers
 
 
 def _media_replayable(error) -> bool:
     """Replay only when the body was never accepted or upstream explicitly refused."""
     if isinstance(error, UpstreamHTTPError):
-        return error.status in (401, 403, 429)
+        # Restricted and model-scoped refusals would fail the same way on another account.
+        code = _upstream_diagnostic(error.raw)[0]
+        return error.status in (401, 403, 429) and code not in NO_FAILOVER_UPSTREAM_CODES
     return isinstance(error, REPLAYABLE_TRANSPORT)
+
+
+def _media_note_restriction(cred, code, body=None) -> bool:
+    """Disable an account the upstream reports as restricted; other refusals leave its health alone."""
+    pool = CONFIG.get("cred_pool")
+    if pool is None:
+        return False
+    cm, generation = cred if isinstance(cred, tuple) else (cred, None)
+    return pool.note_restriction(cm, code, body=body, generation=generation)
 
 
 async def _media_call(action: _MediaAction, body: dict, rid: str, *, model, parse,
@@ -5230,11 +5252,11 @@ async def _media_call(action: _MediaAction, body: dict, rid: str, *, model, pars
                                        rid=rid, model_name=action.name) as response:
                 if response.status_code != 200:
                     raw = await read_bounded_error(response)
-                    code, message, _ = _upstream_diagnostic(raw)
+                    code, message, error_body = _upstream_diagnostic(raw)
                     observe_attempt("upstream_error", status_code=response.status_code,
                                     upstream_code=code, upstream_msg=message)
-                    # Health isolation: only 401 reaches the cooldown/refresh path.
-                    if response.status_code == 401:
+                    # Health isolation: only a restriction code or 401 reaches the cooldown/refresh path.
+                    if not _media_note_restriction(cred, code, error_body) and response.status_code == 401:
                         _note_cred_status(cred, 401, raw=raw)
                     raise UpstreamHTTPError(
                         response.status_code, raw,
@@ -5245,6 +5267,7 @@ async def _media_call(action: _MediaAction, body: dict, rid: str, *, model, pars
             except media_generation.MediaUpstreamError as error:
                 # A business refusal may already be billed; never replay it on another account.
                 observe_failure("media_upstream_refused")
+                _media_note_restriction(cred, error.upstream_code, _upstream_diagnostic(raw)[2])
                 raise HTTPException(status_code=502, detail={"error": {
                     "message": f"上游媒体接口返回错误 {error.upstream_code}：{error.message}",
                     "type": "upstream_error", "upstream_code": error.upstream_code}}) from None
