@@ -200,7 +200,7 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 upstream = self.fx.requests[-1].content.decode("utf-8")
                 self.assertNotIn(source, upstream)
-                self.assertGreaterEqual(upstream.count("You are a helpful AI assistant"), 2)
+                self.assertGreaterEqual(upstream.count("You are WorkBuddy, a powerful AI assistant"), 2)
 
     def test_legacy_workbuddy_attempt_ids_are_independent(self):
         for profile in ("cn-work", "intl-work"):

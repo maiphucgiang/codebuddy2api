@@ -109,11 +109,16 @@ _PATTERN = re.compile(
 )
 
 # Limit substitutions to known templates without globally stripping whitespace.
-def _template_pattern(text: str) -> re.Pattern:
+def _template_source(text: str) -> str:
     words = [(_ZWSP + "*").join(re.escape(char) for char in word) for word in text.split(" ")]
-    return re.compile(r"(?<!\w)" + r"[\s\u200b]+".join(words) + _ZWSP + r"*(?!\w)", re.IGNORECASE)
+    return r"[\s\u200b]+".join(words) + _ZWSP + r"*"
 
 
+def _template_pattern(text: str) -> re.Pattern:
+    return re.compile(r"(?<!\w)" + _template_source(text) + r"(?!\w)", re.IGNORECASE)
+
+
+_DSH_WORKBUDDY_IDENTITY = "You are WorkBuddy, a powerful AI assistant"
 _WORKBUDDY_IDENTITY = "You are CodeBuddy, Tencent's official CLI"
 _CLAUDE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude"
 _TEMPLATE_REPLACEMENTS = tuple(
@@ -123,12 +128,21 @@ _TEMPLATE_REPLACEMENTS = tuple(
         ("You are a Claude agent, built on Anthropic's Claude Agent SDK", _WORKBUDDY_IDENTITY),
         ("Main branch (you will usually use this for PRs)",
          "Main branch (you will usually use this for PR)"),
-        ("You are an AI agent powered by DeepSeek Harness.", "You are a helpful AI assistant."),
+        ("You are an AI agent powered by DeepSeek Harness.", _DSH_WORKBUDDY_IDENTITY + "."),
     )
 )
 _WORKBUDDY_IDENTITY_PATTERN = _template_pattern(_WORKBUDDY_IDENTITY)
 _CHANNEL_IDENTITY_PATTERN = _template_pattern("You are an AI agent powered by DeepSeek Harness")
-_CHANNEL_IDENTITY_FIXED = "You are a helpful AI assistant"
+_DSH_CODING_PATTERN = re.compile(
+    r"(?<!\w)" + _template_source("You are a coding agent powered by the")
+    + r"[\s\u200b]+(?P<model>[^\r\n]{1,200}?)[\s\u200b]+"
+    + _template_source("model") + r"(?!\w)",
+    re.IGNORECASE,
+)
+_DSH_MINIMAL_PATTERN = _template_pattern("You are a helpful software engineer assistant")
+_DSH_DIRECT_PATTERN = _template_pattern("You are DeepSeek Harness")
+_DSH_WEB_GUI_PATTERN = _template_pattern("DeepSeek Harness Web GUI")
+_CHANNEL_IDENTITY_FIXED = _DSH_WORKBUDDY_IDENTITY
 _GIT_STATUS_CONTEXT = re.compile(
     r"^\s*(?:gitStatus:\s*|#\s*gitStatus\s*\n)"
     r"This is the git status at the start of the conversation\.", re.IGNORECASE | re.MULTILINE,
@@ -228,11 +242,20 @@ def desensitize_text(text: str) -> str:
     return _PATTERN.sub(lambda m: _zero_width_split(m.group(0)), text)
 
 
+def _replace_dsh_coding_persona(match: re.Match) -> str:
+    model = match.group("model").strip()
+    return f"{_DSH_WORKBUDDY_IDENTITY}. This conversation is powered by the {model} model"
+
+
 def desensitize_channel_text(text: str) -> str:
-    """Replace only the known DSH channel identity sentence."""
+    """Convert official DSH role prompts without changing unrelated brand references."""
     if not text:
         return text
-    return _CHANNEL_IDENTITY_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
+    text = _DSH_CODING_PATTERN.sub(_replace_dsh_coding_persona, text)
+    text = _CHANNEL_IDENTITY_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
+    text = _DSH_MINIMAL_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
+    text = _DSH_DIRECT_PATTERN.sub(_CHANNEL_IDENTITY_FIXED, text)
+    return _DSH_WEB_GUI_PATTERN.sub("WorkBuddy Web GUI", text)
 
 
 def _iter_text_blocks(content):

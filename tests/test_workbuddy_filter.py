@@ -453,8 +453,8 @@ class EndpointFilterTests(unittest.TestCase):
                     {"role": "user", "content": source},
                 ]}
                 out = converter._chat_body_desensitize(body)
-                self.assertEqual(out["messages"][0]["content"], "You are a helpful AI assistant.")
-                self.assertEqual(out["messages"][1]["content"], "You are a helpful AI assistant.")
+                self.assertEqual(out["messages"][0]["content"], "You are WorkBuddy, a powerful AI assistant.")
+                self.assertEqual(out["messages"][1]["content"], "You are WorkBuddy, a powerful AI assistant.")
                 self.assertEqual(out["messages"][2]["content"], source)
 
     def test_short_template_is_not_expanded_for_filter_retry(self):
