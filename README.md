@@ -47,6 +47,9 @@ The template binds to localhost only. Configure HTTPS and restrict network acces
 | Anthropic Messages | `http://127.0.0.1:8787` |
 | MCP (web_search + web_fetch) | `http://127.0.0.1:8787/v1/mcp` |
 | REST web search / fetch | `POST http://127.0.0.1:8787/v1/search` / `POST http://127.0.0.1:8787/v1/fetch` |
+| Image & video generation | `POST http://127.0.0.1:8787/v1/images/generations` / `POST /v1/images/edits` / `POST /v1/videos` |
+
+- Media generation is billed per upstream credit and only routes to verified account products; see [Media generation](docs/clients.md#media-generation).
 
 - **API key:** the same key used to sign in to the WebUI.
 - **Model:** a public ID from the WebUI or `GET /v1/models`.

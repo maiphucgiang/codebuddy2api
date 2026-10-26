@@ -12,6 +12,7 @@ from .backups import Backups
 from .control_store import ControlStore
 from .gateway_management import Management, install_pages
 from .inference_auth import InferenceAuthMiddleware
+from .media_store import MediaStore
 from .model_policy import PolicyScopeMiddleware
 from .observability import AuditMiddleware
 from .settings import SCHEMA, apply_persisted_settings
@@ -104,6 +105,11 @@ def initialize(gateway, args, argv=None, *, parser=None, dotenv_keys=()):
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
         config["audit_store"] = UnavailableAudit(type(error).__name__)
         print("[audit] 日志库不可用，推理服务继续；请检查目录权限或使用备份恢复日志库。", file=sys.stderr)
+    try:
+        config["media_store"] = MediaStore(root)
+    except (OSError, ValueError, sqlite3.Error) as error:
+        config["media_store"] = None
+        print(f"[media] 媒体存储不可用（{type(error).__name__}），图像/视频接口将返回 503。", file=sys.stderr)
     config["management"] = Management(gateway)
     config["backups"] = Backups(config, data_dir=root, version=gateway.APP_VERSION)
     config["updater"] = Updater(config, root=Path(gateway.__file__).resolve().parent,
@@ -127,7 +133,7 @@ def install(gateway):
 
 
 def close(config):
-    for key in ("audit_store", "control_store"):
+    for key in ("audit_store", "control_store", "media_store"):
         store = config.get(key)
         if store is not None:
             store.close()

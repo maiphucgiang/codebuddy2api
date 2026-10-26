@@ -4042,3 +4042,115 @@ $white: var(--page);
     transform: translateY(-10px) scale(0.97);
   }
 }
+
+/* Media library: a responsive card grid over the shared glass system. */
+.mediaGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 14px;
+}
+.mediaCard {
+  @include glass-well;
+  display: block;
+  width: 100%;
+  padding: 0;
+  border-radius: 16px;
+  overflow: hidden;
+  text-align: start;
+  cursor: pointer;
+  transition:
+    transform 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.mediaCard:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow);
+}
+.mediaCard:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mediaThumb {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  background: var(--soft);
+  color: var(--muted);
+}
+.mediaThumb.isVideo {
+  aspect-ratio: 16 / 9;
+}
+.mediaThumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.mediaMeta {
+  padding: 10px 12px;
+  display: grid;
+  gap: 3px;
+}
+.mediaMeta small {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.mediaMeta strong {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usageMeter {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--soft);
+  overflow: hidden;
+}
+.usageMeter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+.usageMeter.warn > span {
+  background: var(--warning);
+}
+.usageMeter.full > span {
+  background: var(--error);
+}
+.mediaPreview {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  margin-inline: auto;
+  object-fit: contain;
+  border-radius: 14px;
+  background: var(--card);
+}
+@media (max-width: 600px) {
+  .mediaGrid {
+    grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  }
+}
+
+/* Media page helpers. */
+.mediaPreviewWrap {
+  display: grid;
+  place-items: center;
+  margin-bottom: 14px;
+}
+.errorText {
+  color: var(--error);
+  font-size: 13px;
+  margin: -6px 0 10px;
+}
+.warnText {
+  color: var(--warning);
+}
+@media (prefers-reduced-motion: reduce) {
+  .mediaCard:hover {
+    transform: none;
+  }
+}

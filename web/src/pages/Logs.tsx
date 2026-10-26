@@ -345,6 +345,18 @@ export function Logs() {
                                       ? t(eventKindLabel(item.kind)!)
                                       : item.kind,
                                 )}
+                                {kind === "request" &&
+                                  (item.protocol === "images" || item.protocol === "videos") && (
+                                    <span className={s.toolBadge}>
+                                      <Badge tone="neutral">
+                                        {t(
+                                          item.protocol === "images"
+                                            ? "val.protocol.images"
+                                            : "val.protocol.videos",
+                                        )}
+                                      </Badge>
+                                    </span>
+                                  )}
                                 {tools && (
                                   <span className={s.toolBadge}>
                                     <Badge tone={tools.failed ? "bad" : "neutral"}>

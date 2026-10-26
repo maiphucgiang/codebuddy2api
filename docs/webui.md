@@ -49,6 +49,14 @@ Filter requests and inspect failed attempts. Closing details or switching log ty
 
 Clearing **all logs and statistics** is irreversible. Enter the confirmation text shown in the dialog and re-enter the current API key. This does not delete credentials or gateway settings.
 
+## Media
+
+The **Media** page shows locally stored generation results: usage against the capacity limit, image and video totals, and active or failed video tasks.
+
+- **Library** lists assets newest first with model, size and remaining retention; a card opens the preview drawer with metadata, download and a two-step delete. **Video tasks** refresh in-flight tasks on their bound account and link finished videos back to the library. **Models** is a read-only table of media models and how many accounts could currently serve them.
+- Images are only stored when an asset base URL is configured; without it they are returned inline as base64. Videos are always stored locally, and their link appears once the base URL is set.
+- **Media settings** (`media_public_base_url`, `media_max_total_mb`, `media_ttl_hours`) set the public link prefix, capacity (64–1048576 MB) and retention (1–8760 hours). Shrinking either evicts the oldest assets on the next write or scheduled cleanup. Assets are also served publicly at `/v1/media/…` with immutable caching; see [Media generation](clients.md#media-generation).
+
 ## Settings
 
 Edit unlocked options; hot changes apply immediately, while restart-marked settings require a manual restart. Change locked options in the startup configuration; see [configuration precedence](advanced.md#configuration-and-cli). The Dashboard banner lists runtime keys still taken from `.env`; stop the service, migrate them with `python3 converter.py config migrate`, or dismiss the banner once — after either action it never returns, even if `.env` gains more keys.
@@ -106,6 +114,7 @@ Data defaults to `auth/`, or `/data/auth` inside Docker. Local installs can set 
 | `*.info` | Official plaintext credentials; never migrated into SQLite |
 | `control.sqlite3` | Settings, private default key, model rules, sessions, cooldowns, credit/reward state, usage and catalogs |
 | `logs.sqlite3` | Request details and independent aggregate statistics |
+| `media/` + `media.sqlite3` | Generated media files and their metadata; kept for the retention period and never included in configuration backups |
 
 Auditing defaults to 30-day detail retention and a 256 MiB logical detail budget, **not a hard limit on database or directory disk usage**. Detail cleanup and eviction preserve aggregates. SQLite failure diagnostics have a separate budget, defaulting to 8192 bytes. Existing text logs are retained, not backfilled as precise statistics.
 

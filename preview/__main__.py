@@ -30,6 +30,7 @@ def prepare(directory: Path) -> Path:
         sys.exit(f"预览数据目录必须为空或由预览服务创建：{directory}")
     seed.write_credentials(directory)
     seed.write_history(directory / "logs.sqlite3")
+    seed.write_media(directory)
     (directory / MARKER).write_text("codebuddy2api preview data\n", encoding="utf-8")
     return directory
 

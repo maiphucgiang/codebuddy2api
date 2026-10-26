@@ -149,5 +149,10 @@ def search_url_for_headers(headers: dict) -> str:
 def fetch_url_for_headers(headers: dict) -> str:
     return PROFILE_ENDPOINTS[profile_for_headers(headers)] + "/agenttool/v1/webfetch"
 
+def media_url_for_headers(headers: dict, path: str) -> str:
+    """Map one media endpoint path onto the credential's fixed product endpoint."""
+    return PROFILE_ENDPOINTS[profile_for_headers(headers)] + path
+
+
 def refresh_url_for_auth(auth: dict) -> str:
     return PROFILE_ENDPOINTS[profile_for_auth(auth)] + _REFRESH_PATH

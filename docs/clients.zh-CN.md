@@ -99,6 +99,17 @@ curl http://127.0.0.1:8787/v1/fetch -H "Authorization: Bearer YOUR_API_KEY" \
 - 网关执行的工具不会产生独立的审计记录：每次执行在触发它的请求中记为一条 `server_tool` 尝试（`model` 为 `web-search`／`web-fetch`，含结果、错误码、profile、凭证、尝试次数与耗时），该请求仍保留自己的模型、profile 与结果；其用量为所有上游轮次之和。
 - 网关按请求选号，并按网关 failover 配置做一次换号重试；上游确定性拒绝原样返回。
 
+## 媒体生成
+
+图像与视频端点，上游为 `/v2/images/*` 与 `/v2/videos/*`；每次请求按上游积分计费。
+
+- `POST /v1/images/generations`：`{"prompt", "model?", "size?", "n?"（≤4）, "quality?", "response_format?"}` → `{"created", "data": [{url | b64_json, revised_prompt?}], "usage"?}`。
+- `POST /v1/images/edits`：OpenAI 风格 JSON：`{"prompt", "images": [{"image_url": "https://… | data:…"}], "model?", "size?", "input_fidelity?"}`；不支持 multipart。
+- `POST /v1/videos`：`{"prompt?", "image_url?", "seconds?"（整数或数字字符串）, "resolution?"（"768P"|"2K"）, "aspect_ratio?", "enable_audio?", "model?"}` → `{"id", "object": "video", "status": "queued", …}`；用 `GET /v1/videos/{id}` 轮询，`GET /v1/videos/{id}/content` 获取完成的视频。
+- 未配置资源访问地址（`media_public_base_url`，WebUI「媒体生成」页）时，图片一律返回 `b64_json`，已保存的视频不回传链接；视频始终落盘到 `media/`，配置后即可获得链接。资源经 `/v1/media/{images|videos}/{id}` 公开读取，带不可变缓存头。
+- 默认模型按族固定：文生图 `hunyuan-image-v3.0`、图生图 `hunyuan-image-v2.0-general-edit`、视频 `minimax-video-h3`。静态清单 ∪ 账号目录之外的模型返回 400；媒体模型打到聊天端点会被拒绝并指引到本节。授权类拒绝以上游为最终裁决。
+- 按请求选号，仅限已实测可用的媒体产品（当前为 `cn-cli`），要求目录包含该模型且余额为正；被明确拒绝（401/403/429）时可按 failover 配置换号重试一次，5xx 与超时一律不重放以避免重复扣费。视频任务始终绑定提交账号查询。
+
 ## 值得了解的协议行为
 
 - 先将 `developer` 转为 `system` 并置顶首条系统消息，再关联工具结果；不改动调用方原始载荷。

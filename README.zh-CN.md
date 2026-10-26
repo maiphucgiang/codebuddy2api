@@ -47,6 +47,9 @@ Compose 默认拉取 `latest`（`CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebu
 | Anthropic Messages | `http://127.0.0.1:8787` |
 | MCP（web_search + web_fetch 工具） | `http://127.0.0.1:8787/v1/mcp` |
 | REST 联网搜索 / 抓取 | `POST http://127.0.0.1:8787/v1/search` / `POST http://127.0.0.1:8787/v1/fetch` |
+| 图像 / 视频生成 | `POST http://127.0.0.1:8787/v1/images/generations` / `POST /v1/images/edits` / `POST /v1/videos` |
+
+- 媒体生成按上游积分计费，只路由到已实测验证的账号产品；见[媒体生成](docs/clients.zh-CN.md#媒体生成)。
 
 - **API Key**：与 WebUI 登录使用同一个密钥。
 - **模型**：使用 WebUI 中的对外 ID，或查询 `GET /v1/models`。

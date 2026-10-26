@@ -19,16 +19,17 @@ import zlib
 
 import httpx
 
+from app import media_generation
 from app.site_routing import DOMAIN_PROFILES, PROFILE_DOMAINS
-from preview.seed import ACCOUNTS, CN_MODELS, DAY, INTL_MODELS, Account
-
+from preview.seed import (ACCOUNTS, CN_MODELS, COS_HOST, DAY, INTL_MODELS, MP4_BYTES, PNG_BYTES,
+                          SEED_VIDEO_TASK_ID, Account)
 DIRECTIVE = re.compile(r"\[preview:(\w+)(?:=([\w.-]+))?\]")
 TOKEN = re.compile(r"preview-([a-z0-9]+)-(\d+|refresh)")
 TRAVEL_SECONDS = 180
 ARCHIVE_CHUNK = 64 * 1024
 DAILY_TRIPS = 3
 LOGIN_SECONDS = 4
-
+VIDEO_SECONDS = 6  # Preview video tasks complete fast enough to demo end to end.
 # Rates are per-model multipliers in the catalog's own "x1.00" format.
 MODELS = {
     "glm-5.1": {"name": "GLM-5.1", "vendor": "Zhipu", "credits": "x0.30", "maxInputTokens": 200000,
@@ -142,6 +143,10 @@ class Upstream:
         self._missing: set = set()
         self._guests = itertools.count(1)
         self._logins: dict = {}
+        # One in-progress task seeded on disk that this simulation can finish on demand.
+        self._video_tasks = {SEED_VIDEO_TASK_ID: {
+            "owner": "aurora", "model": "hunyuan-video-art",
+            "at": time.time() - VIDEO_SECONDS - 1, "charged": False, "url": None}}
         self.states = {account.key: self._state_for(account) for account in accounts}
         self.routes = {
             "/v2/plugin/auth/token/refresh": self.refresh,
@@ -160,6 +165,10 @@ class Upstream:
             "/console/chat/completions": self.chat,
             "/agenttool/v1/search": self.search,
             "/agenttool/v1/webfetch": self.webfetch,
+            "/v2/images/generations": self.images,
+            "/v2/images/edits": self.images,
+            "/v2/videos/generations": self.video_submit,
+            "/v2/videos/tasks": self.video_tasks,
             "/activity/growth/buddy/info": self.buddy_info,
             "/activity/growth/buddy/travel/status": self.travel_status,
             "/activity/growth/buddy/travel/config": self.travel_config,
@@ -212,6 +221,8 @@ class Upstream:
             return self.releases()
         if path.endswith(".tar.gz"):
             return self.archive(request.url.host)
+        if request.url.host == COS_HOST:
+            return self.media_file(request)
         handler, arguments = self.routes.get(path), ()
         if handler is None:
             handler, arguments = next(((h, m.groups()) for pattern, h in self.patterns
@@ -292,9 +303,16 @@ class Upstream:
                    "descriptionZh": f"{MODELS[key]['name']}（预览数据）",
                    "descriptionEn": f"{MODELS[key]['name']} (preview data)"}
                   for key in state.account.models]
+        # Media models stay out of chat routing (supportsToolCall False) but join the
+        # account catalog so the gateway's media selection sees them as members.
+        models.extend({"id": name, "name": name, "supportsToolCall": False,
+                       "tags": ["video" if name in media_generation.VIDEO_MODELS else "image"],
+                       "credits": "x1.00"}
+                      for name in state.account.media)
+        agents = [{"name": "cli", "tags": ["default"],
+                   "models": list(state.account.models) + list(state.account.media)}]
         models[0]["isDefault"] = True
-        return ok({"models": models, "agents": [{"name": "cli", "tags": ["default"],
-                                                 "models": list(state.account.models)}]})
+        return ok({"models": models, "agents": agents})
 
     def console_accounts(self, request, body, state):
         account = state.account
@@ -421,6 +439,48 @@ class Upstream:
                               "content": f"# 预览环境为 {url} 生成的抓取内容。\n\n正文摘要。",
                               "content_type": "text/markdown", "content_length": 64,
                               "truncated": False, "status_code": 200})
+
+    # -- media generation ----------------------------------------------------------------
+
+    def media_file(self, request):
+        """Serve the simulated COS bucket the media endpoints hand signed URLs for."""
+        if request.url.path.endswith(".mp4"):
+            return Reply(chunks=[MP4_BYTES], media="video/mp4")
+        return Reply(chunks=[PNG_BYTES], media="image/png")
+
+    def images(self, request, body, state):
+        model = str(body.get("model") or "")
+        if model in media_generation.VIDEO_MODELS:
+            return fail(500, "model family not served on this endpoint")
+        if model not in media_generation.IMAGE_TEXT_MODELS and model not in media_generation.IMAGE_EDIT_MODELS:
+            return fail(400, "route config not found")
+        count = max(1, min(int(body.get("n") or 1), 4))
+        prompt = str(body.get("prompt") or "")[:60]
+        items = [{"url": f"https://{COS_HOST}/images/{uuid.uuid4().hex}.png",
+                  "revised_prompt": f"预览图像：{prompt}"} for _ in range(count)]
+        return ok({"data": items, "usage": {"credit": None}})
+
+    def video_submit(self, request, body, state):
+        model = str(body.get("model") or "")
+        if model not in media_generation.VIDEO_MODELS:
+            return fail(400, "route config not found")
+        task_id = uuid.uuid4().hex
+        self._video_tasks[task_id] = {"owner": state.account.key, "model": model,
+                                      "at": time.time(), "charged": False, "url": None}
+        return ok({"id": task_id})
+
+    def video_tasks(self, request, body, state):
+        task_id = str(body.get("task_id") or "")
+        task = self._video_tasks.get(task_id)
+        if task is None or task["owner"] != state.account.key:
+            return fail(404, "task not found")
+        if time.time() - task["at"] < VIDEO_SECONDS:
+            return ok({"status": "processing"})
+        if not task["charged"]:
+            task["charged"] = True
+            task["url"] = f"https://{COS_HOST}/videos/{task_id}.mp4"
+            self._charge(state, 5.0)
+        return ok({"status": "completed", "data": [{"url": task["url"]}], "usage": {"credit": 5.0}})
 
     # -- growth center ------------------------------------------------------------------
 

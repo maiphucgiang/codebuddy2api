@@ -99,6 +99,17 @@ curl http://127.0.0.1:8787/v1/fetch -H "Authorization: Bearer YOUR_API_KEY" \
 - Search results are not lost between turns. The model sees each result's title, link and snippet; emitted `web_search_result` blocks carry the snippet in a gateway-owned `encrypted_content` value (`cb2api:` prefix) and `web_search_call` items list `action.sources`. Clients that echo these items back (`server_tool_use`, `web_search_tool_result`, `web_fetch_tool_result`, `web_search_call`) get them replayed to the model as plain text context, not as tool calls. Other `encrypted_content` values, such as real Anthropic blobs, are ignored. Dated OpenAI types such as `web_search_preview_2025_03_11` and `web_search_2025_08_26` are accepted like their undated forms.
 - Gateway-executed tools do not create audit records of their own: each shows up as one `server_tool` attempt (`model` `web-search` or `web-fetch`, outcome, error code, profile, credential, tries, duration) inside the request that triggered it, which keeps its own model, profile and outcome. Its usage is the sum over every upstream round.
 
+## Media generation
+
+Image and video endpoints backed by the upstream `/v2/images/*` and `/v2/videos/*` services; each request is billed with upstream credits.
+
+- `POST /v1/images/generations` — `{"prompt", "model?", "size?", "n?" (≤4), "quality?", "response_format?"}` → `{"created", "data": [{url | b64_json, revised_prompt?}], "usage"?}`.
+- `POST /v1/images/edits` — OpenAI-style JSON: `{"prompt", "images": [{"image_url": "https://… | data:…"}], "model?", "size?", "input_fidelity?"}`; multipart is not supported.
+- `POST /v1/videos` — `{"prompt?" , "image_url?", "seconds?" (int or numeric string), "resolution?" ("768P"|"2K"), "aspect_ratio?", "enable_audio?", "model?"}` → `{"id", "object": "video", "status": "queued", …}`; poll with `GET /v1/videos/{id}` and fetch finished videos via `GET /v1/videos/{id}/content`.
+- Without the asset base URL (`media_public_base_url`, WebUI **Media**) images always return `b64_json` and saved videos expose no link; videos are always stored locally under `media/` and the link appears once the base URL is set. Assets are served publicly at `/v1/media/{images|videos}/{id}` with immutable caching.
+- Defaults are fixed per family: `hunyuan-image-v3.0` (text to image), `hunyuan-image-v2.0-general-edit` (edit), `minimax-video-h3` (video). Models outside the static list ∪ account catalog are rejected with 400, and media models are refused on the chat endpoints with a pointer here. Upstream stays the final judge of model authorization.
+- Accounts are picked per request from verified media-capable products only (currently `cn-cli`), require catalog membership and a positive balance, and a refused request (401/403/429) may be retried once on another account per the failover setting; 5xx and timeouts are never replayed to avoid double billing. Video tasks always stay bound to the account that submitted them.
+
 ## Protocol behavior worth knowing
 
 - `developer` messages become `system`; the first system message is placed first before matching tool results, without mutating the original payload.
