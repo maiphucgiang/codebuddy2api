@@ -1,4 +1,5 @@
 import axios from "axios";
+import { installPublicDemoAdapter } from "./publicDemo";
 import { create } from "zustand";
 import { useCallback, useEffect, useState } from "react";
 
@@ -15,6 +16,7 @@ export const useSession = create<AuthState>(() => ({
   error: null,
 }));
 export const api = axios.create({ baseURL: "/admin", withCredentials: true, timeout: 20000 });
+installPublicDemoAdapter(api);
 api.interceptors.request.use((config) => {
   const csrf = useSession.getState().csrf;
   if (csrf) config.headers.set("X-CSRF-Token", csrf);
@@ -243,6 +245,9 @@ export type ModelRule = {
   capabilities?: unknown;
   limits?: unknown;
   metadata_by_profile?: unknown;
+  media_kinds?: string[];
+  media_sources?: string[];
+  media_defaults?: string[];
 };
 function rateOverride(value: unknown): Record<string, number> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;

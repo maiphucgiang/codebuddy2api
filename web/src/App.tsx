@@ -6,6 +6,7 @@ import { Dashboard } from "./pages/Dashboard";
 import { Models } from "./pages/Models";
 import { Credentials } from "./pages/Credentials";
 import { Logs } from "./pages/Logs";
+import { Media } from "./pages/Media";
 import { Settings } from "./pages/Settings";
 import { Storage } from "./pages/Storage";
 import { Updates } from "./pages/Updates";
@@ -18,6 +19,7 @@ const navigation = [
   ["/models", "nav.models", "model"],
   ["/credentials", "nav.credentials", "key"],
   ["/logs", "nav.logs", "logs"],
+  ["/media", "nav.media", "image"],
   ["/storage", "nav.storage", "database"],
   ["/settings", "nav.settings", "settings"],
   ["/updates", "nav.updates", "up"],
@@ -245,6 +247,7 @@ export function AppRoutes() {
           <Route path="models" element={<Models />} />
           <Route path="credentials" element={<Credentials />} />
           <Route path="logs" element={<Logs />} />
+          <Route path="media" element={<Media />} />
           <Route path="settings" element={<Settings />} />
           <Route path="storage" element={<Storage />} />
           <Route path="updates" element={<Updates />} />

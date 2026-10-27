@@ -1,6 +1,7 @@
 """Read-only indexes over published account catalogs, built once per catalog revision."""
 from __future__ import annotations
 
+from .media_generation import catalog_kinds
 from .model_catalog_view import INTERNATIONAL, share_models
 
 
@@ -31,6 +32,7 @@ class CatalogIndex:
         self.policy_revision = policy_revision
         self._enabled = is_enabled or (lambda _identity: True)
         self._account: dict[tuple[int, str], list[dict] | None] = {}
+        self.media_kinds: dict[str, tuple] = {}  # model id → media kinds from serves tags.
         self._profile: dict[str, dict[str, tuple[dict, ...]]] = {}
         self.profiles: tuple[str, ...] = tuple(dict.fromkeys(
             account.get("profile") for account in self.accounts.values() if account.get("profile")))
@@ -44,6 +46,13 @@ class CatalogIndex:
                 items = self._effective(account, scope, sources)
                 if items is None:
                     continue
+                if scope == "serves":
+                    # Media membership comes from the root table; keep it O(1) per model.
+                    for item in items:
+                        kinds = catalog_kinds(item)
+                        if kinds and isinstance(item.get("id"), str):
+                            known = self.media_kinds.setdefault(item["id"], ())
+                            self.media_kinds[item["id"]] = tuple(dict.fromkeys(known + kinds))
                 merged.setdefault(profile, []).extend(items)
             self._profile[scope] = {name: tuple(items) for name, items in merged.items()}
 

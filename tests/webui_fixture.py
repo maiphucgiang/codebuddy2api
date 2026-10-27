@@ -17,11 +17,14 @@ import uvicorn
 import converter as gateway
 from app.audit_store import AuditStore
 from app.control_store import ControlStore
+from app.media_store import MediaStore
+from app.runtime_management import install, close
 from app.gateway_management import Management
 from app.runtime_management import install, close
 from app.settings import apply_persisted_settings
 from app.updates import Updater
 
+FIXTURE_PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x08\x00\x00\x00\x08\x08\x02\x00\x00\x00{\x14\xf6u\x00\x00\x00 IDAT\x08\x1dc`\x00\x00\x00\x82\x00\x81\xb5s\x1cJ\x00\x00\x00\x00IEND\xaeB`\x82"
 
 @asynccontextmanager
 async def fake_backend(url, headers, body, **kwargs):
@@ -67,6 +70,9 @@ def main():
         identity = pool.entries()[0]["account_key"]
         gateway.CONFIG.update(ledger=ledger, model_cache=None, account_catalogs={identity: {
             "profile": "cn-work", "models": [{"id": "fixture-model", "supportsToolCall": True, "credits": "x0.00"}]}})
+        media = MediaStore(root)
+        gateway.CONFIG["media_store"] = media
+        media.save_asset("image", FIXTURE_PNG, model="fixture-model", ttl_hours=72, max_total_bytes=1 << 30)
         pool._sync_pending.clear()
         pool._sync_event.clear()
         gateway.CONFIG["management"] = Management(gateway)

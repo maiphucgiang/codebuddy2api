@@ -3,8 +3,11 @@
 from dataclasses import dataclass, field
 import json
 import random
+import struct
 import time
 import uuid
+import zlib
+from pathlib import Path
 
 from app.audit_store import AuditStore
 from app.client_profiles import account_key
@@ -29,17 +32,46 @@ class Account:
     revoked: bool = False
     daily_requests: int = 6
     models: tuple = field(default=())
+    media: tuple = ()
 
 
 CN_MODELS = ("glm-5.1", "deepseek-v3.2", "kimi-k2", "claude-sonnet-4.6", "gpt-5.1")
 INTL_MODELS = ("claude-sonnet-4.6", "gpt-5.1", "gemini-2.5-pro")
 
+# Media models advertised by personal domestic CLI accounts; image models never join chat.
+CN_MEDIA_ALL = ("hunyuan-image-v3.0", "hunyuan-image-v3.0-art", "hy-image-3.5",
+                "gemini-3.0-pro-image", "hunyuan-image-v2.0-general-edit", "minimax-video-h3",
+                "hunyuan-video-art")
+CN_MEDIA_MIN = ("hunyuan-image-v3.0", "minimax-video-h3")
+
+# The simulated COS bucket the media endpoints hand out signed URLs for.
+COS_HOST = "cos.preview.invalid"
+SEED_VIDEO_TASK_ID = "previewvideotask0000000000000001"
+
+
+
+def _png(size, rgb) -> bytes:
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+PNG_BYTES = _png(48, (0x7C, 0x66, 0xDC))
+PNG_BYTES_ALT = _png(48, (0x2A, 0x9D, 0x8F))
+# A minimal ftyp-branded file: the store only sniffs headers, and the demo never plays it.
+MP4_BYTES = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"\x00" * 4096
+
 ACCOUNTS = (
-    Account("aurora", "cn-cli", "100001", "Aurora", daily_requests=14, models=CN_MODELS, packages=(
+    Account("aurora", "cn-cli", "100001", "Aurora", daily_requests=14, models=CN_MODELS,
+            media=CN_MEDIA_ALL, packages=(
         ("个人版订阅套餐", "plan-month", 1500, 2000, 18), ("签到奖励", "checkin", 24.5, 30, 3))),
     Account("breeze", "cn-work", "100002", "Breeze", daily_requests=8, models=CN_MODELS, packages=(
         ("新人权益包", "welcome", 600, 1000, 9), ("旅行奖励", "travel", 260, 300, 26))),
-    Account("cedar", "cn-cli", "100003", "Cedar", daily_requests=3, models=CN_MODELS, packages=(
+    Account("cedar", "cn-cli", "100003", "Cedar", daily_requests=3, models=CN_MODELS,
+            media=CN_MEDIA_MIN, packages=(
         ("活动奖励", "event", 42, 200, 2),)),
     Account("dune", "intl-cli", "200001", "Dune", daily_requests=6, models=INTL_MODELS, packages=(
         ("Pro plan", "pro", 420, 500, 21),)),
@@ -119,3 +151,27 @@ def _record(account: Account, started: float, rng: random.Random) -> dict:
         "attempts": [{"outcome": "error" if failed else "success", "credential": identity,
                       "status_code": status, "duration_ms": duration}],
     }
+
+
+def write_media(directory, now: float | None = None):
+    """Seed local media assets and video tasks so the dashboard media page opens populated."""
+    from app.media_store import MediaStore
+
+    now = time.time() if now is None else now
+    store = MediaStore(Path(directory))
+    try:
+        quota = {"ttl_hours": 72, "max_total_bytes": 1 << 30}
+        store.save_asset("image", PNG_BYTES, model="hunyuan-image-v3.0", **quota)
+        # A second image a moment older keeps the newest-first listing meaningful.
+        first = store.save_asset("image", PNG_BYTES_ALT, model="hy-image-3.5", **quota)
+        store._db.execute("UPDATE assets SET created=? WHERE id=?", (now - 3600, first["id"]))
+        store._db.commit()
+        video = store.save_asset("video", MP4_BYTES, model="minimax-video-h3", **quota)
+        aurora = account_key("cn-cli", "100001", "")
+        store.create_task("seedvideotask-complete", aurora, "cn-cli", "minimax-video-h3")
+        store.update_task("seedvideotask-complete", status="completed",
+                          media_id=video["id"], credit=12.5)
+        # Stays in progress until someone refreshes it; the simulated upstream knows this id.
+        store.create_task(SEED_VIDEO_TASK_ID, aurora, "cn-cli", "hunyuan-video-art")
+    finally:
+        store.close()

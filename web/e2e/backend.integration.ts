@@ -147,3 +147,48 @@ test("manual trial uses the real admin API and persists success and failed-attem
   ).toBe(false);
   expect(errors).toEqual([]);
 });
+
+test("real management API: media summary, settings round-trip and asset CSP", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/");
+  await page.getByLabel("API key", { exact: true }).fill("synthetic-e2e-key");
+  await page.getByRole("button", { name: "进入工作台" }).click();
+  await expect(page.getByRole("heading", { name: "运行概览" })).toBeVisible();
+
+  const summary = await (await page.request.get("/admin/media")).json();
+  expect(summary.available).toBe(true);
+  expect(summary.configured).toBe(false);
+  expect(summary.models.some((model: { id: string }) => model.id === "hunyuan-image-v3.0")).toBe(
+    true,
+  );
+
+  const session = await (await page.request.get("/admin/session")).json();
+  const settings = await (await page.request.get("/admin/settings")).json();
+  const saved = await page.request.patch("/admin/settings", {
+    headers: { Origin: "http://127.0.0.1:5175", "X-CSRF-Token": session.csrf_token },
+    data: {
+      revision: settings.revision,
+      values: { media_public_base_url: "https://media.example.com" },
+    },
+  });
+  expect(saved.status()).toBe(200);
+  const after = await (await page.request.get("/admin/media")).json();
+  expect(after.configured).toBe(true);
+  expect(after.base_url).toBe("https://media.example.com");
+
+  const listed = await (await page.request.get("/admin/media/assets")).json();
+  expect(listed.items.length).toBeGreaterThan(0);
+  const asset = listed.items[0];
+  expect(asset.public_url).toContain("/v1/media/images/");
+  const content = await page.request.get(`/admin/media/assets/${asset.id}/content`);
+  expect(content.status()).toBe(200);
+  expect(content.headers()["content-security-policy"]).toBe("sandbox; default-src 'none'");
+  expect(content.headers()["x-content-type-options"]).toBe("nosniff");
+  // The public read route serves the same bytes without any session or key.
+  const publicRead = await page.request.get(`/v1/media/images/${asset.id}`);
+  expect(publicRead.status()).toBe(200);
+  expect(publicRead.headers()["content-security-policy"]).toBe("sandbox; default-src 'none'");
+  expect((await publicRead.body()).length).toBe(asset.size);
+  expect(errors).toEqual([]);
+});

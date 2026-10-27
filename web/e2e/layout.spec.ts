@@ -104,3 +104,70 @@ test.describe("narrow layout", () => {
     expect(portaled).toBe(true);
   });
 });
+
+test.describe("media page", () => {
+  const mediaSummary = {
+    configured: false,
+    base_url: "",
+    locked: false,
+    available: true,
+    limit_bytes: 1073741824,
+    ttl_hours: 72,
+    usage: {
+      total_bytes: 327155712,
+      images: { count: 2, bytes: 100663296 },
+      videos: { count: 1, bytes: 226492416 },
+    },
+    tasks: { active: 1, failed: 0 },
+    models: [],
+  };
+  const mediaAssets = {
+    items: [
+      {
+        id: `img_${"a".repeat(32)}`,
+        kind: "image",
+        mime: "image/png",
+        size: 4096,
+        sha256: "0".repeat(64),
+        model: "hunyuan-image-v3.0",
+        created: 1789000000,
+        expires: 1789000000 + 71 * 3600,
+      },
+    ],
+    has_more: false,
+    next_cursor: null,
+  };
+
+  async function openMedia(page: Page) {
+    await page.route("**/admin/**", async (route) => {
+      const url = new URL(route.request().url());
+      const send = (json: unknown) => route.fulfill({ json, status: 200 });
+      if (url.pathname === "/admin/session") return send({ authenticated: true, csrf_token: "cs" });
+      if (url.pathname === "/admin/settings") return send(settings);
+      if (url.pathname === "/admin/media") return send(mediaSummary);
+      if (url.pathname === "/admin/media/assets") return send(mediaAssets);
+      return send({});
+    });
+    await page.goto("/dashboard/media");
+  }
+
+  test("cards reflow inside a 600px viewport", async ({ page }) => {
+    await page.setViewportSize({ width: 600, height: 900 });
+    await openMedia(page);
+    const overflow = await page.evaluate(() => {
+      const scroller = document.scrollingElement!;
+      return scroller.scrollWidth - scroller.clientWidth;
+    });
+    expect(overflow).toBeLessThanOrEqual(1);
+    await expect(page.getByRole("button", { name: /hunyuan-image-v3\.0/ })).toBeVisible();
+    await page.screenshot({ path: "test-results/media-600px.png", fullPage: true });
+  });
+
+  test("dark mode keeps the card grid readable", async ({ page }) => {
+    await page.emulateMedia({ colorScheme: "dark" });
+    await openMedia(page);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await expect(page.getByRole("button", { name: /hunyuan-image-v3\.0/ })).toBeVisible();
+    await page.screenshot({ path: "test-results/media-dark.png", fullPage: true });
+  });
+});

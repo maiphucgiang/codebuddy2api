@@ -352,6 +352,9 @@ class Management:
             facts.setdefault(row["id"], row)
         for source in model_policy.snapshot(self.CONFIG)["models"]:
             facts.setdefault(source, {"id": source, "credits": None, "credits_by_profile": {}})
+        for media in self.gateway.media_model_details():
+            row = facts.get(media["id"])
+            facts[media["id"]] = {**media, **(row or {})}
         result = []
         for source, row in facts.items():
             rule = model_policy.rule_for(self.CONFIG, source)
@@ -390,12 +393,16 @@ class Management:
         accepted, rejected = [], []
         if pool is None:
             return {"candidates": [], "excluded": []}
+        media = bool(self.gateway._media_all_kinds(upstream))
+        policy = model_policy.view(self.CONFIG)
         with pool._lock:
             for entry in pool.entries():
                 identity = entry.get("account_key")
                 profile = entry.get("profile")
                 reason = None
-                if not model_policy.credential_enabled(self.CONFIG, entry):
+                if media:
+                    reason = self.gateway._media_account_reason(entry, upstream, rule=rule, policy=policy)
+                elif not model_policy.credential_enabled(self.CONFIG, entry):
                     reason = "人工停用"
                 elif not rule.get("enabled", True):
                     reason = "模型已停用"
@@ -439,7 +446,7 @@ class Management:
 def install_pages(app, directory):
     """Fallback only applies to pages; management/client APIs never serve HTML."""
     root = Path(directory).resolve()
-    pages = {"", "models", "credentials", "logs", "storage", "settings", "updates", "login"}
+    pages = {"", "models", "credentials", "logs", "media", "storage", "settings", "updates", "login"}
     # Release detail pages carry the tag, whose dots would otherwise read as a file suffix.
     release_page = re.compile(r"updates/v\d+\.\d+\.\d+").fullmatch
     assets = StaticFiles(directory=root / "assets", check_dir=False)

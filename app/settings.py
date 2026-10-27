@@ -6,6 +6,7 @@ import os
 import re
 from urllib.parse import urlsplit
 
+from .media_generation import normalize_media_base_url
 
 def normalize_allowed_origins(value):
     """Normalize a comma/space separated origin list; bare hosts default to HTTPS."""
@@ -163,6 +164,14 @@ SCHEMA = {
     "backup_interval_hours": _item(24, "integer", "自动备份间隔（小时）", env="CODEBUDDY2API_BACKUP_INTERVAL_HOURS",
                                    minimum=1, maximum=720),
     "backup_keep": _item(7, "integer", "自动备份保留份数", env="CODEBUDDY2API_BACKUP_KEEP", minimum=1, maximum=100),
+    # Local media storage for generated images and videos (app/media_store.py).
+    "media_public_base_url": _item("", "string", "资源访问地址",
+                                   env="CODEBUDDY2API_MEDIA_BASE_URL", allow_empty=True, max_length=200,
+                                   validator=normalize_media_base_url),
+    "media_max_total_mb": _item(1024, "integer", "媒体容量上限（MB）",
+                                env="CODEBUDDY2API_MEDIA_MAX_TOTAL_MB", minimum=64, maximum=1048576),
+    "media_ttl_hours": _item(72, "integer", "媒体保留时长（小时）",
+                             env="CODEBUDDY2API_MEDIA_TTL_HOURS", minimum=1, maximum=8760),
     # Interface preference: WebUI and `--lang` write it, nothing maps it from the environment.
     "language": _item("auto", "string", "界面语言", choices=["auto", "zh", "en"],
                       env_scope="ui", lockable=False),

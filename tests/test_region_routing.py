@@ -55,6 +55,11 @@ def success_sse():
             + "data: [DONE]\n\n").encode()
 
 
+def chat_model_ids(response):
+    """Exclude media routes when asserting the legacy chat catalog."""
+    return {item["id"] for item in response.json()["data"] if not item.get("media_kinds")}
+
+
 class RegionRoutingTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -520,7 +525,7 @@ class RegionRoutingTests(unittest.TestCase):
         response = self.client.get("/v1/models")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["object"], "list")
-        actual = {item["id"] for item in response.json()["data"]}
+        actual = chat_model_ids(response)
         expected = {item["id"] for items in catalogs().values() for item in items}
         self.assertEqual(actual, expected | {"auto"})
 
@@ -574,7 +579,7 @@ class RegionRoutingTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
             if response.status_code == 200:
                 expected = {m["id"] for profile in eligible for m in catalogs()[profile]}
-                self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"}, expected)
+                self.assertEqual(chat_model_ids(response) - {"auto"}, expected)
                 if not eligible:
                     self.assertEqual(response.json()["data"], [])
         self.assertFalse(self.requests)
@@ -599,7 +604,7 @@ class RegionRoutingTests(unittest.TestCase):
                     self.assertIn(response.status_code, (200, 503), response.text)
                     if response.status_code == 200:
                         expected = ({"first-only"} if balance != 0 else set()) | ({"second-only"} if missing else set())
-                        self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"}, expected)
+                        self.assertEqual(chat_model_ids(response) - {"auto"}, expected)
 
     def test_auto_maps_to_each_accounts_declared_default_and_rotates(self):
         tables = catalogs()

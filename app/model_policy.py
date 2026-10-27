@@ -202,31 +202,51 @@ def public_name(fallback):
 
 
 def public_details(gateway, region=None):
-    """Publish each route using only its upstream capabilities and allowed accounts."""
+    """Publish chat and media routes using their own account eligibility checks."""
     config = gateway.CONFIG
-    raw = gateway.current_model_details(region)
-    if config.get("control_store") is None:
-        return raw
-    known = {item["id"]: item for item in raw}
-    policies = snapshot(config)["models"]
+    known = {item["id"]: item for item in gateway.current_model_details(region)}
+    for media in gateway.media_model_details():
+        row = known.get(media["id"])
+        known[media["id"]] = {**media, **(row or {})}
+    policy = view(config)
+    policies = policy.data["models"]
     owners = {rule.get("public_id", source): source for source, rule in policies.items()}
     pool = config.get("cred_pool")
     entries = pool.entries() if pool is not None else []
     out = []
     for source in dict.fromkeys([*known, *policies]):
-        rule = rule_for(config, source)
+        rule = rule_for(config, source, policy)
         upstream = rule["upstream_id"]
         item = known.get(upstream)
         if not rule["enabled"] or item is None:
             continue
+        media = bool(item.get("media_kinds"))
         token = _request_policy.set({"source": source, "upstream": upstream,
                                      "public_model": rule["public_id"], "rule": rule})
         try:
-            candidates = [entry for entry in entries if route_allowed(config, entry, upstream, rule=rule)
-                          and pool._eligible(entry, upstream, region=region)]
+            if media:
+                candidates = [entry for entry in entries if gateway._media_account_reason(
+                    entry, upstream, rule=rule, policy=policy, region=region) is None]
+                if pool is None:
+                    cm = config.get("cred")
+                    candidates = []
+                    if cm is not None:
+                        with cm._lock:
+                            headers = cm.get_headers()
+                        profile = gateway.profile_for_headers(headers)
+                        identity = gateway.account_key(profile, headers.get("X-User-Id"),
+                                                       headers.get("X-Enterprise-Id"))
+                        entry = {"profile": profile, "account_key": identity}
+                        if (profile in gateway.media_generation.MEDIA_PROFILES
+                                and route_allowed(config, entry, upstream, rule=rule, policy=policy)):
+                            candidates = [entry]
+            else:
+                candidates = [entry for entry in entries if route_allowed(
+                    config, entry, upstream, rule=rule, policy=policy)
+                    and pool._eligible(entry, upstream, region=region)]
         finally:
             _request_policy.reset(token)
-        if pool is not None and not candidates:
+        if not candidates and (pool is not None or media):
             continue
         prices, measured = {}, set()
         accounts = config.get("account_catalogs")
@@ -257,6 +277,9 @@ def public_details(gateway, region=None):
             best = min(prices.values(), default=None)
             row = {"id": name, "credits": best, "credits_by_profile": prices,
                    **route_metadata(gateway, upstream, entries=candidates, rule=rule, region=region)}
+            for key in ("media_kinds", "media_sources", "media_defaults"):
+                if key in item:
+                    row[key] = item[key]
             if any(prices[profile] == best for profile in measured):
                 row["credits_estimated"] = True   # Upstream declares it free but charges it.
             out.append(row)

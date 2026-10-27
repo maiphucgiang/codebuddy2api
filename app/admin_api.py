@@ -18,6 +18,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 
 from . import auth_oauth
 from . import perf_metrics
+from . import media_store as media_store_module
 from .admin_auth import AdminAuth, AdminMiddleware, COOKIE_NAME, SESSION_TTL, error_response, same_origin
 from .control_store import ConflictError, validate_model
 from .credential_io import CredentialFileError, MAX_CREDENTIAL_BYTES, _valid_name, read_import_file
@@ -742,6 +743,151 @@ def install_admin(app, config, gateway):
         if isinstance(result, dict) and result.get("ok") is False:
             return error_response(503, "日志清理未完成，请检查审计存储状态")
         return JSONResponse(result)
+
+    def media_store():
+        store = config.get("media_store")
+        if store is None:
+            raise _MediaUnavailable()
+        return store
+
+    class _MediaUnavailable(Exception):
+        pass
+
+    def media_route(method, path):
+        """Register one media handler; a missing store answers 503, never 400 or 500."""
+        def decorate(function):
+            async def guarded(request: Request):
+                try:
+                    return await function(request)
+                except _MediaUnavailable:
+                    return error_response(503, "媒体存储不可用，请检查数据目录权限或重启网关")
+                except HTTPException as exc:
+                    detail = exc.detail.get("error", {}).get("message") if isinstance(exc.detail, dict) else None
+                    return error_response(exc.status_code, detail or "媒体操作不符合当前状态，请刷新后重试")
+                except ValueError:
+                    return error_response(400, "媒体请求参数无效，请检查 kind/status/limit/cursor")
+                except Exception:
+                    return error_response(500, "管理操作失败，请检查存储状态后重试")
+            guarded.__name__ = function.__name__
+            app.add_api_route(path, guarded, methods=[method])
+            return function
+        return decorate
+
+    def media_page_params(request, *, status=False):
+        params = request.query_params
+        try:
+            limit = int(params.get("limit", "50"))
+        except ValueError:
+            raise ValueError("limit 必须为整数") from None
+        if not 1 <= limit <= 200:
+            raise ValueError("limit 必须为 1 至 200")
+        cursor = params.get("cursor", "")
+        if len(cursor) > 2048:
+            raise ValueError("cursor 过长")
+        filter_value = params.get("status" if status else "kind", "")
+        if status and filter_value not in ("", "active", "completed", "failed"):
+            raise ValueError("status 必须是 active、completed 或 failed")
+        if not status and filter_value not in ("", "image", "video"):
+            raise ValueError("kind 必须是 image 或 video")
+        return filter_value or None, cursor or None, limit
+
+    @route("GET", "/admin/media")
+    async def media_summary(request):
+        def build():
+            store = config.get("media_store")
+            resolved = {item["key"]: item for item in resolve_settings(config)}
+            base = str(config.get("media_public_base_url") or "")
+            return JSONResponse({
+                "configured": bool(base), "base_url": base,
+                "locked": bool(resolved.get("media_public_base_url", {}).get("locked")),
+                "usage": store.usage(ttl_hours=gateway._media_ttl_hours()) if store else {
+                    "total_bytes": 0, "images": {"count": 0, "bytes": 0},
+                    "videos": {"count": 0, "bytes": 0}},
+                "limit_bytes": gateway._media_max_bytes(),
+                "ttl_hours": gateway._media_ttl_hours(),
+                "tasks": store.task_counts() if store else {"active": 0, "failed": 0},
+                "available": store is not None,
+            })
+        return await run_in_threadpool(build)
+
+    def media_asset_row(item, base):
+        entry = dict(item)
+        entry["created_at"] = item["created"]
+        entry["expires_at"] = item["created"] + gateway._media_ttl_hours() * 3600
+        if base:
+            entry["public_url"] = f"{base}/v1/media/{'videos' if item['kind'] == 'video' else 'images'}/{item['id']}"
+        return entry
+
+    def live_asset(asset_id):
+        """Return an asset still inside the current TTL; expired ones vanish before the sweep."""
+        meta = media_store().get_asset(asset_id)
+        if meta is not None and media_store_module.is_expired(meta, gateway._media_ttl_hours()):
+            return None
+        return meta
+
+    @media_route("GET", "/admin/media/assets")
+    async def media_assets(request):
+        kind, cursor, limit = media_page_params(request)
+
+        def build():
+            page = media_store().list_assets(kind, cursor, limit, ttl_hours=gateway._media_ttl_hours())
+            base = str(config.get("media_public_base_url") or "")
+            items = [media_asset_row(item, base) for item in page["items"]]
+            return JSONResponse({**page, "items": items})
+        return await run_in_threadpool(build)
+
+    @media_route("GET", "/admin/media/assets/{asset_id}")
+    async def media_asset_meta(request):
+        def build():
+            meta = live_asset(request.path_params["asset_id"])
+            if meta is None:
+                return error_response(404, "媒体资源不存在或已清理")
+            return JSONResponse(media_asset_row(meta, str(config.get("media_public_base_url") or "")))
+        return await run_in_threadpool(build)
+
+    @media_route("GET", "/admin/media/assets/{asset_id}/content")
+    async def media_asset_content(request):
+        def build():
+            meta = live_asset(request.path_params["asset_id"])
+            file = media_store().asset_file(meta) if meta else None
+            if file is None:
+                return error_response(404, "媒体资源不存在或已清理")
+            headers = media_store_module.security_headers(meta)
+            if request.query_params.get("download") == "1":
+                headers["Content-Disposition"] = f'attachment; filename="{file.name}"'
+            return FileResponse(file, media_type=meta["mime"], headers=headers)
+        return await run_in_threadpool(build)
+
+    @media_route("DELETE", "/admin/media/assets/{asset_id}")
+    async def media_asset_delete(request):
+        def remove():
+            asset_id = request.path_params["asset_id"]
+            if not media_store().delete_asset(asset_id):
+                return error_response(404, "媒体资源不存在或已清理")
+            event("media.asset_deleted", {"asset": asset_id})
+            return JSONResponse({"deleted": asset_id})
+        return await run_in_threadpool(remove)
+
+    @media_route("GET", "/admin/media/tasks")
+    async def media_tasks(request):
+        status, cursor, limit = media_page_params(request, status=True)
+
+        def build():
+            page = media_store().list_tasks(status, cursor, limit)
+            items = [{**item, "created_at": item["created"], "updated_at": item["updated"]}
+                     for item in page["items"]]
+            return JSONResponse({**page, "items": items})
+        return await run_in_threadpool(build)
+
+    @media_route("POST", "/admin/media/tasks/{task_id}/refresh")
+    async def media_task_refresh(request):
+        task_id = request.path_params["task_id"]
+        task = await gateway._media_video_refresh(task_id, gateway._request_id())
+        event("media.task_refreshed", {"task": task_id})
+        meta = None
+        if task["status"] == "completed" and task["media_id"]:
+            meta = await run_in_threadpool(media_store().get_asset, task["media_id"])
+        return JSONResponse(gateway._media_video_response(task, meta))
 
     @route("GET", "/admin/storage")
     async def storage_get(request):

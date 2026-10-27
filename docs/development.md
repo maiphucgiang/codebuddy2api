@@ -38,6 +38,7 @@ Everything below the gateway is simulated; everything in it is the real code. Re
 | Balances | Credit packages with different expiries; requests consume them, check-ins, trips, tasks and trial credits add to them |
 | Models | Per-region catalogs with rates, capabilities and limits |
 | Inference | Chat Completions, Responses and Anthropic Messages stream a simulated reply that quotes your message, with reasoning where the model supports it |
+| Media | Seeded images and videos plus simulated generation; public WebUI media and model mutations are browser-local and reset on reload |
 | Automation | Check-in, Buddy travel (a trip takes three minutes), growth tasks, trial credits and the international active check-in |
 | Sign-in | Adding an account signs in a new synthetic account by itself after four seconds; the official login link it shows never needs to be opened |
 | Search, fetch and MCP | `/v1/search`, `/v1/fetch` and the MCP `web_search` / `web_fetch` tools return simulated results on `example.com` |
@@ -59,7 +60,7 @@ Put a directive anywhere in the last user message to steer the simulated model:
 
 ## Public deployment
 
-`--public` makes the preview safe to share. It refuses credential upload, import, export and deletion, settings changes, log clearing, archiving and update actions, so nobody can leave real credentials for the next visitor to export or spoil the shared demo. `--reset-hours` exits after the given time so the process manager starts over with fresh data. Options the preview does not know pass through to the gateway, such as the trusted management origin a reverse proxy needs.
+`--public` makes the preview safe to share. Direct management writes for media deletion and task refresh, model rules and settings are refused alongside credential transfers, log clearing, archiving and updates. In the WebUI, media deletion and task refresh, media settings, model rules and model guards run in a per-tab in-memory overlay: the browser shows the completed operation, the server keeps its initial state, and a page reload restores that state. `--reset-hours` exits after the given time so the process manager starts over with fresh data. Options the preview does not know pass through to the gateway, such as the trusted management origin a reverse proxy needs.
 
 The published `edge` image already contains the gateway and the WebUI, so mounting this directory is enough:
 
