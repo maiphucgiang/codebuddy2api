@@ -12,7 +12,10 @@ test("real management API: session, model alias, audit, clear, and file credenti
   await expect(page.getByRole("heading", { name: "运行概览" })).toBeVisible();
   await expect(page.getByText("125", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: "模型路由" }).click();
-  await page.getByRole("button", { name: "编辑规则" }).click();
+  await page
+    .getByRole("row", { name: /fixture-model/ })
+    .getByRole("button", { name: "编辑规则" })
+    .click();
   await page.getByLabel("对外 ID").fill("garden-fixture");
   await page.getByRole("button", { name: "保存规则" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
@@ -159,9 +162,13 @@ test("real management API: media summary, settings round-trip and asset CSP", as
   const summary = await (await page.request.get("/admin/media")).json();
   expect(summary.available).toBe(true);
   expect(summary.configured).toBe(false);
-  expect(summary.models.some((model: { id: string }) => model.id === "hunyuan-image-v3.0")).toBe(
-    true,
-  );
+  const catalog = await (await page.request.get("/admin/models")).json();
+  expect(
+    catalog.models.some(
+      (model: { id: string; media_kinds?: string[] }) =>
+        model.id === "hunyuan-image-v3.0" && model.media_kinds?.includes("image"),
+    ),
+  ).toBe(true);
 
   const session = await (await page.request.get("/admin/session")).json();
   const settings = await (await page.request.get("/admin/settings")).json();
