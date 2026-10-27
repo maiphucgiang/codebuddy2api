@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { api, useResource } from "./api";
 import { translate } from "./i18n";
@@ -28,22 +28,6 @@ const summary = normalizeMediaSummary({
     videos: { count: 6, bytes: 226492416 },
   },
   tasks: { active: 2, failed: 1 },
-  models: [
-    {
-      id: "hunyuan-image-v3.0",
-      kinds: ["image"],
-      sources: ["static"],
-      default: ["image"],
-      accounts: 1,
-    },
-    {
-      id: "minimax-video-h3",
-      kinds: ["video"],
-      sources: ["static"],
-      default: ["video"],
-      accounts: 0,
-    },
-  ],
 });
 
 const assets = {
@@ -110,18 +94,12 @@ beforeEach(() => {
 });
 
 describe("media summary normalization", () => {
-  it("maps usage, tasks and models with safe defaults", () => {
+  it("maps usage and tasks with safe defaults", () => {
     expect(summary.usage.images.count).toBe(48);
-    expect(summary.models[0]).toEqual({
-      id: "hunyuan-image-v3.0",
-      kinds: ["image"],
-      sources: ["static"],
-      defaults: ["image"],
-      accounts: 1,
-    });
+    expect(summary.tasks).toEqual({ active: 2, failed: 1 });
     const empty = normalizeMediaSummary({});
     expect(empty.usage.total_bytes).toBe(0);
-    expect(empty.models).toEqual([]);
+    expect(empty.tasks).toEqual({ active: 0, failed: 0 });
     expect(empty.ttl_hours).toBe(72);
   });
 });
@@ -263,34 +241,25 @@ describe("media page", () => {
     expect(screen.getAllByText("下载暂缓，查询时重试")).toHaveLength(1);
   });
 
-  it("labels catalog-only model sources", () => {
-    mockResources({
-      summary: {
-        models: [
-          ...summary.models,
-          {
-            id: "custom-video-model",
-            kinds: ["video"],
-            sources: ["catalog"],
-            defaults: [],
-            accounts: 1,
-          },
-        ],
-      },
-    });
+  it("keeps model management in model routing", () => {
     render(<Media />);
-    fireEvent.click(screen.getByRole("tab", { name: "模型" }));
-    expect(screen.getByText("账号目录", { exact: true })).toBeTruthy();
-    expect(screen.getAllByText("静态清单").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("tab", { name: "模型" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "资源库" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "视频任务" })).toBeTruthy();
   });
-
-  it("requires a second click before deleting an asset", async () => {
+  it("confirms deletion in a dialog and styles the download button", async () => {
     const remove = vi.spyOn(api, "delete").mockResolvedValue({ data: {} } as never);
     render(<Media />);
     fireEvent.click(screen.getAllByRole("button", { name: /hunyuan-image-v3\.0/ })[0]!);
-    const danger = () => screen.getAllByRole("button", { name: /删除/ })[0]!;
-    fireEvent.click(danger());
+    const download = screen.getByRole("link", { name: "下载" });
+    expect(download.className).toContain("linkButton");
+    fireEvent.click(screen.getByRole("button", { name: /^删除$/ }));
     expect(remove).not.toHaveBeenCalled();
+    const confirmation = within(screen.getByRole("dialog"));
+    expect(confirmation.getByText(/不可恢复/)).toBeTruthy();
+    fireEvent.click(confirmation.getByRole("button", { name: "取消" }));
+    expect(remove).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /^删除$/ }));
     fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
     await waitFor(() => expect(remove).toHaveBeenCalled());
     expect(remove.mock.calls[0]![0]).toContain("/media/assets/img_");

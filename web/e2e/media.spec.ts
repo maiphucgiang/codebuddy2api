@@ -17,22 +17,6 @@ function summary(configured: boolean, locked = false) {
       videos: { count: 1, bytes: 226492416 },
     },
     tasks: { active: 1, failed: 1 },
-    models: [
-      {
-        id: "hunyuan-image-v3.0",
-        kinds: ["image"],
-        sources: ["static"],
-        default: ["image"],
-        accounts: 2,
-      },
-      {
-        id: "minimax-video-h3",
-        kinds: ["video"],
-        sources: ["static"],
-        default: ["video"],
-        accounts: 0,
-      },
-    ],
   };
 }
 
@@ -165,13 +149,17 @@ test("media page: grid, preview drawer and settings drawer validation", async ({
   await expect(dialog.getByRole("button", { name: "复制链接" })).toHaveCount(0);
   const href = await dialog.getByRole("link", { name: "下载" }).getAttribute("href");
   expect(href).toContain("/admin/media/assets/img_");
+  await expect(dialog.getByRole("link", { name: "下载" })).toHaveClass(/linkButton/);
+  await dialog.getByRole("button", { name: "删除", exact: true }).click();
+  await expect(dialog).toContainText("不可恢复");
+  await dialog.getByRole("button", { name: "取消" }).click();
+  await expect(dialog).toContainText("资源详情");
   await dialog.getByRole("button", { name: "关闭抽屉" }).click();
 
   await page.getByRole("tab", { name: "视频任务" }).click();
   await expect(page.getByRole("cell", { name: "task-in-progress" })).toBeVisible();
   await expect(page.getByRole("button", { name: "查询状态" })).toBeVisible();
-  await page.getByRole("tab", { name: "模型" }).click();
-  await expect(page.getByText("无可用账号")).toBeVisible();
+  await expect(page.getByRole("tab", { name: "模型", exact: true })).toHaveCount(0);
 
   await page.getByRole("button", { name: "媒体设置" }).click();
   const drawer = page.getByRole("dialog");

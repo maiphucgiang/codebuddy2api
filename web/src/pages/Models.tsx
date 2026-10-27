@@ -59,6 +59,7 @@ import s from "../ui.module.scss";
 import { SearchInput, Select } from "../fields";
 import { clearToasts, notify } from "../toast";
 export const profiles = ["cn-cli", "cn-work", "intl-cli", "intl-work"];
+const mediaKindLabels: Record<string, string> = { image: "文生图", edit: "图生图", video: "视频" };
 const validId = (id: string) => /^[A-Za-z0-9_.:/@-]{1,160}$/.test(id) && ![".", ".."].includes(id);
 export function validateRule(rule: ModelRule, models: ModelRule[]): string | null {
   if (!rule.public_id.trim()) return "对外 ID 不能为空";
@@ -561,7 +562,11 @@ function matchesCatalog(model: ModelRule, query: string, filter: CatalogFilter):
       if (bindingMode(model) !== "auto") return false;
     } else if (model.region !== filter.region) return false;
   }
-  if (filter.capability) {
+  if (filter.capability === "media_image") {
+    if (!model.media_kinds?.some((kind) => kind === "image" || kind === "edit")) return false;
+  } else if (filter.capability === "media_video") {
+    if (!model.media_kinds?.includes("video")) return false;
+  } else if (filter.capability) {
     const declared =
       model.capabilities && typeof model.capabilities === "object"
         ? (model.capabilities as RecordValue)
@@ -806,6 +811,8 @@ export function Models() {
               onChange={(value) => setFilter({ ...filter, capability: value })}
             >
               <option value="">全部能力</option>
+              <option value="media_image">图片生成 / 编辑</option>
+              <option value="media_video">视频生成</option>
               <option value="images">支持视觉</option>
               <option value="tools">支持工具</option>
               <option value="reasoning">支持思考</option>
@@ -915,6 +922,11 @@ export function Models() {
                             <strong className={s.modelName}>{m.public_id}</strong>
                             {!m.enabled && <Badge tone="neutral">已停用</Badge>}
                             {m.custom && <Badge>自建</Badge>}
+                            {m.media_kinds?.map((kind) => (
+                              <Badge key={kind} tone="neutral">
+                                {mediaKindLabels[kind] ?? kind}
+                              </Badge>
+                            ))}
                             {m.available === false && m.enabled && (
                               <Badge tone="warn">暂无候选</Badge>
                             )}

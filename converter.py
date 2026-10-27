@@ -3997,7 +3997,8 @@ def list_models(authorization: Optional[str] = Header(default=None),
     _check_auth(authorization, x_api_key)
     data = [{"id": item["id"], "object": "model", "created": 1700000000, "owned_by": "codebuddy",
              "credits": item["credits"], "credits_by_profile": item["credits_by_profile"],
-             **{key: item[key] for key in ("credits_estimated", "capabilities", "limits", "metadata_by_profile")
+             **{key: item[key] for key in ("credits_estimated", "capabilities", "limits", "metadata_by_profile",
+                                  "media_kinds", "media_sources", "media_defaults")
                 if key in item}}
             for item in model_policy.public_details(sys.modules[__name__])]
     return {"object": "list", "data": data}
@@ -5225,12 +5226,38 @@ def _media_check_model(model, kind: str) -> None:
 
 
 def _media_account_serves(account, model) -> bool:
-    """Account catalog membership with a static-list fallback for unsynced accounts."""
+    """Static models defer to upstream; dynamic models require account catalog membership."""
+    if media_generation.model_kinds(model):
+        return True
     items = account.get("serves") if isinstance(account, dict) else None
     if items is None:
-        return bool(media_generation.model_kinds(model))
+        return False
     return any(isinstance(item, dict) and item.get("id") == model for item in items)
 
+
+def _media_account_reason(entry, model, *, rule=None, policy=None, region=None):
+    """Return the media-specific reason an account cannot serve a model, or None."""
+    pool = CONFIG.get("cred_pool")
+    profile = CredentialPool._entry_profile(entry)
+    if not model_policy.credential_enabled(CONFIG, entry, policy):
+        return "人工停用"
+    rule = rule or model_policy.active_rule(CONFIG, model, policy)
+    if not rule.get("enabled", True):
+        return "模型已停用"
+    if not model_policy.route_allowed(CONFIG, entry, model, rule=rule, policy=policy):
+        return "不在绑定范围"
+    if not profile or profile not in media_generation.MEDIA_PROFILES:
+        return "产品不支持媒体生成"
+    if region and not _in_region(profile, region):
+        return "不在区域范围"
+    if not pool._healthy(entry, policy):
+        return "认证熔断"
+    account = (CONFIG.get("account_catalogs") or {}).get(entry.get("account_key"))
+    if not _media_account_serves(account, model):
+        return "账号自身目录不支持模型"
+    if not pool._has_credit(entry, profile):
+        return "额度不足或未知"
+    return None
 
 def _media_cred_for(model, tried=()):
     """Lease one account allowed to serve paid media; mirror pool health and capacity."""
@@ -5246,26 +5273,25 @@ def _media_cred_for(model, tried=()):
         if profile not in media_generation.MEDIA_PROFILES:
             raise HTTPException(status_code=503, detail={"error": {
                 "message": "当前凭证产品不支持媒体生成", "type": "auth_error"}})
+        identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
+        entry = {"profile": profile, "account_key": identity}
+        if not model_policy.route_allowed(CONFIG, entry, model):
+            raise HTTPException(status_code=503, detail={"error": {
+                "message": "当前凭证不在媒体模型路由范围内", "type": "service_unavailable",
+                "code": "no_media_account"}})
         _apply_session_headers(headers, profile, None, current_context())
         return cm, headers
     policy = model_policy.view(CONFIG)
-    accounts = CONFIG.get("account_catalogs") or {}
     excluded = {_cred_manager(item) for item in tried}
     with pool._lock:
         candidates = []
         for entry in pool._entries:
-            profile = CredentialPool._entry_profile(entry)
-            if (entry["cm"] in excluded or not profile
-                    or profile not in media_generation.MEDIA_PROFILES
-                    or not pool._healthy(entry, policy)
-                    or not _media_account_serves(accounts.get(entry.get("account_key")), model)
-                    or not pool._has_credit(entry, profile)):
+            if entry["cm"] in excluded or _media_account_reason(entry, model, policy=policy) is not None:
                 continue
             candidates.append(entry)
-        candidates.sort(key=pool._expiry_rank)
     if not candidates:
         raise HTTPException(status_code=503, detail={"error": {
-            "message": "没有符合媒体路由条件的账号（需支持媒体的产品、目录包含该模型且有余额）",
+            "message": "没有符合媒体路由条件的账号（需产品支持、路由允许且有余额）",
             "type": "service_unavailable", "code": "no_media_account"}})
     busy = False
     for entry in candidates:
@@ -5354,7 +5380,7 @@ async def _media_call(action: _MediaAction, body: dict, rid: str, *, model, pars
             cred, headers = await run_in_threadpool(_media_cred_for, model, tried)
         profile = profile_for_headers(headers)
         url = media_url_for_headers(headers, action.path)
-        observe_route(public_model=model, upstream_model=model, profile=profile,
+        observe_route(public_model=model_policy.public_name(model), upstream_model=model, profile=profile,
                       credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")))
         t0 = time.time()
         released = False
@@ -5530,7 +5556,7 @@ async def _media_video_refresh(task_id: str, rid: str) -> dict:
 def _media_video_response(task: dict, meta) -> dict:
     """Render one task row in the public video shape; meta is the pre-fetched asset."""
     body = {"id": task["task_id"], "object": "video", "status": task["status"],
-            "model": task["model"], "created_at": int(task["created"])}
+            "model": task.get("public_model") or task["model"], "created_at": int(task["created"])}
     if task["status"] == "completed":
         expired = meta is not None and media_store.is_expired(meta, _media_ttl_hours())
         if meta is not None and not expired and _media_base_url():
@@ -5583,12 +5609,14 @@ async def _media_image_item(item: dict, model, rid: str, *, persist: bool):
             if persist:
                 meta = await _media_save("image", base64.b64decode(item["b64_json"]),
                                          model=model, rid=rid)
-                return {"url": _media_public_url(meta), **revised}, None
+                if _media_base_url():
+                    return {"url": _media_public_url(meta), **revised}, None
             return {"b64_json": item["b64_json"], **revised}, None
         data = await _media_download_bytes(item["url"], rid)
         if persist:
             meta = await _media_save("image", data, model=model, rid=rid)
-            return {"url": _media_public_url(meta), **revised}, None
+            if _media_base_url():
+                return {"url": _media_public_url(meta), **revised}, None
         return {"b64_json": base64.b64encode(data).decode("ascii"), **revised}, None
     except (MediaDownloadError, MediaDownloadRetryable, ValueError) as error:
         return None, str(error)
@@ -5622,27 +5650,8 @@ async def _media_image_reply(items: list, model, rid: str, *, persist: bool) -> 
     return out
 
 
-def _media_model_accounts(model) -> int:
-    """Count accounts the media routing rules would currently select for this model."""
-    pool = CONFIG.get("cred_pool")
-    if pool is None:
-        return 1 if CONFIG.get("cred") is not None else 0
-    policy = model_policy.view(CONFIG)
-    accounts = CONFIG.get("account_catalogs") or {}
-    with pool._lock:
-        count = 0
-        for entry in pool._entries:
-            profile = CredentialPool._entry_profile(entry)
-            if (profile and profile in media_generation.MEDIA_PROFILES
-                    and model_policy.credential_enabled(CONFIG, entry, policy)
-                    and _media_account_serves(accounts.get(entry.get("account_key")), model)
-                    and pool._has_credit(entry, profile)):
-                count += 1
-        return count
-
-
-def admin_media_models() -> list:
-    """Model table for the media page: static families plus catalog-tagged entries."""
+def media_model_details() -> list:
+    """Return static and catalog media models in the shared catalog shape."""
     defaults = {"image": media_generation.DEFAULT_IMAGE_MODEL,
                 "edit": media_generation.DEFAULT_IMAGE_EDIT_MODEL,
                 "video": media_generation.DEFAULT_VIDEO_MODEL}
@@ -5658,15 +5667,15 @@ def admin_media_models() -> list:
              for model, kinds in static_kinds.items()}
     for model, kinds in catalog_kinds_map.items():
         if not kinds:
-            continue  # Only tagged media entries join the table.
+            continue
         entry = table.setdefault(model, {"kinds": (), "catalog": False})
         entry["catalog"] = True
         entry["kinds"] = tuple(dict.fromkeys(entry["kinds"] + kinds))
-    return [{"id": model, "kinds": list(entry["kinds"]),
-             "sources": (["static"] if model in static_kinds else [])
-                        + (["catalog"] if entry["catalog"] else []),
-             "default": [kind for kind, name in defaults.items() if name == model],
-             "accounts": _media_model_accounts(model)}
+    return [{"id": model, "credits": None, "credits_by_profile": {},
+             "media_kinds": list(entry["kinds"]),
+             "media_sources": (["static"] if model in static_kinds else [])
+                              + (["catalog"] if entry["catalog"] else []),
+             "media_defaults": [kind for kind, name in defaults.items() if name == model]}
             for model, entry in sorted(table.items())]
 
 
@@ -6107,7 +6116,8 @@ async def images_generations(request: Request,
     """Generate images through the upstream media endpoints."""
     _check_auth(authorization, x_api_key)
     payload = await _media_json(request)
-    model = payload.get("model") or media_generation.DEFAULT_IMAGE_MODEL
+    requested_model = payload.get("model") or media_generation.DEFAULT_IMAGE_MODEL
+    model = model_policy.resolve(CONFIG, requested_model)
     _media_check_model(model, "image")
     if not isinstance(payload.get("prompt"), str) or not payload["prompt"].strip():
         raise _media_bad_request("prompt 必须是非空字符串")
@@ -6123,12 +6133,12 @@ async def images_generations(request: Request,
     except ValueError as error:
         raise _media_bad_request(str(error)) from None
     rid = _request_id()
-    if bool(_media_base_url()) and payload.get("response_format") != "b64_json":
+    persist = payload.get("response_format") != "b64_json"
+    if persist:
         _media_store()  # Refuse before the billed upstream round when persistence is impossible.
     _log(f"[{rid}] ▶ IMAGE | {model} | n={n} | chars={len(payload['prompt'])}")
     items, credit = await _media_call(MEDIA_IMAGE_GENERATE, body, rid, model=model,
                                       parse=media_generation.parse_image_reply)
-    persist = bool(_media_base_url()) and payload.get("response_format") != "b64_json"
     data = await _media_image_reply(items, model, rid, persist=persist)
     response = {"created": int(time.time()), "data": data}
     if credit is not None:
@@ -6143,7 +6153,8 @@ async def images_edits(request: Request,
     """Edit images through the upstream media endpoints; JSON body only, no multipart."""
     _check_auth(authorization, x_api_key)
     payload = await _media_json(request)
-    model = payload.get("model") or media_generation.DEFAULT_IMAGE_EDIT_MODEL
+    requested_model = payload.get("model") or media_generation.DEFAULT_IMAGE_EDIT_MODEL
+    model = model_policy.resolve(CONFIG, requested_model)
     _media_check_model(model, "edit")
     if not isinstance(payload.get("prompt"), str) or not payload["prompt"].strip():
         raise _media_bad_request("prompt 必须是非空字符串")
@@ -6169,12 +6180,12 @@ async def images_edits(request: Request,
     except ValueError as error:
         raise _media_bad_request(str(error)) from None
     rid = _request_id()
-    if bool(_media_base_url()) and payload.get("response_format") != "b64_json":
+    persist = payload.get("response_format") != "b64_json"
+    if persist:
         _media_store()  # Refuse before the billed upstream round when persistence is impossible.
     _log(f"[{rid}] ▶ IMAGE EDIT | {model} | images={len(images)} | chars={len(payload['prompt'])}")
     items, credit = await _media_call(MEDIA_IMAGE_EDIT, body, rid, model=model,
                                       parse=media_generation.parse_image_reply)
-    persist = bool(_media_base_url()) and payload.get("response_format") != "b64_json"
     data = await _media_image_reply(items, model, rid, persist=persist)
     response = {"created": int(time.time()), "data": data}
     if credit is not None:
@@ -6189,7 +6200,8 @@ async def create_video(request: Request,
     """Submit one asynchronous video generation task."""
     _check_auth(authorization, x_api_key)
     payload = await _media_json(request)
-    model = payload.get("model") or media_generation.DEFAULT_VIDEO_MODEL
+    requested_model = payload.get("model") or media_generation.DEFAULT_VIDEO_MODEL
+    model = model_policy.resolve(CONFIG, requested_model)
     _media_check_model(model, "video")
     seconds = payload.get("seconds")
     if isinstance(seconds, str):
@@ -6218,8 +6230,8 @@ async def create_video(request: Request,
     task_id = await _media_call(MEDIA_VIDEO_SUBMIT, body, rid, model=model,
                                 parse=media_generation.parse_video_submit, lease_note=note)
     task = await run_in_threadpool(store.create_task, task_id, note.get("credential"),
-                                   note.get("profile"), model)
-    return {"id": task_id, "object": "video", "status": "queued", "model": model,
+                                   note.get("profile"), model, public_model=requested_model)
+    return {"id": task_id, "object": "video", "status": "queued", "model": requested_model,
             "created_at": int((task or {}).get("created") or time.time())}
 
 

@@ -203,19 +203,26 @@ class PublicTests(unittest.TestCase):
     def test_guard_refuses_credential_transfer_and_shared_changes(self):
         app = FastAPI()
         app.add_api_route("/{path:path}", lambda: {"ok": True},
-                          methods=["GET", "POST", "PATCH", "DELETE"])
+                          methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
         app.add_middleware(public.Guard)
         client = TestClient(app)
         for method, path in (("POST", "/admin/credentials"), ("POST", "/admin/credentials/upload"),
                              ("POST", "/admin/credentials/refresh-import"), ("POST", "/admin/credentials/export"),
                              ("DELETE", "/admin/credentials/aurora.info"), ("PATCH", "/admin/settings"),
-                             ("POST", "/admin/logs/clear"), ("POST", "/admin/update/install")):
+                             ("POST", "/admin/logs/clear"), ("POST", "/admin/update/install"),
+                             ("DELETE", "/admin/media/assets/img_demo"),
+                             ("POST", "/admin/media/tasks/task_demo/refresh"),
+                             ("POST", "/admin/models"), ("PUT", "/admin/models/hy-image-3.5"),
+                             ("DELETE", "/admin/models/custom:demo")):
             response = client.request(method, path)
             self.assertEqual(response.status_code, 403, path)
+            self.assertEqual(response.headers["x-codebuddy-preview"], "public")
             self.assertEqual(response.json()["error"]["message"], public.MESSAGE)
         for method, path in (("GET", "/admin/credentials"), ("PATCH", "/admin/credentials/abc"),
                              ("POST", "/admin/credentials/abc/checkin"), ("POST", "/v1/chat/completions")):
-            self.assertEqual(client.request(method, path).status_code, 200, path)
+            response = client.request(method, path)
+            self.assertEqual(response.status_code, 200, path)
+            self.assertEqual(response.headers["x-codebuddy-preview"], "public")
 
     def test_reset_stops_the_server(self):
         class Immediate:

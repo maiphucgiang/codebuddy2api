@@ -39,6 +39,7 @@ Reward claims and departures are durably reserved before sending. Stale or faile
 Add independent mappings with public/upstream IDs and local enablement. Choose either specific accounts or a region with an optional product filter; switching modes clears the opposite binding. Unavailable candidates never cause out-of-scope fallback.
 
 - **Model details** shows descriptions, capability states, token limits, reasoning options and safe raw metadata by product; differences remain separate. Declarations are read-only and do not guarantee native or measured support. Route previews use the draft binding scope.
+- Media models share this catalog and routing rules; badges distinguish text-to-image, image editing and video models, with matching capability filters.
 - International catalogs are shared and deduplicated. Inherited entries show "Shared catalog source" with expandable safe originals; native declarations and shared references remain distinguishable.
 - The rate column shows `≈0.037x · 实测计费` for a model declared free that upstream charges, with the sample counts on hover, and `· 手填` for a manual rate. **Edit rule → 消费倍率** takes a manual rate per product and **一键探测倍率** sends one ≈8K-token request per product to tell real 0x from measured billing; **一键检测倍率** in the header does this for every model declared free. See [Measured rates and output limits](advanced.md#measured-rates-and-output-limits).
 - The max output column overlays results from `scripts/probe_max_tokens.py`: red `32K ⚠ 钳制 12×` for silent clamping, green `48K ✓` / `64K ↑` when the claim holds or is exceeded, grey `≥40K` for a lower bound and `?` when nothing was measured.
@@ -53,8 +54,8 @@ Clearing **all logs and statistics** is irreversible. Enter the confirmation tex
 
 The **Media** page shows locally stored generation results: usage against the capacity limit, image and video totals, and active or failed video tasks.
 
-- **Library** lists assets newest first with model, size and remaining retention; a card opens the preview drawer with metadata, download and a two-step delete. **Video tasks** refresh in-flight tasks on their bound account and link finished videos back to the library. **Models** is a read-only table of media models and how many accounts could currently serve them.
-- Images are only stored when an asset base URL is configured; without it they are returned inline as base64. Videos are always stored locally, and their link appears once the base URL is set.
+- **Library** lists assets newest first with model, size and remaining retention; a card opens the preview drawer with metadata, download and a confirmation dialog. **Video tasks** refresh in-flight tasks on their bound account and link finished videos back to the library. Model catalogs and routing are managed under **Model routing**.
+- Images are stored locally by default; without an asset base URL they return base64 without a public link. Explicit `response_format=b64_json` skips image persistence. Videos are always stored locally, and links appear once the base URL is set.
 - **Media settings** (`media_public_base_url`, `media_max_total_mb`, `media_ttl_hours`) set the public link prefix, capacity (64–1048576 MB) and retention (1–8760 hours). Retention is derived from each asset's creation time and the current setting, so shrinking it expires existing assets immediately; the oldest are evicted on the next write or scheduled cleanup. Assets are also served publicly at `/v1/media/…` with immutable caching; see [Media generation](clients.md#media-generation).
 
 ## Settings

@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 DB_NAME = "media.sqlite3"
-SCHEMA_VERSION = 1              # v1 dropped assets.expires; retention is derived.
+SCHEMA_VERSION = 2              # v2 keeps the submitted public model name on video tasks.
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 INCOMING_DIR = ".incoming"
@@ -77,7 +77,7 @@ def _row_to_asset(row) -> dict:
 
 def _row_to_task(row) -> dict:
     keys = ("task_id", "account_key", "profile", "model", "created", "updated",
-            "status", "media_id", "error", "credit")
+            "status", "media_id", "error", "credit", "public_model")
     return dict(zip(keys, row))
 
 
@@ -108,21 +108,24 @@ class MediaStore:
             CREATE TABLE IF NOT EXISTS tasks(
                 task_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, profile TEXT NOT NULL,
                 model TEXT, created REAL NOT NULL, updated REAL NOT NULL, status TEXT NOT NULL,
-                media_id TEXT, error TEXT, credit REAL);
+                media_id TEXT, error TEXT, credit REAL, public_model TEXT);
             CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created);
         """)
 
     def _migrate_schema(self):
-        """v0 databases stored a per-row expires column; retention is derived now."""
+        """Apply additive task metadata and remove the obsolete asset expiry column."""
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
             return
-        columns = {row[1] for row in self._db.execute("PRAGMA table_info(assets)").fetchall()}
-        if "expires" in columns:
-            self._db.execute("ALTER TABLE assets DROP COLUMN expires")
+        if version < 1:
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(assets)").fetchall()}
+            if "expires" in columns:
+                self._db.execute("ALTER TABLE assets DROP COLUMN expires")
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "public_model" not in columns:
+            self._db.execute("ALTER TABLE tasks ADD COLUMN public_model TEXT")
         self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._db.commit()
-
     def close(self):
         with self._lock:
             try:
@@ -315,14 +318,17 @@ class MediaStore:
 
     # -- video tasks --------------------------------------------------------------------
 
-    def create_task(self, task_id: str, account_key: str, profile: str, model) -> dict | None:
+    def create_task(self, task_id: str, account_key: str, profile: str, model,
+                    public_model=None) -> dict | None:
         with self._lock:
             now = time.time()
-            self._db.execute("INSERT OR IGNORE INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?)",
-                             (task_id, account_key, profile, model, now, now, "queued", None, None, None))
+            self._db.execute(
+                "INSERT OR IGNORE INTO tasks(task_id,account_key,profile,model,created,updated,"
+                "status,media_id,error,credit,public_model) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, account_key, profile, model, now, now, "queued", None, None, None,
+                 public_model or model))
             self._db.commit()
             return self.get_task(task_id)
-
     def get_task(self, task_id: str):
         with self._lock:
             row = self._db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()

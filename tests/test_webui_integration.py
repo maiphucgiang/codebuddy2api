@@ -49,6 +49,19 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
                                   known_models=[item["id"] for item in self.management.admin_model_inventory()])
         return rule
 
+    def test_media_models_share_admin_catalog_and_media_preview(self):
+        self.configure(profiles=("cn-cli",))
+        self.account_catalogs({"cn-cli": []}, serves={"cn-cli": []})
+        rows = self.client.get("/admin/models").json()["models"]
+        media = next(row for row in rows if row["id"] == "hy-image-3.5")
+        self.assertEqual(media["media_kinds"], ["image", "edit"])
+        self.assertTrue(media["available"])
+        preview = self.client.post("/admin/models/hy-image-3.5/preview", json={})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(len(preview.json()["candidates"]), 1)
+        public = {row["id"]: row for row in self.client.get("/v1/models").json()["data"]}
+        self.assertEqual(public["hy-image-3.5"]["media_kinds"], ["image", "edit"])
+
     def test_model_metadata_respects_alias_and_draft_scope_without_exposing_identity(self):
         tables = {profile: [{**fixtures.model('shared-model', 'x0.00'), 'supportsImages': profile == 'cn-cli',
                             'descriptionZh': 'safe-' + profile, 'accessToken': 'metadata-secret-canary',
@@ -85,7 +98,7 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
         self.post_ok('chat/completions', body, {'intl-work'})
         data = self.client.get('/admin/models').json()
         self.assertFalse(data['model_capability_guard'])
-        self.assertEqual(data['models'][0]['capabilities']['images'], 'unsupported')
+        self.assertEqual(next(row for row in data['models'] if row['id'] == 'shared-model')['capabilities']['images'], 'unsupported')
 
 
     def test_managed_alias_all_protocols_strict_binding_and_response_names(self):

@@ -429,6 +429,22 @@ class StoreTests(unittest.TestCase):
             self.store.list_tasks(status="bogus")
 
 
+    def test_v1_database_adds_public_model_without_losing_tasks(self):
+        self.store.close()
+        db = sqlite3.connect(self.store.path)
+        db.execute("ALTER TABLE tasks DROP COLUMN public_model")
+        db.execute("INSERT INTO tasks VALUES('task_old','acct','cn-cli','upstream',1,1,'queued',NULL,NULL,NULL)")
+        db.execute("PRAGMA user_version=1")
+        db.commit()
+        db.close()
+        reopened = MediaStore(self.store.root)
+        self.addCleanup(reopened.close)
+        self.assertIsNone(reopened.get_task("task_old")["public_model"])
+        created = reopened.create_task("task_new", "acct", "cn-cli", "upstream", public_model="alias")
+        self.assertEqual(created["model"], "upstream")
+        self.assertEqual(created["public_model"], "alias")
+
+
 class MediaRoutingTests(fixtures.RegionRoutingTests):
     """Endpoint behaviour against a mocked media upstream."""
 
@@ -461,6 +477,13 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
 
     def configure_media(self, *, profiles=("cn-cli", "cn-work", "intl-cli", "intl-work"), **kwargs):
         self.configure(profiles=profiles, **kwargs)
+
+    def install_policy(self):
+        store = ControlStore(self.root / f"media-policy-{self.fixture_sequence}.sqlite3")
+        self.addCleanup(store.close)
+        self.enterContext(patch.dict(converter.CONFIG, {"control_store": store}))
+        converter.invalidate_model_table()
+        return store
 
     def handle_upstream(self, request):
         path = request.url.path
@@ -511,16 +534,36 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
 
     # -- images --------------------------------------------------------------------------
 
-    def test_image_generation_returns_b64_without_base_url(self):
+    def test_image_generation_persists_b64_without_base_url(self):
         result = self.client.post("/v1/images/generations", json={"prompt": "a cat"})
         self.assertEqual(result.status_code, 200, result.text)
         body = result.json()
         self.assertNotIn("usage", body)  # Omitted when the upstream reports no credit.
         item = body["data"][0]
         self.assertIn("b64_json", item)
+        self.assertNotIn("url", item)
         self.assertEqual(item["revised_prompt"], "synthetic")
         self.assertTrue(base64.b64decode(item["b64_json"]).startswith(b"\x89PNG"))
-        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 0)  # No local writes without a base URL.
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 1)
+        stored = self.store.list_assets(ttl_hours=72)["items"][0]
+        self.assertEqual(stored["model"], media_generation.DEFAULT_IMAGE_MODEL)
+        explicit = self.client.post("/v1/images/generations",
+                                    json={"prompt": "a cat", "response_format": "b64_json"})
+        self.assertEqual(explicit.status_code, 200, explicit.text)
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 1)
+
+    def test_upstream_b64_is_persisted_without_public_link(self):
+        self.media_replies = [(200, {"data": {"data": [
+            {"b64_json": base64.b64encode(PNG_BYTES).decode("ascii")}]}})]
+        result = self.client.post("/v1/images/generations",
+                                  json={"model": "hy-image-3.5", "prompt": "a cat"})
+        self.assertEqual(result.status_code, 200, result.text)
+        item = result.json()["data"][0]
+        self.assertEqual(item["b64_json"], base64.b64encode(PNG_BYTES).decode("ascii"))
+        self.assertNotIn("url", item)
+        stored = self.store.list_assets(ttl_hours=72)["items"]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["model"], "hy-image-3.5")
 
     def test_image_generation_persists_with_base_url(self):
         self.enterContext(patch.dict(converter.CONFIG, {"media_public_base_url": "https://media.example.com/"}))
@@ -552,6 +595,9 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertEqual(sent["model"], media_generation.DEFAULT_IMAGE_EDIT_MODEL)
         self.assertEqual(sent["image"], [f"{COS}/source.png"])
         self.assertEqual(self.media_requests[-1].url.path, "/v2/images/edits")
+        self.assertIn("b64_json", result.json()["data"][0])
+        self.assertNotIn("url", result.json()["data"][0])
+        self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 1)
 
     def test_data_uri_references_pass_and_oversized_ones_fail(self):
         uri = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 30000).decode("ascii")
@@ -720,7 +766,7 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
 
     # -- selection and failover ------------------------------------------------------------
 
-    def test_media_account_requires_profile_catalog_and_credit(self):
+    def test_media_account_requires_profile_credit_and_dynamic_catalog(self):
         # Only intl accounts exist: no whitelisted media profile.
         self.configure_media(profiles=("intl-cli", "intl-work"))
         result = self.client.post("/v1/images/generations", json={"prompt": "x"})
@@ -730,15 +776,17 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.configure_media(balances={"cn-cli": 0})
         result = self.client.post("/v1/images/generations", json={"prompt": "x"})
         self.assertEqual(result.status_code, 503)
-        # A synced root table (serves) without the model excludes the account (#1).
+        # Static media models defer to upstream even when a synced root table omits them.
         self.configure_media(balances={"cn-cli": 100})
         self.account_catalogs({"cn-cli": [fixtures.model("shared-model")]},
                               serves={"cn-cli": [{"id": "shared-model",
                                                   "tags": ["text-to-image-preview"]}]})
         result = self.client.post("/v1/images/generations", json={"prompt": "x"})
-        self.assertEqual(result.status_code, 503)
-        # Media models only in serves (never in the chat picker) still select the
-        # account; a tagged catalog entry qualifies even outside the static list.
+        self.assertEqual(result.status_code, 200, result.text)
+        # Dynamic media models still require their exact account-catalog entry.
+        missing = self.client.post("/v1/videos", json={
+            "prompt": "x", "model": "custom-video-model", "seconds": 4})
+        self.assertEqual(missing.status_code, 400)
         self.account_catalogs({"cn-cli": [fixtures.model("shared-model")]},
                               serves={"cn-cli": [{"id": "shared-model"},
                                                  {"id": "custom-video-model",
@@ -746,9 +794,47 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
                                                   "tags": ["text-to-video"]}]})
         self.assertEqual(self.client.post("/v1/videos", json={"prompt": "x", "model": "custom-video-model",
                                                               "seconds": 4}).status_code, 200)
-        # An unsynced account (serves is None) falls back to the static list.
+        # Unsynced accounts also accept static media models.
         self.account_catalogs({"cn-cli": [fixtures.model("shared-model")]})
         self.assertEqual(self.client.post("/v1/images/generations", json={"prompt": "x"}).status_code, 200)
+    def test_media_models_use_shared_alias_disable_and_binding_rules(self):
+        self.add_account("cn2", "cn-cli")
+        self.configure_media(profiles=("cn-cli", "cn2"))
+        self.account_catalogs({"cn-cli": [], "cn2": []}, serves={"cn-cli": [], "cn2": []})
+        store = self.install_policy()
+        source = "hy-image-3.5"
+        rule = {**converter.model_policy.default_rule(source), "public_id": "hy-alias",
+                "credential_ids": [self.entries["cn2"]["account_key"]]}
+        store.update_model(source, rule, 0, known_models=[source])
+        result = self.client.post("/v1/images/generations", json={"model": "hy-alias", "prompt": "x"})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(self.media_requests[-1].headers["x-user-id"], "cn2")
+        self.assertEqual(json.loads(self.media_requests[-1].read())["model"], source)
+        public_ids = {item["id"] for item in self.client.get("/v1/models").json()["data"]}
+        self.assertIn("hy-alias", public_ids)
+        self.assertNotIn(source, public_ids)
+        store.update_model(source, {**rule, "enabled": False}, 1, known_models=[source])
+        before = len(self.media_requests)
+        disabled = self.client.post("/v1/images/generations", json={"model": "hy-alias", "prompt": "x"})
+        self.assertEqual(disabled.status_code, 404)
+        self.assertEqual(len(self.media_requests), before)
+
+    def test_video_task_preserves_public_alias(self):
+        self.configure_media(profiles=("cn-cli",))
+        store = self.install_policy()
+        source = "minimax-video-h3"
+        rule = {**converter.model_policy.default_rule(source), "public_id": "video-alias"}
+        store.update_model(source, rule, 0, known_models=[source])
+        submitted = self.client.post("/v1/videos", json={"model": "video-alias", "prompt": "x"})
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        self.assertEqual(submitted.json()["model"], "video-alias")
+        task_id = submitted.json()["id"]
+        task = self.store.get_task(task_id)
+        self.assertEqual(task["model"], source)
+        self.assertEqual(task["public_model"], "video-alias")
+        completed = self.client.get(f"/v1/videos/{task_id}")
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["model"], "video-alias")
 
     def test_media_kinds_and_guard_use_the_serves_index(self):
         # A chat model carrying an "image"-looking non-media tag stays a chat model.
@@ -762,11 +848,11 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.account_catalogs({"cn-cli": [fixtures.model("shared-model")]},
                               serves={"cn-cli": [
                                   {"id": "custom-video-model", "tags": ["text-to-video"]}]})
-        models = {entry["id"]: entry for entry in converter.admin_media_models()}
-        self.assertEqual(models["custom-video-model"]["kinds"], ["video"])
-        self.assertEqual(models["custom-video-model"]["sources"], ["catalog"])
-        self.assertEqual(models["custom-video-model"]["default"], [])
-        self.assertEqual(models["hunyuan-image-v3.0"]["sources"], ["static"])
+        models = {entry["id"]: entry for entry in converter.media_model_details()}
+        self.assertEqual(models["custom-video-model"]["media_kinds"], ["video"])
+        self.assertEqual(models["custom-video-model"]["media_sources"], ["catalog"])
+        self.assertEqual(models["custom-video-model"]["media_defaults"], [])
+        self.assertEqual(models["hunyuan-image-v3.0"]["media_sources"], ["static"])
 
     def test_upstream_envelope_errors(self):
         # Image business refusals surface as 502 with the upstream code and never replay.
@@ -958,11 +1044,17 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertEqual(self.store.usage(ttl_hours=72)["images"]["count"], 1)
 
     def test_store_unavailable_refuses_before_upstream(self):
-        self.enterContext(patch.dict(converter.CONFIG, {
-            "media_public_base_url": "https://media.example.com", "media_store": None}))
-        result = self.client.post("/v1/images/generations", json={"prompt": "x"})
-        self.assertEqual(result.status_code, 503)
-        self.assertEqual(self.media_requests, [])   # Nothing billed upstream.
+        for base_url in ("", "https://media.example.com"):
+            with self.subTest(base_url=base_url), patch.dict(converter.CONFIG, {
+                    "media_public_base_url": base_url, "media_store": None}):
+                result = self.client.post("/v1/images/generations", json={"prompt": "x"})
+                self.assertEqual(result.status_code, 503)
+                self.assertEqual(self.media_requests, [])  # Nothing billed upstream.
+                explicit = self.client.post("/v1/images/generations",
+                                            json={"prompt": "x", "response_format": "b64_json"})
+                self.assertEqual(explicit.status_code, 200, explicit.text)
+                self.assertEqual(len(self.media_requests), 1)
+                self.media_requests.clear()
 
     def test_expired_asset_reads_404_immediately(self):
         self.enterContext(patch.dict(converter.CONFIG, {"media_public_base_url": "https://media.example.com"}))
@@ -1125,18 +1217,19 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.assertEqual(headers["x-root-request-id"], result.headers["x-request-id"])
         self.assertEqual(headers["x-request-id"], headers["x-conversation-message-id"])
 
-    def test_admin_media_view_lists_models_and_usage(self):
+    def test_shared_media_catalog(self):
         result = self.client.post("/v1/images/generations", json={"prompt": "x"})
         self.assertEqual(result.status_code, 200, result.text)
-        models = converter.admin_media_models()
+        models = converter.media_model_details()
         by_id = {entry["id"]: entry for entry in models}
-        self.assertEqual(by_id["hunyuan-image-v3.0"]["kinds"], ["image"])
-        self.assertEqual(by_id["hunyuan-image-v3.0"]["default"], ["image"])
-        self.assertEqual(by_id["hunyuan-image-v3.0"]["sources"], ["static"])
-        self.assertGreaterEqual(by_id["hunyuan-image-v3.0"]["accounts"], 1)
-        self.assertEqual(by_id["hunyuan-image-v2.0-general-edit"]["default"], ["edit"])
-        self.assertEqual(by_id["minimax-video-h3"]["default"], ["video"])
+        self.assertEqual(by_id["hunyuan-image-v3.0"]["media_kinds"], ["image"])
+        self.assertEqual(by_id["hunyuan-image-v3.0"]["media_defaults"], ["image"])
+        self.assertEqual(by_id["hunyuan-image-v3.0"]["media_sources"], ["static"])
+        self.assertEqual(by_id["hunyuan-image-v2.0-general-edit"]["media_defaults"], ["edit"])
+        self.assertEqual(by_id["minimax-video-h3"]["media_defaults"], ["video"])
         self.assertNotIn("glm-5.1", by_id)
+        public = {entry["id"]: entry for entry in converter.model_policy.public_details(converter)}
+        self.assertEqual(public["hy-image-3.5"]["media_kinds"], ["image", "edit"])
 
 
 class AdminMediaApiTests(unittest.TestCase):
@@ -1162,9 +1255,6 @@ class AdminMediaApiTests(unittest.TestCase):
         self.gateway = Mock()
         self.gateway._media_ttl_hours.side_effect = lambda: float(self.config["media_ttl_hours"])
         self.gateway._media_max_bytes.side_effect = lambda: self.config["media_max_total_mb"] * 1048576
-        self.gateway.admin_media_models.return_value = [{"id": "minimax-video-h3", "kinds": ["video"],
-                                                         "sources": ["static"], "default": ["video"],
-                                                         "accounts": 2}]
         self.gateway._media_video_refresh = AsyncMock(return_value=self.video_task)
         self.gateway._media_video_response = Mock(
             side_effect=lambda task, meta=None: {"id": task["task_id"], "status": task["status"]})
@@ -1187,7 +1277,7 @@ class AdminMediaApiTests(unittest.TestCase):
         self.assertFalse(body["locked"])
         self.assertEqual(body["limit_bytes"], 1024 * 1048576)
         self.assertEqual(body["tasks"], {"active": 0, "failed": 0})
-        self.assertEqual(body["models"][0]["id"], "minimax-video-h3")
+        self.assertNotIn("models", body)
 
     def test_asset_listing_serving_and_delete(self):
         meta = self.store.save_asset("image", PNG_BYTES, model="m", ttl_hours=1, max_total_bytes=1 << 20)

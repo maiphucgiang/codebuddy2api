@@ -146,12 +146,49 @@ describe("model declarations", () => {
         ({
           data:
             path === "/models"
-              ? { revision: 1, models: [model], model_capability_guard: false }
+              ? {
+                  revision: 1,
+                  models: [
+                    model,
+                    {
+                      ...model,
+                      id: "hy-image-3.5",
+                      public_id: "hy-image-3.5",
+                      upstream_id: "hy-image-3.5",
+                      capabilities: {},
+                      limits: {},
+                      metadata_by_profile: {},
+                      media_kinds: ["image", "edit"],
+                    },
+                    {
+                      ...model,
+                      id: "minimax-video-h3",
+                      public_id: "minimax-video-h3",
+                      upstream_id: "minimax-video-h3",
+                      capabilities: {},
+                      limits: {},
+                      metadata_by_profile: {},
+                      media_kinds: ["video"],
+                    },
+                  ],
+                  model_capability_guard: false,
+                }
               : { credentials: [] },
         }) as never,
     );
     render(<Models />);
     await screen.findByText("能力预检：关闭");
+    expect(screen.getByText("文生图")).toBeTruthy();
+    expect(screen.getByText("图生图")).toBeTruthy();
+    const capability = screen.getByRole("combobox", { name: "筛选能力" });
+    choose(capability, "media_image");
+    expect(screen.getByText("hy-image-3.5", { selector: "strong" })).toBeTruthy();
+    expect(screen.queryByText("minimax-video-h3", { selector: "strong" })).toBeNull();
+    expect(screen.queryByText("public", { selector: "strong" })).toBeNull();
+    choose(capability, "media_video");
+    expect(screen.getByText("minimax-video-h3", { selector: "strong" })).toBeTruthy();
+    expect(screen.queryByText("hy-image-3.5", { selector: "strong" })).toBeNull();
+    choose(capability, "");
     fireEvent.change(screen.getByRole("textbox", { name: "搜索模型" }), {
       target: { value: "Display" },
     });

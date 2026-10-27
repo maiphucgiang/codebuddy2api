@@ -806,7 +806,6 @@ def install_admin(app, config, gateway):
                 "limit_bytes": gateway._media_max_bytes(),
                 "ttl_hours": gateway._media_ttl_hours(),
                 "tasks": store.task_counts() if store else {"active": 0, "failed": 0},
-                "models": gateway.admin_media_models(),
                 "available": store is not None,
             })
         return await run_in_threadpool(build)

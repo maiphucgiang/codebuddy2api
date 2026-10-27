@@ -106,9 +106,9 @@ curl http://127.0.0.1:8787/v1/fetch -H "Authorization: Bearer YOUR_API_KEY" \
 - `POST /v1/images/generations`：`{"prompt", "model?", "size?", "n?"（≤4）, "quality?", "response_format?"}` → `{"created", "data": [{url | b64_json, revised_prompt?}], "usage"?}`。prompt 原样下发，支持多行（≤32000 字符）；gemini 族忽略 `n` 与 `quality`，与官方 CLI 一致。
 - `POST /v1/images/edits`：OpenAI 风格 JSON：`{"prompt", "images": [{"image_url": "https://… | data:…"}], "model?", "size?", "input_fidelity?"}`；不支持 multipart。图片引用（含视频 `image_url`）最长 20 MiB 文本，可直接传 `data:` URI。
 - `POST /v1/videos`：`{"prompt?", "image_url?", "seconds?"（整数或数字字符串）, "resolution?"（"768P"|"2K"）, "aspect_ratio?", "enable_audio?", "model?"}` → `{"id", "object": "video", "status": "queued", …}`；用 `GET /v1/videos/{id}` 轮询，`GET /v1/videos/{id}/content` 获取完成的视频。
-- 未配置资源访问地址（`media_public_base_url`，WebUI「媒体生成」页）时，图片一律返回 `b64_json`，已保存的视频不回传链接；视频始终落盘到 `media/`，配置后即可获得链接。资源经 `/v1/media/{images|videos}/{id}` 公开读取，带不可变缓存头。
-- 默认模型按族固定：文生图 `hunyuan-image-v3.0`、图生图 `hunyuan-image-v2.0-general-edit`、视频 `minimax-video-h3`。静态清单 ∪ 账号目录之外的模型返回 400；媒体模型打到聊天端点会被拒绝并指引到本节。授权类拒绝以上游为最终裁决。
-- 按请求选号，仅限已实测可用的媒体产品（当前为 `cn-cli`），要求目录包含该模型且余额为正；被明确拒绝（401/403/429）时可按 failover 配置换号重试一次，但上游限制码不会重放，账号限制码会禁用该账号（与聊天接口一致），5xx 与超时一律不重放以避免重复扣费。视频任务始终绑定提交账号查询。
+- 图片默认保存到本地。未配置资源访问地址（`media_public_base_url`，WebUI「媒体生成」页）时返回 `b64_json`，不生成公开链接；显式 `response_format=b64_json` 则不保存图片。视频始终落盘。配置地址后可返回 `url` 和视频链接；资源经 `/v1/media/{images|videos}/{id}` 公开读取，带不可变缓存头。
+- 默认模型按族固定：文生图 `hunyuan-image-v3.0`、图生图 `hunyuan-image-v2.0-general-edit`、视频 `minimax-video-h3`。媒体模型统一进入 `/v1/models` 和 WebUI「模型路由」，共用别名、启停与绑定规则；媒体模型打到聊天端点会被拒绝并指引到本节。
+- 按请求选号，仅限已实测可用的媒体产品（当前为 `cn-cli`），且余额为正。静态媒体模型即使不在账号目录中也由上游裁决权限；动态模型要求目录带对应媒体标签。被明确拒绝（401/403/429）时可按 failover 配置在允许范围内换号重试一次，但上游限制码不会重放，账号限制码会禁用该账号（与聊天接口一致），5xx 与超时一律不重放以避免重复扣费。视频任务始终绑定提交账号查询。
 - 多张图片并发下载，部分失败时返回成功的条目；全部失败才返回 502 且不残留已落盘文件。视频下载仅在签名失效（403/404/410）、类型被拒或超容量时永久失败，重复查询返回同一错误；其余失败（网络、超时、408/429/5xx、本地存储错误）任务保持进行中，进行中响应带 `message` 重试提示，下次查询重试。
 
 ## 值得了解的协议行为

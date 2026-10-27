@@ -45,14 +45,6 @@ export function validateMediaBaseUrl(value: string): string | null {
   }
 }
 
-export type MediaModel = {
-  id: string;
-  kinds: string[];
-  sources: string[];
-  defaults: string[];
-  accounts: number;
-};
-
 export type MediaSummary = {
   configured: boolean;
   base_url: string;
@@ -66,7 +58,6 @@ export type MediaSummary = {
     videos: { count: number; bytes: number };
   };
   tasks: { active: number; failed: number };
-  models: MediaModel[];
 };
 
 export function normalizeMediaSummary(value: unknown): MediaSummary {
@@ -91,15 +82,6 @@ export function normalizeMediaSummary(value: unknown): MediaSummary {
       active: number((data.tasks as RecordValue)?.active) ?? 0,
       failed: number((data.tasks as RecordValue)?.failed) ?? 0,
     },
-    models: Array.isArray(data.models)
-      ? list(data.models, "媒体模型").map((item) => ({
-          id: text(item.id),
-          kinds: Array.isArray(item.kinds) ? item.kinds.map(text) : [],
-          sources: Array.isArray(item.sources) ? item.sources.map(text) : [],
-          defaults: Array.isArray(item.default) ? item.default.map(text) : [],
-          accounts: number(item.accounts) ?? 0,
-        }))
-      : [],
   };
 }
 
@@ -159,6 +141,39 @@ function AssetPreview({
   const content = `/admin/media/assets/${encodeURIComponent(assetId)}/content`;
   const isVideo = item.kind === "video";
   const link = typeof item.public_url === "string" ? item.public_url : "";
+  const remove = () => {
+    setBusy(true);
+    setError(null);
+    void api
+      .delete(`/media/assets/${encodeURIComponent(assetId)}`)
+      .then(() => {
+        onDeleted();
+        onClose();
+      })
+      .catch((err: unknown) => setError(errorMessage(err)))
+      .finally(() => setBusy(false));
+  };
+  if (confirming) {
+    return (
+      <Drawer
+        title={t("media.deleteConfirm")}
+        onClose={() => setConfirming(false)}
+        dismissDisabled={busy}
+      >
+        <ErrorNotice message={error} />
+        <p>{t("media.deleteHint")}</p>
+        <p className={s.mono}>{assetId}</p>
+        <div className={s.actions}>
+          <button type="button" disabled={busy} onClick={() => setConfirming(false)}>
+            {t("common.cancel")}
+          </button>
+          <button type="button" className={s.danger} disabled={busy} onClick={remove}>
+            {busy ? t("media.deleting") : t("media.deleteConfirm")}
+          </button>
+        </div>
+      </Drawer>
+    );
+  }
   return (
     <Drawer title={t("media.preview")} onClose={onClose} dismissDisabled={busy}>
       <ErrorNotice message={error} />
@@ -204,36 +219,21 @@ function AssetPreview({
             {t("media.copyLink")}
           </button>
         )}
-        <a className={s.pill} href={`${content}?download=1`} download>
+        <a className={`${s.linkButton} ${s.pill}`} href={`${content}?download=1`} download>
           {t("media.download")}
         </a>
-        {confirming ? (
-          <button
-            className={s.danger}
-            disabled={busy}
-            onClick={() => {
-              setBusy(true);
-              setError(null);
-              void api
-                .delete(`/media/assets/${encodeURIComponent(assetId)}`)
-                .then(() => {
-                  onDeleted();
-                  onClose();
-                })
-                .catch((err: unknown) => setError(errorMessage(err)))
-                .finally(() => setBusy(false));
-            }}
-          >
-            {t("media.deleteConfirm")}
-          </button>
-        ) : (
-          <button className={s.danger} onClick={() => setConfirming(true)}>
-            {t("media.delete")}
-          </button>
-        )}
+        <button
+          type="button"
+          className={s.danger}
+          onClick={() => {
+            setError(null);
+            setConfirming(true);
+          }}
+        >
+          {t("media.delete")}
+        </button>
       </div>
       {!configured && <p className={s.note}>{t("media.noLinkNote")}</p>}
-      {confirming && <p className={s.note}>{t("media.deleteHint")}</p>}
     </Drawer>
   );
 }
@@ -376,7 +376,7 @@ function MediaSettingsDrawer({ onClose, onSaved }: { onClose: () => void; onSave
 
 export function Media() {
   const t = useT();
-  const [tab, setTab] = useState<"library" | "tasks" | "models">("library");
+  const [tab, setTab] = useState<"library" | "tasks">("library");
   const [kind, setKind] = useState("");
   const [taskStatus, setTaskStatus] = useState("");
   const [assetCursors, setAssetCursors] = useState<string[]>([]);
@@ -485,7 +485,6 @@ export function Media() {
           [
             ["library", t("media.tab.library")],
             ["tasks", t("media.tab.tasks")],
-            ["models", t("media.tab.models")],
           ] as const
         ).map(([value, label]) => (
           <button
@@ -508,7 +507,7 @@ export function Media() {
         <>
           <div className={s.filters}>
             <Select
-              aria-label={t("media.models.kind")}
+              aria-label={t("media.filter.kind")}
               value={kind}
               onChange={(value) => {
                 setKind(value);
@@ -638,7 +637,7 @@ export function Media() {
                               ? `${text(item.task_id).slice(0, 18)}…`
                               : text(item.task_id)}
                           </td>
-                          <td>{text(item.model)}</td>
+                          <td>{text(item.public_model || item.model)}</td>
                           <td title={text(item.account_key)}>
                             {text(item.profile)}
                             <small className={s.mono}>{text(item.account_key).slice(0, 12)}</small>
@@ -733,80 +732,6 @@ export function Media() {
               </button>
             </div>
           </div>
-        </>
-      )}
-
-      {tab === "models" && data && (
-        <>
-          <div className={s.tableWrap}>
-            <table>
-              <thead>
-                <tr>
-                  <th>{t("media.models.model")}</th>
-                  <th>{t("media.models.kind")}</th>
-                  <th>{t("media.models.source")}</th>
-                  <th>{t("media.models.accounts")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.models.map((model) => (
-                  <tr key={model.id}>
-                    <td className={s.mono}>
-                      {model.id}
-                      {model.defaults.length > 0 && (
-                        <Badge tone="neutral">
-                          {t("media.models.default")} ·{" "}
-                          {model.defaults
-                            .map((kindName) =>
-                              t(
-                                kindName === "image"
-                                  ? "media.models.kindImage"
-                                  : kindName === "edit"
-                                    ? "media.models.kindEdit"
-                                    : "media.models.kindVideo",
-                              ),
-                            )
-                            .join("/")}
-                        </Badge>
-                      )}
-                    </td>
-                    <td>
-                      {model.kinds
-                        .map((kindName) =>
-                          t(
-                            kindName === "image"
-                              ? "media.models.kindImage"
-                              : kindName === "edit"
-                                ? "media.models.kindEdit"
-                                : "media.models.kindVideo",
-                          ),
-                        )
-                        .join(" / ")}
-                    </td>
-                    <td>
-                      {model.sources
-                        .map((source) =>
-                          t(
-                            source === "catalog"
-                              ? "media.models.sourceCatalog"
-                              : "media.models.sourceStatic",
-                          ),
-                        )
-                        .join(" + ")}
-                    </td>
-                    <td>
-                      {model.accounts > 0 ? (
-                        model.accounts
-                      ) : (
-                        <Badge tone="warn">{t("media.models.noAccounts")}</Badge>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <p className={s.note}>{t("media.models.note")}</p>
         </>
       )}
 
