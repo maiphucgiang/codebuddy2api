@@ -114,13 +114,13 @@ class MediaStore:
                 model TEXT, created REAL NOT NULL, updated REAL NOT NULL, status TEXT NOT NULL,
                 media_id TEXT, error TEXT, credit REAL, public_model TEXT, api_key TEXT);
             CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created);
-            CREATE INDEX IF NOT EXISTS tasks_api_key ON tasks(api_key, created);
         """)
 
     def _migrate_schema(self):
         """Apply additive task metadata and remove the obsolete asset expiry column."""
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
+            self._db.execute("CREATE INDEX IF NOT EXISTS tasks_api_key ON tasks(api_key, created)")
             return
         if version < 1:
             columns = {row[1] for row in self._db.execute("PRAGMA table_info(assets)").fetchall()}

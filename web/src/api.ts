@@ -246,10 +246,17 @@ export function useResource<T>(
     reload,
   };
 }
+export type ModelRoute = {
+  upstream_id: string;
+  weight: number | null;
+  enabled: boolean;
+  source: "builtin" | "cloud" | "manual";
+};
 export type ModelRule = {
   id: string;
   public_id: string;
   upstream_id?: string;
+  routes?: ModelRoute[];
   custom?: boolean;
   available?: boolean;
   enabled: boolean;
@@ -310,6 +317,17 @@ export function modelResponse(value: unknown): {
       region: typeof m.region === "string" ? m.region : "",
       profile: typeof m.profile === "string" ? m.profile : "",
       credential_ids: m.credential_ids as string[],
+      routes: Array.isArray(m.routes)
+        ? (m.routes.filter(
+            (route): route is RecordValue =>
+              !!route &&
+              typeof route === "object" &&
+              !Array.isArray(route) &&
+              typeof route.upstream_id === "string" &&
+              typeof route.enabled === "boolean" &&
+              (route.weight === null || typeof route.weight === "number"),
+          ) as ModelRoute[])
+        : undefined,
       credits_override: rateOverride(m.credits_override),
     };
   });

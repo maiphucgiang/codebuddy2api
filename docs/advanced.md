@@ -238,6 +238,10 @@ The root table is not a guarantee that a backend serves every listed model; meas
 
 Beyond standard model fields, `credits` is the lowest source multiplier: `0.0` identifies a zero-multiplier source and `null` means no parseable multiplier was declared. `credits_by_profile` provides source details, such as `{"intl-work":0.0,"cn-cli":0.03}`. Compatible clients may ignore these fields; multipliers are not guaranteed to stay unchanged.
 
+Model rules may include an ordered `routes` list. Each entry has an `upstream_id`, optional `weight`, `enabled` and `source` (`builtin`, `cloud` or `manual`). Empty weights use top-to-bottom failover; weights use weighted selection before the normal account scheduler. Disabled entries are skipped, and an all-disabled list makes the public model unavailable. Existing rules without `routes` keep their single `upstream_id` behavior.
+
+Cloud catalog variants are grouped automatically only when their region, declared multiplier, context, output, image/reasoning/tool support and reasoning metadata match. A saved manual `routes` list takes precedence over that automatic group.
+
 Credential domain / token issuer determine the product identity. Chat and refresh use fixed origins with separate product headers:
 
 | Profile | Chat / refresh origin |

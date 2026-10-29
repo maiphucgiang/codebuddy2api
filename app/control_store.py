@@ -51,12 +51,46 @@ def buddy_claim_reserved(record):
 
 def validate_model(source, rule, models=None, known_models=(), *, legacy_scopes=False):
     _identifier(source, "模型规则 ID")
-    if not isinstance(rule, dict) or set(rule) - {"public_id", "upstream_id", "custom", "enabled", "keep_original", "region", "profile", "credential_ids", "credits_override"}:
+    if not isinstance(rule, dict) or set(rule) - {"public_id", "upstream_id", "routes", "custom", "enabled", "keep_original", "region", "profile", "credential_ids", "credits_override"}:
         raise ValueError("模型规则字段无效")
     clean = {"public_id": source, "upstream_id": source, "custom": False,
              "enabled": True, "keep_original": False,
              "region": None, "profile": None, "credential_ids": [], **rule}
     _identifier(clean["upstream_id"], "上游模型 ID")
+    routes = clean.get("routes")
+    if routes is not None:
+        if not isinstance(routes, list) or not routes or len(routes) > 100:
+            raise ValueError("routes 必须是 1–100 条路由列表")
+        normalized_routes = []
+        seen_routes = set()
+        weighted = False
+        for route in routes:
+            if not isinstance(route, dict) or set(route) - {"upstream_id", "weight", "enabled", "source"}:
+                raise ValueError("路由字段无效")
+            route_id = route.get("upstream_id")
+            _identifier(route_id, "路由上游模型 ID")
+            if route_id in seen_routes:
+                raise ValueError("路由上游模型重复")
+            seen_routes.add(route_id)
+            enabled = route.get("enabled", True)
+            if type(enabled) is not bool:
+                raise ValueError("路由 enabled 必须为布尔值")
+            source_kind = route.get("source", "manual")
+            if source_kind not in ("builtin", "cloud", "manual"):
+                raise ValueError("路由 source 无效")
+            weight = route.get("weight")
+            if weight is not None:
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)) \
+                        or not math.isfinite(weight) or weight < 0 or weight > 1000:
+                    raise ValueError("路由 weight 必须是 0–1000 的有限数字")
+                weight = float(weight)
+                weighted = True
+            normalized_routes.append({"upstream_id": route_id, "weight": weight,
+                                      "enabled": enabled, "source": source_kind})
+        if weighted and not any((route["weight"] or 0) > 0 and route["enabled"]
+                                for route in normalized_routes):
+            raise ValueError("加权路由至少需要一条正权重路线")
+        clean["routes"] = normalized_routes
     if type(clean["custom"]) is not bool or (clean["custom"] and clean["keep_original"]):
         raise ValueError("自建模型不能公开内部规则标识")
     _identifier(clean["public_id"], "公开模型 ID")

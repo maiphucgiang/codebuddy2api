@@ -2249,6 +2249,18 @@ def _publish_model_cache():
                 CONFIG["account_catalogs"] = accounts
                 CONFIG["model_catalogs"] = catalogs
                 CONFIG["models_remote"], CONFIG["models_intl"] = catalogs["cn-cli"], catalogs["intl-cli"]
+                route_groups, route_aliases = _build_catalog_route_groups(accounts)
+                for alias, canonical in list(route_aliases.items()):
+                    saved = model_policy.snapshot(CONFIG)["models"].get(alias, {})
+                    if saved.get("custom") or isinstance(saved.get("routes"), list):
+                        route_aliases.pop(alias, None)
+                        continue
+                    if saved.get("enabled") is False:
+                        for route in route_groups.get(canonical, []):
+                            if route["upstream_id"] == alias:
+                                route["enabled"] = False
+                CONFIG["model_route_groups"] = route_groups
+                CONFIG["model_route_aliases"] = route_aliases
                 invalidate_model_table()  # Drop the stale table first, then install the fresh index.
                 _publish_catalog_index(accounts)
 
@@ -2256,6 +2268,66 @@ def _publish_model_cache():
 def _account_catalog_key(profile, headers):
     return catalog_cache_key(profile, account_key(profile, headers.get("X-User-Id"),
                                                   headers.get("X-Enterprise-Id")))
+
+
+def _catalog_model_signature(model: dict, region: str):
+    """Return the conservative signature used for automatic same-cost variant grouping."""
+    if not isinstance(model, dict) or model.get("supportsToolCall") is not True:
+        return None
+    model_id = model.get("id")
+    if not isinstance(model_id, str) or model_id in {"auto", "default-model"} \
+            or model_id.startswith("custom"):
+        return None
+    tags = tuple(sorted(tag for tag in (model.get("tags") or [])
+                        if isinstance(tag, str) and not tag.startswith("badge:")))
+    if {"text-to-image", "image-to-image", "text-to-video", "image-to-video"}.intersection(tags):
+        return None
+    credits = model.get("credits")
+    if not isinstance(credits, str) or not credits.strip():
+        return None
+    reasoning = model.get("reasoning")
+    reasoning = json.dumps(reasoning, sort_keys=True, ensure_ascii=False) if isinstance(reasoning, dict) else reasoning
+    context = model.get("contextWindow")
+    context = json.dumps(context, sort_keys=True, ensure_ascii=False) if isinstance(context, dict) else context
+    return (region, str(model.get("name") or model_id).strip().casefold(), credits.strip(),
+            model.get("maxInputTokens"), model.get("maxOutputTokens"), context,
+            model.get("supportsImages"), model.get("supportsReasoning"),
+            model.get("supportsToolCall"), reasoning, tags)
+
+
+def _build_catalog_route_groups(accounts: dict) -> tuple[dict, dict]:
+    """Group cloud variants only when their declared cost and capability signature match."""
+    grouped = {}
+    for account in accounts.values():
+        profile = account.get("profile")
+        region = profile_region(profile) if profile else None
+        if region is None:
+            continue
+        for model in account.get("serves") or account.get("models") or []:
+            signature = _catalog_model_signature(model, region)
+            if signature is not None:
+                grouped.setdefault(signature, []).append(model["id"])
+    routes = {key: [dict(route) for route in values]
+              for key, values in BUILTIN_MODEL_ROUTE_GROUPS.items()}
+    aliases = {route["upstream_id"]: key
+               for key, values in routes.items() for route in values if route["upstream_id"] != key}
+    cloud_signatures = {}
+    for signature, ids in grouped.items():
+        ordered = list(dict.fromkeys(ids))
+        if len(ordered) < 2:
+            continue
+        canonical = ordered[0]
+        if canonical in cloud_signatures and cloud_signatures[canonical] != signature:
+            continue
+        cloud_signatures[canonical] = signature
+        cloud_routes = [{"upstream_id": model_id, "weight": None,
+                         "enabled": True, "source": "cloud"} for model_id in ordered]
+        existing = {route["upstream_id"] for route in routes.get(canonical, [])}
+        routes.setdefault(canonical, []).extend(route for route in cloud_routes
+                                                if route["upstream_id"] not in existing)
+        for model_id in ordered[1:]:
+            aliases[model_id] = canonical
+    return routes, aliases
 
 
 def _fetch_catalog(headers):
@@ -2822,18 +2894,29 @@ def _housekeeper_loop(pool: CredentialPool, ledger) -> None:
 
 # Fallback models for legacy domestic deployments without a cloud catalog.
 DEFAULT_MODELS = [
-    "hy4-preview", "hy4-preview-x",
+    "hy4-preview", "hy4-preview-f", "hy4-preview-x",
     "hy3", "hy3-x",
     "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash", "deepseek-v3-2-volc",
     "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5.0", "glm-5.0-turbo",
     "glm-5v-turbo", "glm-4.7", "glm-4.6", "glm-4.6v",
     "minimax-m3", "minimax-m2.7", "minimax-m2.5",
-    "kimi-k3-1", "kimi-k2.7", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking",
+    "kimi-k3", "kimi-k3-1", "kimi-k2.7", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking",
     "hunyuan-chat", "default",
     "auto",  # Backend-selected model alias
 ]
 
-
+# Built-in variants that share one public route in legacy deployments.
+BUILTIN_MODEL_ROUTE_GROUPS = {
+    "hy4-preview": [
+        {"upstream_id": "hy4-preview", "weight": None, "enabled": True, "source": "builtin"},
+        {"upstream_id": "hy4-preview-f", "weight": None, "enabled": True, "source": "builtin"},
+        {"upstream_id": "hy4-preview-x", "weight": None, "enabled": True, "source": "builtin"},
+    ],
+    "kimi-k3": [
+        {"upstream_id": "kimi-k3", "weight": None, "enabled": True, "source": "builtin"},
+        {"upstream_id": "kimi-k3-1", "weight": None, "enabled": True, "source": "builtin"},
+    ],
+}
 # Supported optional upstream request fields.
 PASSTHROUGH_BODY_KEYS = {
     "model", "messages", "tools", "tool_choice", "temperature",
@@ -2905,6 +2988,11 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "credit_price_cny": None, "credit_price_usd": None, "usd_rate": None,
                 "desensitize": False, "no_compact": False, "keep_tool_metadata": False,
                 "prompt_mode": "empty"}  # None prices use module defaults.
+
+CONFIG.setdefault("model_route_groups", BUILTIN_MODEL_ROUTE_GROUPS)
+CONFIG.setdefault("model_route_aliases", {
+    "hy4-preview-f": "hy4-preview", "hy4-preview-x": "hy4-preview", "kimi-k3-1": "kimi-k3"
+})
 
 # In-memory OAuth sessions do not survive restarts.
 _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
@@ -3695,10 +3783,12 @@ def _model_profiles(model: str | None, region: str | None = None, configured=Non
     profiles = {profile for profile in PROFILE_ENDPOINTS if _in_region(profile, region)}
     if not model:
         return profiles
+    route_ids = model_policy.route_ids(CONFIG, model, policy)
     supported = {profile for profile in profiles
-                 if any(item["id"] == _upstream_model(model, profile)
+                 if any(item["id"] == _upstream_model(route, profile)
+                        for route in route_ids
                         for item in _models_for_profile(profile, configured, scope="serves",
-                                                        model_id=_upstream_model(model, profile), policy=policy))}
+                                                        model_id=_upstream_model(route, profile), policy=policy))}
     if model == "auto" and region == "cn":
         # WorkBuddy uses its advertised Auto; legacy CLI defaults remain separate.
         if "cn-work" in configured and "cn-work" in supported:
@@ -3949,7 +4039,12 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
     if session_payload is not None:
         _bind_request_session(session_payload, body)
     body = dict(body)
-    body["model"] = model_policy.resolve(CONFIG, body.get("model", "auto"))
+    public_model = body.get("model", "auto")
+    body["model"] = model_policy.resolve(CONFIG, public_model)
+    route_candidates = model_policy.route_candidates(CONFIG, public_model)
+    if len(route_candidates) > 1:
+        body["_route_candidates"] = route_candidates
+        body["_route_index"] = 0
     guard_model(body["model"], region=region, resolved=True)
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages or any(not isinstance(message, dict) for message in messages):
@@ -4039,7 +4134,7 @@ def list_models(request: Request, authorization: Optional[str] = Header(default=
     data = [{"id": item["id"], "object": "model", "created": 1700000000, "owned_by": "codebuddy",
              "credits": item["credits"], "credits_by_profile": item["credits_by_profile"],
              **{key: item[key] for key in ("credits_estimated", "capabilities", "limits", "metadata_by_profile",
-                                  "media_kinds", "media_sources", "media_defaults", "embedding", "rerank")
+                                  "media_kinds", "media_sources", "media_defaults", "embedding", "rerank", "routes")
                 if key in item}}
             for item in model_policy.public_details(sys.modules[__name__])
             if principal is None or principal.models is None
@@ -4260,6 +4355,10 @@ async def create_embeddings(request: Request,
     requested_model = payload.get("model")
     model = model_policy.resolve(CONFIG, requested_model)
     model_policy.check_resolved(CONFIG, model)
+    if len(model_policy.route_ids(CONFIG, requested_model)) > 1:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "embedding 模型暂不支持多模型路由，请为该模型保留单一路线",
+            "type": "invalid_request_error", "code": "multi_route_not_supported", "param": "model"}})
     if not embeddings.is_embedding_model(model):
         raise HTTPException(status_code=400, detail={"error": {
             "message": f"模型 {model} 不是 embedding 模型，请选择 /v1/models 中的向量模型",
@@ -4367,6 +4466,10 @@ async def create_rerank(request: Request,
     requested_model = payload.get("model") or rerank.MODEL_ID
     model = model_policy.resolve(CONFIG, requested_model)
     model_policy.check_resolved(CONFIG, model)
+    if len(model_policy.route_ids(CONFIG, requested_model)) > 1:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "rerank 模型暂不支持多模型路由，请为该模型保留单一路线",
+            "type": "invalid_request_error", "code": "multi_route_not_supported", "param": "model"}})
     if not rerank.is_rerank_model(model):
         raise HTTPException(status_code=400, detail={"error": {
             "message": f"模型 {model} 不是重排序模型，请使用 reranker",
@@ -4441,7 +4544,8 @@ async def chat_completions(request: Request,
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
     # Credential selection and refresh perform blocking file and network I/O.
     prepared = body        # Keep canonical input for failover policy checks.
-    body, cred, headers, url = await run_in_threadpool(_route_chat, payload, body, rid)
+    body, attempt = await run_in_threadpool(_route_chat_with_routes, payload, body, rid)
+    body, cred, headers, url = attempt
     _log_json(f"[{rid}] REQUEST BODY (发往后端，预览)", body)
     t0 = time.time()
 
@@ -5300,6 +5404,46 @@ def _failover_limit() -> int:
     return int(CONFIG.get("failover_max") or 0)
 
 
+def _next_route_body(canonical):
+    """Advance a prepared request to its next enabled model route, if any."""
+    if not isinstance(canonical, dict):
+        return None
+    candidates = canonical.get("_route_candidates")
+    index = canonical.get("_route_index", 0)
+    if not isinstance(candidates, list) or not isinstance(index, int) or index + 1 >= len(candidates):
+        return None
+    return {**canonical, "model": candidates[index + 1], "_route_index": index + 1}
+
+
+def _route_retry_attempt(payload, canonical, rid):
+    """Try the next configured model route without carrying account exclusions across routes."""
+    candidate = _next_route_body(canonical)
+    while candidate is not None:
+        try:
+            model_policy.bind_route(CONFIG, candidate["model"], candidate["_route_index"])
+            return candidate, _route_chat(payload, candidate, rid)
+        except HTTPException:
+            candidate = _next_route_body(candidate)
+    return None, None
+
+
+def _route_chat_with_routes(payload, body, rid):
+    """Select the first route with an eligible account, skipping preflight failures."""
+    candidate = body
+    last_error = None
+    while candidate is not None:
+        try:
+            model_policy.bind_route(CONFIG, candidate.get("model"), candidate.get("_route_index"))
+            return candidate, _route_chat(payload, candidate, rid)
+        except HTTPException as error:
+            last_error = error
+            candidate = _next_route_body(candidate)
+    if last_error is not None:
+        raise last_error
+    raise HTTPException(status_code=503, detail={"error": {
+        "message": "所有模型路线均不可用", "type": "service_unavailable", "code": "routes_unavailable"}})
+
+
 async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cred, headers, url):
     """Prefetch with bounded credential failover, using canonical input to preserve routing restrictions."""
     tried = []
@@ -5316,7 +5460,15 @@ async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cr
             limit = _failover_limit()
             surface = HTTPException(status_code=failure.status, headers=failure.headers,
                                     detail=_safe_err_raw(failure.raw, failure.status))
-            if limit <= 0 or len(tried) > limit or not _failover_safe(failure.error, failure.raw):
+            safe = _failover_safe(failure.error, failure.raw)
+            if safe:
+                next_body, attempt = await run_in_threadpool(_route_retry_attempt, payload, canonical, rid)
+                if attempt is not None:
+                    canonical = next_body
+                    routed, cred, headers, url = attempt
+                    _log(f"[{rid}] ↻ 切换模型路由 | {model_name} → {routed.get('model')}")
+                    continue
+            if limit <= 0 or len(tried) > limit or not safe:
                 raise surface from None
             try:
                 attempt = await run_in_threadpool(_route_chat, payload, canonical, rid,
@@ -5366,7 +5518,16 @@ async def _routed_fetch(payload, canonical, model_name, rid, t0, fetch, routed, 
             limit = _failover_limit()
             surface = HTTPException(status_code=status, detail=_safe_err_raw(raw, status),
                                     headers=error.headers if isinstance(error, UpstreamHTTPError) else None)
-            if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
+            safe = _failover_safe(error, raw)
+            if safe:
+                next_body, attempt = await run_in_threadpool(_route_retry_attempt, payload, canonical, rid)
+                if attempt is not None:
+                    canonical = next_body
+                    routed, cred, headers, url = attempt
+                    tried = []
+                    _log(f"[{rid}] ↻ 切换模型路由 | {model_name} → {routed.get('model')}")
+                    continue
+            if limit <= 0 or len(tried) > limit or not safe:
                 raise surface from None
             try:
                 attempt = await run_in_threadpool(_route_chat, payload, canonical, rid,
@@ -6163,7 +6324,8 @@ async def create_response(request: Request,
     )
     # Keep blocking credential selection and refresh off the event loop.
     prepared = chat_body        # Preserve canonical input for routing policy checks.
-    chat_body, cred, headers, url = await run_in_threadpool(_route_chat, payload, chat_body, rid)
+    chat_body, attempt = await run_in_threadpool(_route_chat_with_routes, payload, chat_body, rid)
+    chat_body, cred, headers, url = attempt
     _log_json(f"[{rid}] RESPONSES → CHAT BODY (预览)", chat_body)
     t0 = time.time()
 
@@ -6403,7 +6565,8 @@ async def create_message(request: Request,
     _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
     # Keep blocking credential selection and refresh off the event loop.
     prepared = chat_body        # Preserve canonical input for routing policy checks.
-    chat_body, cred, headers, url = await run_in_threadpool(_route_chat, payload, chat_body, rid)
+    chat_body, attempt = await run_in_threadpool(_route_chat_with_routes, payload, chat_body, rid)
+    chat_body, cred, headers, url = attempt
     _log_json(f"[{rid}] ANTHROPIC → CHAT BODY (预览)", chat_body)
     t0 = time.time()
 
