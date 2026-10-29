@@ -85,8 +85,10 @@ class WeightedRouteTests(TestCase):
                  "supportsImages": True, "supportsReasoning": True, "supportsToolCall": True},
             ]}})
         self.assertEqual([route["upstream_id"] for route in groups["hy4-preview"]],
-                         ["hy4-preview", "hy4-preview-x"])
-        self.assertEqual(aliases, {"hy4-preview-x": "hy4-preview"})
+                         ["hy4-preview", "hy4-preview-f", "hy4-preview-x"])
+        self.assertEqual(aliases, {
+            "hy4-preview-f": "hy4-preview", "hy4-preview-x": "hy4-preview", "kimi-k3-1": "kimi-k3"
+        })
 
 
 if __name__ == "__main__":

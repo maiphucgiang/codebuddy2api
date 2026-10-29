@@ -2250,6 +2250,15 @@ def _publish_model_cache():
                 CONFIG["model_catalogs"] = catalogs
                 CONFIG["models_remote"], CONFIG["models_intl"] = catalogs["cn-cli"], catalogs["intl-cli"]
                 route_groups, route_aliases = _build_catalog_route_groups(accounts)
+                for alias, canonical in list(route_aliases.items()):
+                    saved = model_policy.snapshot(CONFIG)["models"].get(alias, {})
+                    if saved.get("custom") or isinstance(saved.get("routes"), list):
+                        route_aliases.pop(alias, None)
+                        continue
+                    if saved.get("enabled") is False:
+                        for route in route_groups.get(canonical, []):
+                            if route["upstream_id"] == alias:
+                                route["enabled"] = False
                 CONFIG["model_route_groups"] = route_groups
                 CONFIG["model_route_aliases"] = route_aliases
                 invalidate_model_table()  # Drop the stale table first, then install the fresh index.
@@ -2298,14 +2307,20 @@ def _build_catalog_route_groups(accounts: dict) -> tuple[dict, dict]:
             signature = _catalog_model_signature(model, region)
             if signature is not None:
                 grouped.setdefault(signature, []).append(model["id"])
-    routes, aliases = {}, {}
+    routes = {key: [dict(route) for route in values]
+              for key, values in BUILTIN_MODEL_ROUTE_GROUPS.items()}
+    aliases = {route["upstream_id"]: key
+               for key, values in routes.items() for route in values if route["upstream_id"] != key}
     for ids in grouped.values():
         ordered = list(dict.fromkeys(ids))
         if len(ordered) < 2:
             continue
         canonical = ordered[0]
-        routes[canonical] = [{"upstream_id": model_id, "weight": None,
-                              "enabled": True, "source": "cloud"} for model_id in ordered]
+        cloud_routes = [{"upstream_id": model_id, "weight": None,
+                         "enabled": True, "source": "cloud"} for model_id in ordered]
+        existing = {route["upstream_id"] for route in routes.get(canonical, [])}
+        routes.setdefault(canonical, []).extend(route for route in cloud_routes
+                                                if route["upstream_id"] not in existing)
         for model_id in ordered[1:]:
             aliases[model_id] = canonical
     return routes, aliases
@@ -2875,18 +2890,29 @@ def _housekeeper_loop(pool: CredentialPool, ledger) -> None:
 
 # Fallback models for legacy domestic deployments without a cloud catalog.
 DEFAULT_MODELS = [
-    "hy4-preview", "hy4-preview-x",
+    "hy4-preview", "hy4-preview-f", "hy4-preview-x",
     "hy3", "hy3-x",
     "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash", "deepseek-v3-2-volc",
     "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5.0", "glm-5.0-turbo",
     "glm-5v-turbo", "glm-4.7", "glm-4.6", "glm-4.6v",
     "minimax-m3", "minimax-m2.7", "minimax-m2.5",
-    "kimi-k3-1", "kimi-k2.7", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking",
+    "kimi-k3", "kimi-k3-1", "kimi-k2.7", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking",
     "hunyuan-chat", "default",
     "auto",  # Backend-selected model alias
 ]
 
-
+# Built-in variants that share one public route in legacy deployments.
+BUILTIN_MODEL_ROUTE_GROUPS = {
+    "hy4-preview": [
+        {"upstream_id": "hy4-preview", "weight": None, "enabled": True, "source": "builtin"},
+        {"upstream_id": "hy4-preview-f", "weight": None, "enabled": True, "source": "builtin"},
+        {"upstream_id": "hy4-preview-x", "weight": None, "enabled": True, "source": "builtin"},
+    ],
+    "kimi-k3": [
+        {"upstream_id": "kimi-k3", "weight": None, "enabled": True, "source": "builtin"},
+        {"upstream_id": "kimi-k3-1", "weight": None, "enabled": True, "source": "builtin"},
+    ],
+}
 # Supported optional upstream request fields.
 PASSTHROUGH_BODY_KEYS = {
     "model", "messages", "tools", "tool_choice", "temperature",
@@ -2958,6 +2984,11 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "credit_price_cny": None, "credit_price_usd": None, "usd_rate": None,
                 "desensitize": False, "no_compact": False, "keep_tool_metadata": False,
                 "prompt_mode": "empty"}  # None prices use module defaults.
+
+CONFIG.setdefault("model_route_groups", BUILTIN_MODEL_ROUTE_GROUPS)
+CONFIG.setdefault("model_route_aliases", {
+    "hy4-preview-f": "hy4-preview", "hy4-preview-x": "hy4-preview", "kimi-k3-1": "kimi-k3"
+})
 
 # In-memory OAuth sessions do not survive restarts.
 _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
