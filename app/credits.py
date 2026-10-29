@@ -15,7 +15,7 @@ from pathlib import Path
 
 import httpx
 
-from .client_profiles import catalog_headers, enterprise_id_of
+from .client_profiles import catalog_headers, credential_headers, enterprise_id_of
 from .safe_logging import sanitize_log_text
 from .site_routing import PROFILE_ENDPOINTS, profile_for_auth, profile_product
 
@@ -42,6 +42,7 @@ ENTERPRISE_ACCOUNTS_PATH = "/console/accounts"
 # An enterprise allowance reported as -1 is unlimited rather than exhausted.
 UNLIMITED_ALLOWANCE = -1
 CONFIG_PATH = "/v3/config"  # Official cloud model catalog
+PERSONAL_MODELS_PATH = "/v2/enterprises/personal/models"  # Rich personal model catalog
 RESOURCE_PRODUCT_CODE = "p_tcaca"
 CREDITS_PAGE_SIZE = 100
 CREDITS_MAX_PAGES = 20  # Mark capped results partial instead of reporting complete balances.
@@ -52,6 +53,10 @@ _ALREADY_RE = re.compile(r"已签到|已领取|已经.*(?:签到|领取)|重复�
 
 class AuthExpiredError(Exception):
     """Signal an expired token from a billing HTTP 401 response."""
+
+
+class _PersonalCatalogUnavailable(RuntimeError):
+    """Signal that an older or non-SaaS product has no personal model route."""
 
 
 # ---------------------------------------------------------------------------
@@ -700,11 +705,61 @@ def select_cli_models(data: dict) -> list[dict]:
     return select_product_models(data, "cli")
 
 
+def _parse_model_scopes(payload: object, product: str, label: str) -> dict[str, list[dict]]:
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label}格式错误: response")
+    if payload.get("code") != 0:
+        raise RuntimeError(f"{label}返回非成功状态")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise ValueError(f"{label}格式错误: data")
+    return {"picker": select_product_models(data, product),
+            "account": select_product_models(data, product, scope="account")}
+
+
+def fetch_personal_model_scopes(access_token: str, user_agent: str = "", *, domain: str = "",
+                                uid: str = "", enterprise_id: str = "") -> dict[str, list[dict]]:
+    """Fetch the richer personal model table used by the desktop cloud-agent client."""
+    if enterprise_id:
+        raise ValueError("企业账号不能请求个人模型表")
+    auth = {"accessToken": access_token, "domain": domain}
+    profile = profile_for_auth(auth)
+    headers = credential_headers(auth, {"uid": uid})
+    headers.update({"Accept": "application/json, text/plain, */*",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "X-Request-ID": secrets.token_hex(16)})
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    try:
+        with httpx.Client() as client:
+            response = client.get(BILLING_PROFILE_HOSTS[profile] + PERSONAL_MODELS_PATH,
+                                  headers=headers, timeout=REQUEST_TIMEOUT)
+    except httpx.HTTPError:
+        raise RuntimeError("个人模型表接口网络错误") from None
+    if response.status_code == 401:
+        raise AuthExpiredError("登录身份过期")
+    if response.status_code in (404, 405, 501):
+        raise _PersonalCatalogUnavailable(f"个人模型表接口 HTTP {response.status_code}")
+    if response.status_code != 200:
+        raise RuntimeError(f"个人模型表接口 HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError:
+        raise ValueError("个人模型表接口返回无法解析") from None
+    return _parse_model_scopes(payload, profile_product(profile), "个人模型表接口")
+
+
 def fetch_model_scopes(access_token: str, user_agent: str = "", *, domain: str = "",
-                       uid: str = "", enterprise_id: str = "") -> dict[str, list[dict]]:
+                       uid: str = "", enterprise_id: str = "", prefer_personal: bool = False) -> dict[str, list[dict]]:
     """Fetch selector and account-root catalogs without assuming every candidate is servable."""
     auth = {"accessToken": access_token, "domain": domain}
     profile = profile_for_auth(auth)
+    if prefer_personal and not enterprise_id:
+        try:
+            return fetch_personal_model_scopes(access_token, user_agent, domain=domain, uid=uid)
+        except _PersonalCatalogUnavailable:
+            # Older deployments and private endpoints retain the established /v3/config path.
+            pass
     headers = catalog_headers(auth, {"uid": uid, "enterpriseId": enterprise_id}, user_agent=user_agent)
     try:
         with httpx.Client() as client:
@@ -719,20 +774,14 @@ def fetch_model_scopes(access_token: str, user_agent: str = "", *, domain: str =
         payload = response.json()
     except ValueError:
         raise ValueError("模型配置接口返回无法解析") from None
-    if not isinstance(payload, dict):
-        raise ValueError("模型配置格式错误: response")
-    if payload.get("code") != 0:
-        raise RuntimeError("模型配置接口返回非成功状态")
-    product = profile_product(profile)
-    return {"picker": select_product_models(payload.get("data"), product),
-            "account": select_product_models(payload.get("data"), product, scope="account")}
+    return _parse_model_scopes(payload, profile_product(profile), "模型配置接口")
 
 
 def fetch_model_catalog(access_token: str, user_agent: str = "", *, domain: str = "",
-                        uid: str = "", enterprise_id: str = "") -> list[dict]:
+                        uid: str = "", enterprise_id: str = "", prefer_personal: bool = False) -> list[dict]:
     """Return selector models for this credential's product."""
     return fetch_model_scopes(access_token, user_agent, domain=domain, uid=uid,
-                              enterprise_id=enterprise_id)["picker"]
+                              enterprise_id=enterprise_id, prefer_personal=prefer_personal)["picker"]
 
 
 # ---------------------------------------------------------------------------

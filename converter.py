@@ -2263,7 +2263,8 @@ def _fetch_catalog(headers):
     with _endpoint_semaphore("models"):
         scopes = credits_mod.fetch_model_scopes(
             _bearer_token(headers), domain=headers.get("X-Domain", ""),
-            uid=headers.get("X-User-Id", ""), enterprise_id=headers.get("X-Enterprise-Id", ""))
+            uid=headers.get("X-User-Id", ""), enterprise_id=headers.get("X-Enterprise-Id", ""),
+            prefer_personal=True)
     return scopes["picker"], scopes["account"]
 
 
