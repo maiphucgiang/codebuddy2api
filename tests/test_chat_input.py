@@ -243,7 +243,7 @@ class ChatInputEndpointTests(unittest.TestCase):
 
     def test_mixed_history_is_normalized_before_upstream_in_both_modes(self):
         def reply(request):
-            body = json.loads(request.content)
+            body = routing.request_json(request)
             for message in body["messages"]:
                 if isinstance(message.get("content"), list):
                     for index, block in enumerate(message["content"]):
@@ -263,7 +263,7 @@ class ChatInputEndpointTests(unittest.TestCase):
                     "model": "auto", "messages": messages, "tools": TOOLS, "stream": stream})
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(len(self.fx.requests), 1)
-                body = json.loads(self.fx.requests[0].content)
+                body = routing.request_json(self.fx.requests[0])
                 assistant_index = next(index for index, message in enumerate(body["messages"])
                                        if message["role"] == "assistant" and message.get("tool_calls"))
                 assistant = body["messages"][assistant_index]
@@ -281,7 +281,7 @@ class ChatInputEndpointTests(unittest.TestCase):
                     "model": "auto", "messages": messages, "stream": stream})
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(len(self.fx.requests), 1)
-                sent = json.loads(self.fx.requests[0].content)["messages"]
+                sent = routing.request_json(self.fx.requests[0])["messages"]
                 self.assertEqual(sent[0], {"role": "system", "content": "late instructions"})
                 self.assertEqual([m["role"] for m in sent], ["system", "user", "assistant", "tool"])
                 self.assertEqual(sent[2]["tool_calls"][0]["id"], sent[3]["tool_call_id"])
@@ -323,7 +323,7 @@ class ChatInputEndpointTests(unittest.TestCase):
                 response = self.fx.client.post("/v1/chat/completions", json={"model": "auto", "messages": messages})
             self.assertEqual(response.status_code, status, response.text)
             if policy == "truncate":
-                body = json.loads(self.fx.requests[0].content)
+                body = routing.request_json(self.fx.requests[0])
                 self.assertEqual(body["messages"][-1]["content"], [IMAGE])
             else:
                 self.assertEqual(self.fx.requests, [])
@@ -350,7 +350,7 @@ class ChatInputRoutingTests(routing.GatewayFixture, unittest.TestCase):
                     payload = self.fx.payload("chat/completions", stream=stream)
                     payload.update(messages=history(), tools=TOOLS)
                     self.fx.post_ok("chat/completions", payload, {profile})
-                    body = json.loads(self.fx.requests[-1].content)
+                    body = routing.request_json(self.fx.requests[-1])
                     assistant = next(m for m in body["messages"] if m["role"] == "assistant")
                     tool = next(m for m in body["messages"] if m["role"] == "tool")
                     self.assertEqual(assistant["tool_calls"][0]["id"], tool["tool_call_id"])

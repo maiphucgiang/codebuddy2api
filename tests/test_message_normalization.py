@@ -91,7 +91,7 @@ class EndpointTests(fixtures.GatewayFixture, unittest.TestCase):
                         body[key].append(user("question"))
                         original = deepcopy(body)
                         self.fx.post_ok(protocol, body, {profile})
-                        sent = json.loads(self.fx.requests[-1].content)
+                        sent = fixtures.request_json(self.fx.requests[-1])
                         self.assertEqual(sum(m["role"] == "user" for m in sent["messages"]), 1 if profile.startswith("intl") else 2)
                         self.assertEqual(len(images(sent)), 1)
                         self.assertEqual(body, original)
@@ -103,7 +103,7 @@ class EndpointTests(fixtures.GatewayFixture, unittest.TestCase):
         body["messages"].append(user("question"))
         with patch.dict(gateway.CONFIG, model_capability_guard=False):
             self.fx.post_ok("chat/completions", body, {"intl-work"})
-        self.assertEqual(sum(m["role"] == "user" for m in json.loads(self.fx.requests[-1].content)["messages"]), 1)
+        self.assertEqual(sum(m["role"] == "user" for m in fixtures.request_json(self.fx.requests[-1])["messages"]), 1)
 
     def test_unmergeable_runs_release_capacity_without_calling_upstream(self):
         self.fx.configure(profiles=("intl-work",))
@@ -136,7 +136,7 @@ class EndpointTests(fixtures.GatewayFixture, unittest.TestCase):
                 self.fx.account_catalogs({"intl-work": [model()], "cn-cli": [model()]})
                 seen = []
                 def reply(request):
-                    seen.append((request.headers["x-domain"], json.loads(request.content)))
+                    seen.append((request.headers["x-domain"], fixtures.request_json(request)))
                     if len(seen) == 1:
                         return httpx.Response(429, json={"error": {"message": "synthetic quota", "code": "quota"}})
                     return httpx.Response(200, content=fixtures.fixtures.success_sse())

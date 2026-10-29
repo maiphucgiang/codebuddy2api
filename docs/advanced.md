@@ -137,7 +137,7 @@ Generation responses carry a gateway-generated `X-Request-ID` for correlation wi
 In scoped mode, optionally send `X-Codebuddy-Session-ID`, `metadata.conversation_id` / `metadata.conversationId`, or top-level `conversation_id` / `conversationId`. Values must agree; conflicting, non-string, control-character or over-512-UTF-8-byte values return 400. Empty values fall back to a fingerprint of adapted instructions and the first user input, including image references; URLs are not fetched. Without reliable input a temporary session is used. Identical inputs without explicit IDs remain indistinguishable; `user`, `metadata.user_id` and `prompt_cache_key` are not session IDs. Raw hints are neither logged nor forwarded upstream.
 
 Switch back to `legacy` to restore old behavior for new requests; in-flight requests retain their initial mode.
-Upstream client identities follow verified official packages: domestic CLI 2.165.0 / WorkBuddy 5.9.2 and international CLI 2.161.0 / WorkBuddy 5.8.4. WorkBuddy attempts use independent message/request UUIDs and trace IDs; CLI keeps its existing ID relationships. Headers are generated locally without reading hardware IDs.
+Upstream client identities follow verified official packages: domestic CLI 2.165.0 / WorkBuddy 5.9.3 and international CLI 2.161.0 / WorkBuddy 5.8.4. Domestic WorkBuddy uses session-stable UUIDv7 conversation IDs, per-attempt request/tracing headers and gzip for JSON bodies of at least 1024 bytes; CLI and international WorkBuddy use their existing ID relationships and always gzip chat JSON. Headers are generated locally without reading hardware IDs.
 
 ## Automation and rewards
 

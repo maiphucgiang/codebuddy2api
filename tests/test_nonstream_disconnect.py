@@ -77,7 +77,7 @@ class NonStreamDisconnectTests(fixtures.RegionRoutingTests):
 
     # Inject a pending upstream read, optionally preceded by a quota rejection.
     def handle_upstream(self, request):
-        if HANG_MARKER in request.content.decode("utf-8", "replace"):
+        if HANG_MARKER in fixtures.request_content(request).decode("utf-8", "replace"):
             self.hang_attempts += 1
             self.hang_uids.append(request.headers.get("x-user-id"))
             if self.hang_attempts == 1 and self.fail_over_first:

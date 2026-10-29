@@ -236,8 +236,7 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         response, sent = self.auto_post()
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(sent), 1)
-        import json as _json
-        self.assertEqual(_json.loads(sent[0].content)["model"], "default-model")
+        self.assertEqual(fixtures.request_json(sent[0])["model"], "default-model")
 
     def test_failover_cannot_widen_the_credential_binding(self):
         """Preserve auto-model credential restrictions when failover reroutes an aliased request."""
@@ -498,7 +497,7 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(sent), 2)
         for request in sent:
-            body = json.loads(request.content)
+            body = fixtures.request_json(request)
             systems = [m for m in body["messages"] if m.get("role") == "system"]
             self.assertTrue(systems[0]["content"].startswith("You are CodeBuddy Code.\n"))
             self.assertEqual(sum(m["content"] == systems[0]["content"] for m in systems), 1)

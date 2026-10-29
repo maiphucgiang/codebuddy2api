@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
+import gzip
 import json
 import unittest
 from unittest.mock import patch
@@ -399,6 +400,71 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                         async with upstream_io.open_backend_stream("https://synthetic.invalid", {}, {}) as response:
                             await response.aread()
                 self.assertEqual(len(attempts), 1, "歧义请求不得重放 POST")
+
+    def test_sync_profile_body_uses_gzip(self):
+        body = {"messages": [{"role": "user", "content": "你好"}]}
+        headers = {"X-Domain": "www.codebuddy.cn", "X-IDE-Type": "CLI"}
+
+        def handler(request):
+            self.assertEqual(request.headers["Content-Encoding"], "gzip")
+            self.assertEqual(json.loads(gzip.decompress(request.content)), body)
+            return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with upstream_io.open_backend_stream_sync(client, "https://synthetic.invalid/v2/chat/completions", headers, body) as (response, _):
+                self.assertEqual(response.status_code, 200)
+
+    def test_non_chat_json_keeps_the_original_transport_contract(self):
+        body = {"query": "synthetic", "type": "text2text"}
+        headers = {"X-Domain": "www.codebuddy.cn", "X-IDE-Type": "CLI"}
+
+        def handler(request):
+            self.assertNotIn("Content-Encoding", request.headers)
+            self.assertNotEqual(request.headers.get("Accept-Encoding"), "identity")
+            self.assertEqual(json.loads(request.content), body)
+            return httpx.Response(200, json={"code": 0, "data": {}})
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            with upstream_io.open_backend_stream_sync(
+                    client, "https://synthetic.invalid/agenttool/v1/search", headers, body) as (response, _):
+                self.assertEqual(response.status_code, 200)
+
+    async def test_gzip_contract_and_retry_body_are_stable(self):
+        real_client = httpx.AsyncClient
+        profiles = {
+            "cn-cli": {"X-Domain": "www.codebuddy.cn", "X-IDE-Type": "CLI"},
+            "cn-work": {"X-Domain": "www.workbuddy.cn", "X-IDE-Type": "WorkBuddy"},
+            "intl-cli": {"X-Domain": "www.codebuddy.ai", "X-IDE-Type": "CLI"},
+            "intl-work": {"X-Domain": "www.workbuddy.ai", "X-IDE-Type": "WorkBuddy"},
+        }
+        large = {"messages": [{"role": "user", "content": "x" * 1400}]}
+        small = {"messages": [{"role": "user", "content": "small"}]}
+        cases = (("cn-cli", small, True), ("intl-cli", small, True),
+                 ("intl-work", small, True), ("cn-work", small, False),
+                 ("cn-work", large, True), (None, large, False))
+        for profile, body, expected_gzip in cases:
+            with self.subTest(profile=profile, compressed=expected_gzip):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    if len(attempts) == 1:
+                        raise httpx.ConnectError("synthetic retry")
+                    return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    async with upstream_io.open_backend_stream(
+                            "https://synthetic.invalid/v2/chat/completions", profiles.get(profile, {}), body) as response:
+                        await response.aread()
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(attempts[0].content, attempts[1].content)
+                for request in attempts:
+                    self.assertEqual(request.headers["Accept-Encoding"], "identity")
+                    self.assertEqual("content-encoding" in request.headers, expected_gzip)
+                    raw = gzip.decompress(request.content) if expected_gzip else request.content
+                    self.assertEqual(json.loads(raw), body)
 
 
 if __name__ == "__main__":

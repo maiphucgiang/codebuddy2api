@@ -1,6 +1,7 @@
 """Bound upstream retries and prohibit replay after a response has opened."""
 
 import asyncio
+import gzip
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -12,6 +13,7 @@ import httpx
 
 from app.content_filter import ContentFilterDetector
 from app.upstream_compat import should_channel_fallback
+from app.site_routing import profile_for_headers
 
 
 class UpstreamResponseError(Exception):
@@ -394,6 +396,26 @@ def read_bounded_sync_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
     return buffer.bytes()
 
 
+def _json_request_kwargs(headers, body, url):
+    """Serialize replay-safe chat bytes using the profile's gzip contract."""
+    if httpx.URL(url).path not in ("/v2/chat/completions", "/console/chat/completions"):
+        return {"headers": dict(headers), "json": body}
+    request_headers = {**headers, "Accept-Encoding": "identity"}
+    names = {str(name).lower() for name in headers}
+    if not names.intersection({"x-domain", "x-ide-type"}):
+        return {"headers": request_headers, "json": body}
+    profile = profile_for_headers(headers)
+    raw = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compressed = (profile in ("cn-cli", "intl-cli", "intl-work") or
+                  (profile == "cn-work" and len(raw) >= 1024))
+    if not compressed:
+        return {"headers": request_headers, "json": body}
+    if not any(str(name).lower() == "content-type" for name in request_headers):
+        request_headers["Content-Type"] = "application/json"
+    request_headers["Content-Encoding"] = "gzip"
+    return {"headers": request_headers, "content": gzip.compress(raw, compresslevel=6, mtime=0)}
+
+
 @contextmanager
 def open_backend_stream_sync(client, url, headers, body, *, timeout=None, fallback_url=None):
     """Open a sync upstream stream, retrying once on the console endpoint after a channel rejection.
@@ -404,7 +426,7 @@ def open_backend_stream_sync(client, url, headers, body, *, timeout=None, fallba
     """
     while True:
         raw = None
-        with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as response:
+        with client.stream("POST", url, timeout=timeout, **_json_request_kwargs(headers, body, url)) as response:
             if fallback_url and response.status_code == 400:
                 raw = read_bounded_sync_error(response)
                 if should_channel_fallback(fallback_url, response.status_code, raw):
@@ -443,7 +465,8 @@ async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=
         try:
             async with _attempt_client(url, timeout, clients if attempt == 0 else None) as client:
                 attempt_headers = headers_for_attempt() if headers_for_attempt is not None else headers
-                async with client.stream("POST", url, headers=attempt_headers, json=body, timeout=timeout) as response:
+                async with client.stream("POST", url, timeout=timeout,
+                                         **_json_request_kwargs(attempt_headers, body, url)) as response:
                     opened = True
                     yield response
                     return

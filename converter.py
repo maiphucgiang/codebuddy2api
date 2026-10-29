@@ -84,7 +84,7 @@ from app.upstream_io import (ChatSSEAccumulator, StreamOutputBudget, UpstreamHTT
                              read_bounded_error)
 from app.inference_resources import (AccountCapacity, InferenceResourcesMiddleware, inference_lifespan,
                                      request_resources, release_credential)
-from app.request_context import SessionIdentifierError, build_attempt_headers, current_context
+from app.request_context import SessionIdentifierError, build_attempt_headers, current_context, session_conversation_id
 from app.reasoning import resolve_reasoning_effort, thinking_mode
 from app import model_capabilities
 from app.message_normalization import merge_intl_user_images
@@ -112,8 +112,8 @@ from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_f
                               refresh_url_for_auth, media_url_for_headers)
 from app import dsml, mcp_server, server_tools, web_fetch, web_search, media_generation, media_store
 from app.inbound_limits import anthropic_path
-from app.client_profiles import (CLI_VERSION, CLI_USER_AGENT, credential_headers, catalog_cache_key,
-                                 account_key, canonical_uid, enterprise_id_of, identity_email,
+from app.client_profiles import (CLI_VERSION, CLI_USER_AGENT, credential_headers, credential_refresh_headers,
+                                 catalog_cache_key, account_key, canonical_uid, enterprise_id_of, identity_email,
                                  is_enterprise_account, normalize_uid)
 try:
     from app import credits as credits_mod
@@ -377,7 +377,7 @@ class CredentialManager:
         """Share the import lock so token refresh cannot overwrite a newer login."""
         s = self._session()
         auth = s.get("auth") or {}
-        headers = self._build_headers_from(auth, _credential_account(s))
+        headers = credential_refresh_headers(auth, _credential_account(s))
         headers["X-Refresh-Token"] = auth.get("refreshToken", "")
         headers["X-Auth-Refresh-Source"] = "plugin"
         url = refresh_url_for_auth(auth)
@@ -630,10 +630,13 @@ def _dynamic_request_headers(skey: str | None, profile=None) -> dict:
     message_id, request_id, trace_id = (uuid.uuid4().hex for _ in range(3))
     root = secrets.token_hex(16)
     span, parent = secrets.token_hex(8), secrets.token_hex(8)
-    conv = str(uuid.UUID(hex=hashlib.sha256(skey.encode()).hexdigest()[:32])) if skey else str(uuid.uuid4())
+    if profile == "cn-work":
+        conv = session_conversation_id(profile, "", skey or uuid.uuid4().hex)
+    else:
+        conv = str(uuid.UUID(hex=hashlib.sha256(skey.encode()).hexdigest()[:32])) if skey else str(uuid.uuid4())
     return {"X-Conversation-ID": conv, **build_attempt_headers(
         {}, profile, root=root, message_id=message_id, request_id=request_id,
-        trace_id=trace_id, span=span, parent=parent,
+        trace_id=trace_id, span=span, parent=parent, conversation_id=conv,
     )}
 
 

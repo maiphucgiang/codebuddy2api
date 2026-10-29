@@ -74,7 +74,7 @@ class ReasoningEndpointTests(unittest.TestCase):
         self.fx.respond = self.respond
 
     def respond(self, request):
-        body = json.loads(request.content)
+        body = fixtures.request_json(request)
         delta = {"content": "answer"}
         if body.get("reasoning_effort") not in (None, "none"):
             delta["reasoning_content"] = "new reasoning"
@@ -86,7 +86,7 @@ class ReasoningEndpointTests(unittest.TestCase):
         with patch.dict(gateway.CONFIG, stream_mode=mode, responses_projection_mode=projection, desensitize=desensitize):
             response = self.fx.client.post("/v1/" + protocol, json={**body, "stream": stream})
         self.assertEqual(body, original)
-        upstream = [json.loads(request.content) for request in self.fx.requests[before:]]
+        upstream = [fixtures.request_json(request) for request in self.fx.requests[before:]]
         return response, upstream
 
     def test_controls_and_output_in_all_modes(self):
@@ -350,7 +350,7 @@ class ReasoningRoutingTests(fixtures.GatewayFixture, unittest.TestCase):
                 self.assertNotEqual(seen[0].headers["x-user-id"], seen[1].headers["x-user-id"])
                 for request in seen:
                     expected = {"cn-cli": "low", "intl-work": "high"}[request.headers["x-user-id"]]
-                    self.assertEqual(json.loads(request.content)["reasoning_effort"], expected)
+                    self.assertEqual(fixtures.request_json(request)["reasoning_effort"], expected)
                 self.assertEqual(self.fx.pool._capacity._counts, {})
 
     def test_activation_cannot_escape_free_tier_or_strict_binding(self):

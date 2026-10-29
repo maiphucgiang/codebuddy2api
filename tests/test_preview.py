@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import asyncio
+import gzip
 import json
 import os
 import socket
@@ -148,6 +149,15 @@ class UpstreamTests(Isolated):
         text = "".join(e["choices"][0]["delta"].get("content", "") for e in events)
         self.assertIn("模拟回复", text)
         self.assertGreater(events[-1]["usage"]["credit"], 0)
+
+    def test_gzip_chat_body_is_decoded_before_dispatch(self):
+        token, _, _ = login("aurora")
+        body = json.dumps({"model": "glm-5.1", "messages": [{"role": "user", "content": "你好"}]}).encode()
+        response = httpx.post("https://copilot.tencent.com/v2/chat/completions",
+                              headers={"Authorization": f"Bearer {token}", "Content-Encoding": "gzip"},
+                              content=gzip.compress(body))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("data: [DONE]", response.text)
 
     def test_console_chat_uses_the_same_simulated_upstream(self):
         token, _, _ = login("aurora")

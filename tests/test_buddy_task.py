@@ -76,6 +76,8 @@ class BuddyTaskTests(unittest.TestCase):
             "/v2/chat/completions", "/activity/growth/buddy/agreement",
             "/activity/growth/buddy/first", "/activity/growth/buddy/travel/depart"])
         chat = self.writes()[0]
+        self.assertEqual(chat.headers["X-Agent-Type"], "auxiliary")
+        self.assertEqual(chat.headers["X-Agent-Runtime"], "local-agent")
         body = json.loads(chat.content)
         self.assertEqual(body["max_tokens"], 32)
         self.assertNotIn("tools", body)

@@ -905,7 +905,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         return super().handle_upstream(request)
 
     def posted_tools(self):
-        return [json.loads(request.content).get("tools") for request in self.chat_requests]
+        return [fixtures.request_json(request).get("tools") for request in self.chat_requests]
 
     def test_messages_web_search_roundtrip(self):
         self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
@@ -925,11 +925,11 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         for tools in self.posted_tools():
             self.assertFalse(any(t["function"]["name"].startswith("_") for t in tools))
         # The agenttool search carries the declared domain filter.
-        sent = json.loads(self.tool_requests[0].content)
+        sent = fixtures.request_json(self.tool_requests[0])
         self.assertEqual(sent["query"], QUERY)
         self.assertEqual(sent["allowed_domains"], ["example.com"])
         # Round two carries the executed tool result back upstream.
-        second = json.loads(self.chat_requests[1].content)
+        second = fixtures.request_json(self.chat_requests[1])
         self.assertEqual(second["messages"][-1]["role"], "tool")
         self.assertIn(URL, second["messages"][-1]["content"])
 
@@ -945,7 +945,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                          '"type": "web_fetch_tool_result"', '"type": "web_fetch_result"',
                          '"type": "document"', '"type": "text_delta"', "message_stop"):
             self.assertIn(fragment, text)
-        sent = json.loads(self.tool_requests[0].content)
+        sent = fixtures.request_json(self.tool_requests[0])
         self.assertEqual(sent["url"], URL)
         self.assertEqual(sent["prompt"], "summarize")
 
@@ -973,7 +973,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(data["choices"][0]["message"]["content"], "ok")
         self.assertNotIn("tool_calls", data["choices"][0]["message"])
         self.assertIn("WebSearch", [t["function"]["name"] for t in self.posted_tools()[0]])
-        self.assertEqual(json.loads(self.tool_requests[0].content)["max_results"], 3)
+        self.assertEqual(fixtures.request_json(self.tool_requests[0])["max_results"], 3)
 
     def assert_valid_chat_sse(self, text):
         """Events must be framed by blank lines and the stream must end with [DONE]."""
@@ -1010,10 +1010,10 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["choices"][0]["message"]["content"], "ok")
         self.assertEqual(len(self.tool_requests), 1)
-        first = json.loads(self.chat_requests[0].content)
+        first = fixtures.request_json(self.chat_requests[0])
         self.assertEqual(first["tool_choice"], "required")
         self.assertEqual([t["function"]["name"] for t in first["tools"]], ["WebSearch"])
-        self.assertEqual(json.loads(self.chat_requests[1].content)["tool_choice"], "auto")
+        self.assertEqual(fixtures.request_json(self.chat_requests[1])["tool_choice"], "auto")
 
     def test_chat_hosted_tool_choice_without_hosted_tool_is_auto(self):
         payload = self.payload()
@@ -1022,7 +1022,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         payload["tool_choice"] = {"type": "web_search"}
         response = self.client.post("/v1/chat/completions", json=payload)
         self.assertEqual(response.status_code, 200, response.text)
-        sent = json.loads(self.chat_requests[0].content)
+        sent = fixtures.request_json(self.chat_requests[0])
         self.assertEqual(sent["tool_choice"], "auto")
         self.assertEqual([t["function"]["name"] for t in sent["tools"]], ["client_tool"])
         self.assertEqual(self.tool_requests, [])
@@ -1045,7 +1045,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                              "input_schema": {"type": "object", "properties": {}}}]
         response = self.client.post("/v1/messages", json=payload)
         self.assertEqual(response.status_code, 200, response.text)
-        sent = json.loads(self.chat_requests[0].content)
+        sent = fixtures.request_json(self.chat_requests[0])
         self.assertEqual([t["function"]["name"] for t in sent["tools"]], ["client_tool"])
         self.assertEqual(self.tool_requests, [])
 
@@ -1077,7 +1077,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["content"][-1]["type"], "text")
         # The continuation round ran with a relaxed choice.
-        second = json.loads(self.chat_requests[1].content)
+        second = fixtures.request_json(self.chat_requests[1])
         self.assertEqual(second["tool_choice"], "auto")
 
     def test_messages_tool_choice_named_web_search(self):
@@ -1087,7 +1087,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         payload["tool_choice"] = {"type": "tool", "name": "web_search"}
         response = self.client.post("/v1/messages", json=payload)
         self.assertEqual(response.status_code, 200, response.text)
-        first = json.loads(self.chat_requests[0].content)
+        first = fixtures.request_json(self.chat_requests[0])
         self.assertEqual(first["tool_choice"], "required")
         self.assertEqual([t["function"]["name"] for t in first["tools"]], ["WebSearch"])
 
@@ -1098,7 +1098,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         payload["tool_choice"] = {"type": "web_search"}
         response = self.client.post("/v1/responses", json=payload)
         self.assertEqual(response.status_code, 200, response.text)
-        sent = json.loads(self.chat_requests[0].content)
+        sent = fixtures.request_json(self.chat_requests[0])
         self.assertEqual(sent["tool_choice"], "required")
 
     def post_realtime(self, endpoint, tools, rounds):
@@ -1171,7 +1171,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         response = self.client.post("/v1/messages", json=payload)
         self.assertEqual(response.status_code, 200, response.text)
         # No gateway injection or execution; the client's own tool call passes through.
-        sent = json.loads(self.chat_requests[0].content)
+        sent = fixtures.request_json(self.chat_requests[0])
         self.assertEqual([t["function"]["name"] for t in sent["tools"]], ["WebSearch"])
         self.assertEqual(self.tool_requests, [])
         self.assertEqual(response.json()["stop_reason"], "tool_use")
@@ -1234,7 +1234,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                 payload["tool_choice"] = dict(tool)
                 response = self.client.post("/v1/" + endpoint, json=payload)
                 self.assertEqual(response.status_code, 200, response.text)
-                first = json.loads(self.chat_requests[0].content)
+                first = fixtures.request_json(self.chat_requests[0])
                 self.assertEqual(first["tool_choice"], "required")
                 self.assertEqual([t["function"]["name"] for t in first["tools"]], ["WebSearch"])
 
@@ -1245,7 +1245,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         payload["tool_choice"] = {"type": "web_search_preview_2025_03_11"}
         response = self.client.post("/v1/chat/completions", json=payload)
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(json.loads(self.chat_requests[0].content)["tool_choice"], "auto")
+        self.assertEqual(fixtures.request_json(self.chat_requests[0])["tool_choice"], "auto")
 
     def test_search_snippets_reach_the_model(self):
         self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round()]
@@ -1253,11 +1253,11 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
         payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
         response = self.client.post("/v1/messages", json=payload)
         self.assertEqual(response.status_code, 200, response.text)
-        second = json.loads(self.chat_requests[1].content)
+        second = fixtures.request_json(self.chat_requests[1])
         self.assertEqual(second["messages"][-1]["content"], f"1. [Example]({URL})\n\n[1] Snippet.")
 
     def last_upstream_messages(self):
-        return json.loads(self.chat_requests[-1].content)["messages"]
+        return fixtures.request_json(self.chat_requests[-1])["messages"]
 
     def test_messages_history_echo_carries_search_and_fetch_to_the_next_turn(self):
         self.chat_rounds = [tool_call_round("WebSearch", {"query": QUERY}), final_round("found it")]
@@ -1279,7 +1279,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                                  {"role": "user", "content": "and then?"}]
         response = self.client.post("/v1/messages", json=follow_up)
         self.assertEqual(response.status_code, 200, response.text)
-        sent = json.loads(self.chat_requests[-1].content)
+        sent = fixtures.request_json(self.chat_requests[-1])
         # Echoed server blocks reach the model as text, never as tool calls.
         self.assertNotIn("tools", sent)
         messages = [m for m in sent["messages"] if m["role"] != "system"]
@@ -1538,7 +1538,7 @@ class ServerToolEndpointTests(fixtures.RegionRoutingTests):
                     response = self.client.post("/v1/messages", json=self.search_payload())
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(len(self.chat_requests), 4)
-                messages = [json.loads(request.content)["messages"] for request in self.chat_requests]
+                messages = [fixtures.request_json(request)["messages"] for request in self.chat_requests]
                 roles = [message["role"] for message in messages[0]]
                 self.assertEqual(roles[-1], "user")
                 self.assertEqual([message["role"] for message in messages[1]],

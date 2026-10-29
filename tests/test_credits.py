@@ -103,6 +103,12 @@ def test_financial_profile_hosts_and_web_headers():
             headers = httpx.Headers(kwargs["headers"])
             if operation is credits.daily_checkin:
                 assert "x-client-platform" not in headers and "origin" not in headers and "referer" not in headers
+                if domain == "www.workbuddy.cn":
+                    assert len(headers["x-request-id"]) == 32
+                    int(headers["x-request-id"], 16)
+                    assert headers["user-agent"] == "axios/1.16.1"
+                else:
+                    assert "x-request-id" not in headers
             else:
                 assert headers["x-client-platform"] == "web"
                 assert headers["origin"] == host

@@ -218,8 +218,13 @@ class CatalogSelectionTests(unittest.TestCase):
                     client.get.assert_called_once()
                     args, kwargs = client.get.call_args
                     self.assertEqual(args, (host + "/v3/config",))
-                    self.assertEqual(kwargs["headers"], catalog_headers(
-                        {"accessToken": token, "domain": hint}, {"uid": "user", "enterpriseId": "enterprise"}))
+                    expected_headers = catalog_headers(
+                        {"accessToken": token, "domain": hint}, {"uid": "user", "enterpriseId": "enterprise"})
+                    actual_headers = kwargs["headers"]
+                    if profile == "cn-work":
+                        self.assertRegex(actual_headers["X-Request-ID"], r"^[0-9a-f]{32}$")
+                        actual_headers = {**actual_headers, "X-Request-ID": expected_headers["X-Request-ID"]}
+                    self.assertEqual(actual_headers, expected_headers)
                     headers = httpx.Headers(kwargs["headers"])
                     self.assertEqual(headers["authorization"], f"Bearer {token}")
                     self.assertEqual(headers["x-domain"], domain)
