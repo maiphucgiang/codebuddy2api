@@ -36,6 +36,28 @@ LIBRARY_URL = "https://www.workbuddy.cn/space/d/o0KWYeynteVv06UnAZqIFm"
 QQ_BUDDY_ID = "cb_y5Dy46tPQGGWtueMxXbe"
 QQ_BUDDY_NAME = "企鹅教师助手"
 LIGHTHOUSE_EXPERT_ID = "ex_2cvvUZQhDyeJ"
+NAMED_EXPERT_TASKS = {
+    "WorkBuddy_Valorant": {
+        "expert_id": "ex_xQHHD1u5Jkua", "expert_type": "agent",
+        "display_name_zh": "无畏契约拼豆专家", "profession_zh": "无畏契约拼豆专家",
+        "version": "1.2.7", "categories": ["03-GameSpatial", "06-ContentCreative"]},
+    "expert_use_bowangwang": {
+        "expert_id": "ex_WZY136wV5aMt", "expert_type": "agent",
+        "display_name_zh": "播旺旺", "profession_zh": "直播电商教练",
+        "version": "1.0.2", "categories": ["05-MarketingGrowth", "18-Double11"]},
+    "expert_use_douyinyin": {
+        "expert_id": "ex_FbY5nlWTqDod", "expert_type": "agent",
+        "display_name_zh": "斗音音", "profession_zh": "抖音策略师",
+        "version": "1.0.2", "categories": ["06-ContentCreative", "18-Double11"]},
+    "expert_use_maidehao": {
+        "expert_id": "ex_GDl31WahyIH0", "expert_type": "agent",
+        "display_name_zh": "卖得好", "profession_zh": "中国电商运营专家",
+        "version": "1.0.1", "categories": ["05-MarketingGrowth", "18-Double11"]},
+    "expert_use_shangjia_xuanchuan": {
+        "expert_id": "ex_Weo3x2EZuSDm", "expert_type": "agent",
+        "display_name_zh": "商家宣传设计师", "profession_zh": "商家宣传页与海报设计师",
+        "version": "1.6.0", "categories": ["01-ProductDesign", "05-MarketingGrowth", "18-Double11"]},
+}
 SKILL_NAME = "润泽小馆·日报撰写"
 SKILL_ID = "skill_2097350077599879168"
 THEME_KEY = "theme-tkmw7j"
@@ -279,18 +301,16 @@ def run_expert_team_3(ctx, task):
     return _run_expert_batch(ctx, "team", 3)
 
 
-def run_expert_lighthouse(ctx, task):
-    expert = {"expert_id": LIGHTHOUSE_EXPERT_ID, "expert_type": "agent",
-              "display_name_zh": "腾讯轻量云专家", "profession_zh": "腾讯轻量云专家",
-              "version": "1.0.2", "categories": []}
+def _run_named_expert(ctx, expert, *, local=False):
+    expert = dict(expert)
     try:
         for candidate in growth_events.market_expert_list(ctx.base, ctx.token, ctx.uid, "agent",
                                                           domain=ctx.domain):
-            if candidate.get("expert_id") == LIGHTHOUSE_EXPERT_ID:
+            if candidate.get("expert_id") == expert["expert_id"]:
                 expert = candidate
                 break
     except growth_events.Failure:
-        pass     # 市场不可用时用内置专家信息（id 为平台真实 id）
+        pass  # Fall back to the verified task-specific id when the market is unavailable.
     _report_desktop(ctx, growth_events.expert_summon_sequence(expert))
     conversation_id, request_id = _real_chat(ctx, expert_id=expert["expert_id"])
     events = growth_events.chat_sequence(conversation_id, request_id,
@@ -299,9 +319,38 @@ def run_expert_lighthouse(ctx, task):
         if event["eventCode"] == "agent_task_created":
             event.update(has_expert=True, expert_id=expert["expert_id"],
                          expert_name=expert.get("display_name_zh") or "", expert_industry_id="")
-    events.append(growth_events.expert_actual_use(expert, conversation_id, request_id, mode="LOCAL"))
+    events.append(growth_events.expert_actual_use(
+        expert, conversation_id, request_id, mode="LOCAL" if local else "craft"))
     _report_desktop(ctx, events)
+    return f"已上报「{expert.get('display_name_zh') or expert['expert_id']}」召唤+使用链（真实对话 requestId）"
+
+
+def run_expert_lighthouse(ctx, task):
+    _run_named_expert(ctx, {
+        "expert_id": LIGHTHOUSE_EXPERT_ID, "expert_type": "agent",
+        "display_name_zh": "腾讯轻量云专家", "profession_zh": "腾讯轻量云专家",
+        "version": "1.0.2", "categories": []}, local=True)
     return "已上报轻量云专家召唤+使用链（真实对话 requestId）"
+
+
+def run_workbuddy_valorant(ctx, task):
+    return _run_named_expert(ctx, NAMED_EXPERT_TASKS["WorkBuddy_Valorant"])
+
+
+def run_expert_bowangwang(ctx, task):
+    return _run_named_expert(ctx, NAMED_EXPERT_TASKS["expert_use_bowangwang"])
+
+
+def run_expert_douyinyin(ctx, task):
+    return _run_named_expert(ctx, NAMED_EXPERT_TASKS["expert_use_douyinyin"])
+
+
+def run_expert_maidehao(ctx, task):
+    return _run_named_expert(ctx, NAMED_EXPERT_TASKS["expert_use_maidehao"])
+
+
+def run_expert_shangjia_xuanchuan(ctx, task):
+    return _run_named_expert(ctx, NAMED_EXPERT_TASKS["expert_use_shangjia_xuanchuan"])
 
 
 def run_black_cat(ctx, task):
@@ -522,6 +571,11 @@ RUNNERS = {
     "Hp_Appearance": run_hp_appearance,
     "Model_chat_GLM5.2": run_model_chat_glm, "skill_1": run_skill_1, "expert_5": run_expert_5,
     "Expert_team_use_3": run_expert_team_3, "Expert_lighthouse": run_expert_lighthouse,
+    "WorkBuddy_Valorant": run_workbuddy_valorant,
+    "expert_use_bowangwang": run_expert_bowangwang,
+    "expert_use_douyinyin": run_expert_douyinyin,
+    "expert_use_maidehao": run_expert_maidehao,
+    "expert_use_shangjia_xuanchuan": run_expert_shangjia_xuanchuan,
     "black_cat": run_black_cat,
     "school_season": run_school_season, "Sequential_Tasks_1": run_sequential_1,
     "Sequential_Tasks_2": run_sequential_2, "Sequential_Tasks_3": run_sequential_3,
