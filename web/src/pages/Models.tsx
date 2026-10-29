@@ -58,32 +58,37 @@ import { JobBanner, ProgressBanner, type Job } from "../jobs";
 import s from "../ui.module.scss";
 import { SearchInput, Select } from "../fields";
 import { clearToasts, notify } from "../toast";
+import { useT } from "../i18n";
 export const profiles = ["cn-cli", "cn-work", "intl-cli", "intl-work"];
 const mediaKindLabels: Record<string, string> = { image: "文生图", edit: "图生图", video: "视频" };
 const validId = (id: string) => /^[A-Za-z0-9_.:/@-]{1,160}$/.test(id) && ![".", ".."].includes(id);
-export function validateRule(rule: ModelRule, models: ModelRule[]): string | null {
+export function validateRule(
+  rule: ModelRule,
+  models: ModelRule[],
+  translate: (key: string) => string = (key) => key,
+): string | null {
   if (!rule.public_id.trim()) return "对外 ID 不能为空";
   if (rule.public_id !== rule.public_id.trim() || /\s/.test(rule.public_id))
     return "对外 ID 不能包含空白字符";
   if (!validId(rule.public_id)) return "对外 ID 只允许 1–160 位字母、数字及 _ . : / @ -";
   if (!validId(rule.upstream_id ?? rule.id)) return "上游 ID 不能为空，且须为有效模型标识";
   if (rule.routes) {
-    if (!rule.routes.length) return "路由列表不能为空，删除全部候选请停用模型";
+    if (!rule.routes.length) return translate("models.routes.invalidEmpty");
     const routeIds = new Set<string>();
     let hasWeight = false;
     let hasPositive = false;
     for (const route of rule.routes) {
       if (!validId(route.upstream_id) || routeIds.has(route.upstream_id))
-        return "路由上游 ID 必须非空且不重复";
+        return translate("models.routes.invalidId");
       routeIds.add(route.upstream_id);
       if (route.weight !== null) {
         hasWeight = true;
         if (!Number.isFinite(route.weight) || route.weight < 0 || route.weight > 1000)
-          return "路由权重必须是 0–1000 的有限数字";
+          return translate("models.routes.invalidWeight");
         if (route.weight > 0) hasPositive = true;
       }
     }
-    if (hasWeight && !hasPositive) return "加权路由至少需要一条正权重路线";
+    if (hasWeight && !hasPositive) return translate("models.routes.invalidPositive");
   }
   if (
     models.some(
@@ -240,10 +245,11 @@ export function ModelEditor({
   rateProbe?: RateProbeControl;
   creating?: boolean;
 }) {
+  const t = useT();
   const [rule, setRule] = useState({
     ...model,
     upstream_id: model.upstream_id ?? model.id,
-    routes: model.routes?.map((route) => ({ ...route })) ?? [],
+    routes: model.routes?.map((route) => ({ ...route })),
     region:
       model.region ||
       (!model.credential_ids.length && profiles.includes(model.profile)
@@ -251,6 +257,9 @@ export function ModelEditor({
         : ""),
   });
   const [mode, setMode] = useState<Mode>(() => bindingMode(model));
+  const [routesTouched, setRoutesTouched] = useState(
+    () => model.routes?.some((route) => route.source === "manual") ?? false,
+  );
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -259,6 +268,7 @@ export function ModelEditor({
   useEffect(() => () => request.current?.abort(), []);
   const update = <K extends keyof ModelRule>(key: K, value: ModelRule[K]) => {
     setRule((old) => ({ ...old, [key]: value }));
+    if (key === "routes") setRoutesTouched(true);
     setPreview(null);
   };
   const chooseMode = (next: Mode) => {
@@ -275,7 +285,7 @@ export function ModelEditor({
   };
   const run = (save: boolean) => {
     const invalid =
-      validateRule(rule, models) ??
+      validateRule(rule, models, t) ??
       (mode === "accounts" && !rule.credential_ids.length ? "请选择至少一个账号" : null);
     if (invalid) {
       setError(invalid);
@@ -289,7 +299,7 @@ export function ModelEditor({
       revision,
       public_id: rule.public_id,
       upstream_id: rule.upstream_id,
-      ...(rule.routes?.length ? { routes: rule.routes } : {}),
+      ...(routesTouched && rule.routes?.length ? { routes: rule.routes } : {}),
       enabled: rule.enabled,
       keep_original: rule.keep_original,
       region: rule.region || null,
@@ -374,13 +384,11 @@ export function ModelEditor({
             </datalist>
           </div>
           <fieldset className={s.fieldset}>
-            <legend>多模型路由</legend>
-            <p>
-              可按顺序或权重选择多个上游模型。留空权重时按列表从上到下尝试；关闭路线不会参与派发。
-            </p>
-            {rule.routes.length > 0 && (
+            <legend>{t("models.routes.title")}</legend>
+            <p>{t("models.routes.help")}</p>
+            {(rule.routes?.length ?? 0) > 0 && (
               <div className={s.routePreview}>
-                {rule.routes.map((route, index) => (
+                {rule.routes?.map((route, index) => (
                   <div className={s.routeCandidate} key={`${route.upstream_id}-${index}`}>
                     <input
                       value={route.upstream_id}
@@ -389,7 +397,7 @@ export function ModelEditor({
                       onChange={(e) =>
                         update(
                           "routes",
-                          rule.routes.map((item, i) =>
+                          (rule.routes ?? []).map((item, i) =>
                             i === index ? { ...item, upstream_id: e.target.value } : item,
                           ),
                         )
@@ -401,11 +409,11 @@ export function ModelEditor({
                       max="1000"
                       step="any"
                       value={route.weight ?? ""}
-                      placeholder="权重"
+                      placeholder={t("models.routes.weight")}
                       onChange={(e) =>
                         update(
                           "routes",
-                          rule.routes.map((item, i) =>
+                          (rule.routes ?? []).map((item, i) =>
                             i === index
                               ? {
                                   ...item,
@@ -423,24 +431,24 @@ export function ModelEditor({
                         onChange={(e) =>
                           update(
                             "routes",
-                            rule.routes.map((item, i) =>
+                            (rule.routes ?? []).map((item, i) =>
                               i === index ? { ...item, enabled: e.target.checked } : item,
                             ),
                           )
                         }
                       />
-                      启用
+                      {t("models.routes.enabled")}
                     </label>
                     <button
                       type="button"
                       onClick={() =>
                         update(
                           "routes",
-                          rule.routes.filter((_, i) => i !== index),
+                          (rule.routes ?? []).filter((_, i) => i !== index),
                         )
                       }
                     >
-                      删除
+                      {t("models.routes.remove")}
                     </button>
                   </div>
                 ))}
@@ -451,9 +459,9 @@ export function ModelEditor({
               onClick={() =>
                 update(
                   "routes",
-                  rule.routes.length
+                  (rule.routes?.length ?? 0)
                     ? [
-                        ...rule.routes,
+                        ...(rule.routes ?? []),
                         {
                           upstream_id: rule.upstream_id,
                           weight: null,
@@ -472,7 +480,7 @@ export function ModelEditor({
                 )
               }
             >
-              添加路由候选
+              {t("models.routes.add")}
             </button>
           </fieldset>
           <div className={s.actions}>

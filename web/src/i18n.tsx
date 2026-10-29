@@ -635,6 +635,18 @@ const zh = {
   "media.settings.save": "保存",
   "media.settings.saved": "媒体设置已保存",
   "media.settings.note": "缩小容量或时长会在下次写入或定时清理时淘汰旧资源。",
+  "models.routes.title": "多模型路由",
+  "models.routes.help":
+    "可按顺序或权重选择多个上游模型。留空权重时按列表从上到下尝试；关闭路线不会参与派发。",
+  "models.routes.label": "路由",
+  "models.routes.weight": "权重",
+  "models.routes.enabled": "启用",
+  "models.routes.remove": "删除",
+  "models.routes.add": "添加路由候选",
+  "models.routes.invalidEmpty": "路由列表不能为空，删除全部候选请停用模型",
+  "models.routes.invalidId": "路由上游 ID 必须非空且不重复",
+  "models.routes.invalidWeight": "路由权重必须是 0–1000 的有限数字",
+  "models.routes.invalidPositive": "加权路由至少需要一条正权重路线",
 } satisfies Record<string, string>;
 export type MessageKey = keyof typeof zh;
 
@@ -1288,6 +1300,20 @@ const en: Record<MessageKey, string> = {
   "media.settings.saved": "Media settings saved",
   "media.settings.note":
     "Shrinking capacity or retention evicts older assets on the next write or cleanup.",
+  "models.routes.title": "Multi-model routes",
+  "models.routes.help":
+    "Choose upstream models by order or weight. Empty weights use top-to-bottom fallback; disabled routes are skipped.",
+  "models.routes.label": "Routes",
+  "models.routes.weight": "Weight",
+  "models.routes.enabled": "Enabled",
+  "models.routes.remove": "Remove",
+  "models.routes.add": "Add route",
+  "models.routes.invalidEmpty":
+    "The route list cannot be empty; disable the model to remove every candidate.",
+  "models.routes.invalidId": "Route upstream IDs must be non-empty and unique.",
+  "models.routes.invalidWeight": "Route weights must be finite numbers from 0 to 1000.",
+  "models.routes.invalidPositive":
+    "A weighted route list needs at least one enabled positive weight.",
 };
 
 const messages: Record<Lang, Record<string, string>> = { zh, en };

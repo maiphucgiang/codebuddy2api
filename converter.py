@@ -2311,11 +2311,15 @@ def _build_catalog_route_groups(accounts: dict) -> tuple[dict, dict]:
               for key, values in BUILTIN_MODEL_ROUTE_GROUPS.items()}
     aliases = {route["upstream_id"]: key
                for key, values in routes.items() for route in values if route["upstream_id"] != key}
-    for ids in grouped.values():
+    cloud_signatures = {}
+    for signature, ids in grouped.items():
         ordered = list(dict.fromkeys(ids))
         if len(ordered) < 2:
             continue
         canonical = ordered[0]
+        if canonical in cloud_signatures and cloud_signatures[canonical] != signature:
+            continue
+        cloud_signatures[canonical] = signature
         cloud_routes = [{"upstream_id": model_id, "weight": None,
                          "enabled": True, "source": "cloud"} for model_id in ordered]
         existing = {route["upstream_id"] for route in routes.get(canonical, [])}
@@ -4351,6 +4355,10 @@ async def create_embeddings(request: Request,
     requested_model = payload.get("model")
     model = model_policy.resolve(CONFIG, requested_model)
     model_policy.check_resolved(CONFIG, model)
+    if len(model_policy.route_ids(CONFIG, requested_model)) > 1:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "embedding 模型暂不支持多模型路由，请为该模型保留单一路线",
+            "type": "invalid_request_error", "code": "multi_route_not_supported", "param": "model"}})
     if not embeddings.is_embedding_model(model):
         raise HTTPException(status_code=400, detail={"error": {
             "message": f"模型 {model} 不是 embedding 模型，请选择 /v1/models 中的向量模型",
@@ -4458,6 +4466,10 @@ async def create_rerank(request: Request,
     requested_model = payload.get("model") or rerank.MODEL_ID
     model = model_policy.resolve(CONFIG, requested_model)
     model_policy.check_resolved(CONFIG, model)
+    if len(model_policy.route_ids(CONFIG, requested_model)) > 1:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "rerank 模型暂不支持多模型路由，请为该模型保留单一路线",
+            "type": "invalid_request_error", "code": "multi_route_not_supported", "param": "model"}})
     if not rerank.is_rerank_model(model):
         raise HTTPException(status_code=400, detail={"error": {
             "message": f"模型 {model} 不是重排序模型，请使用 reranker",
@@ -4532,7 +4544,8 @@ async def chat_completions(request: Request,
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
     # Credential selection and refresh perform blocking file and network I/O.
     prepared = body        # Keep canonical input for failover policy checks.
-    body, cred, headers, url = await run_in_threadpool(_route_chat, payload, body, rid)
+    body, attempt = await run_in_threadpool(_route_chat_with_routes, payload, body, rid)
+    body, cred, headers, url = attempt
     _log_json(f"[{rid}] REQUEST BODY (发往后端，预览)", body)
     t0 = time.time()
 
@@ -5414,6 +5427,23 @@ def _route_retry_attempt(payload, canonical, rid):
     return None, None
 
 
+def _route_chat_with_routes(payload, body, rid):
+    """Select the first route with an eligible account, skipping preflight failures."""
+    candidate = body
+    last_error = None
+    while candidate is not None:
+        try:
+            model_policy.bind_route(CONFIG, candidate.get("model"), candidate.get("_route_index"))
+            return candidate, _route_chat(payload, candidate, rid)
+        except HTTPException as error:
+            last_error = error
+            candidate = _next_route_body(candidate)
+    if last_error is not None:
+        raise last_error
+    raise HTTPException(status_code=503, detail={"error": {
+        "message": "所有模型路线均不可用", "type": "service_unavailable", "code": "routes_unavailable"}})
+
+
 async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cred, headers, url):
     """Prefetch with bounded credential failover, using canonical input to preserve routing restrictions."""
     tried = []
@@ -5426,17 +5456,19 @@ async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cr
             await _close_stream(stream)   # Release the failed upstream connection.
             release_credential(cred)
             recovered = observe_failure_seq()   # Recover only this failure sequence.
-            next_body, attempt = await run_in_threadpool(_route_retry_attempt, payload, canonical, rid)
-            if attempt is not None:
-                canonical = next_body
-                routed, cred, headers, url = attempt
-                _log(f"[{rid}] ↻ 切换模型路由 | {model_name} → {routed.get('model')}")
-                continue
             tried.append(cred)
             limit = _failover_limit()
             surface = HTTPException(status_code=failure.status, headers=failure.headers,
                                     detail=_safe_err_raw(failure.raw, failure.status))
-            if limit <= 0 or len(tried) > limit or not _failover_safe(failure.error, failure.raw):
+            safe = _failover_safe(failure.error, failure.raw)
+            if safe:
+                next_body, attempt = await run_in_threadpool(_route_retry_attempt, payload, canonical, rid)
+                if attempt is not None:
+                    canonical = next_body
+                    routed, cred, headers, url = attempt
+                    _log(f"[{rid}] ↻ 切换模型路由 | {model_name} → {routed.get('model')}")
+                    continue
+            if limit <= 0 or len(tried) > limit or not safe:
                 raise surface from None
             try:
                 attempt = await run_in_threadpool(_route_chat, payload, canonical, rid,
@@ -5482,18 +5514,20 @@ async def _routed_fetch(payload, canonical, model_name, rid, t0, fetch, routed, 
             release_credential(cred)
             status, raw = _upstream_failure(error, model_name, t0, rid)
             recovered = observe_failure_seq()
-            next_body, attempt = await run_in_threadpool(_route_retry_attempt, payload, canonical, rid)
-            if attempt is not None:
-                canonical = next_body
-                routed, cred, headers, url = attempt
-                tried = []
-                _log(f"[{rid}] ↻ 切换模型路由 | {model_name} → {routed.get('model')}")
-                continue
             tried.append(cred)
             limit = _failover_limit()
             surface = HTTPException(status_code=status, detail=_safe_err_raw(raw, status),
                                     headers=error.headers if isinstance(error, UpstreamHTTPError) else None)
-            if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
+            safe = _failover_safe(error, raw)
+            if safe:
+                next_body, attempt = await run_in_threadpool(_route_retry_attempt, payload, canonical, rid)
+                if attempt is not None:
+                    canonical = next_body
+                    routed, cred, headers, url = attempt
+                    tried = []
+                    _log(f"[{rid}] ↻ 切换模型路由 | {model_name} → {routed.get('model')}")
+                    continue
+            if limit <= 0 or len(tried) > limit or not safe:
                 raise surface from None
             try:
                 attempt = await run_in_threadpool(_route_chat, payload, canonical, rid,
@@ -6290,7 +6324,8 @@ async def create_response(request: Request,
     )
     # Keep blocking credential selection and refresh off the event loop.
     prepared = chat_body        # Preserve canonical input for routing policy checks.
-    chat_body, cred, headers, url = await run_in_threadpool(_route_chat, payload, chat_body, rid)
+    chat_body, attempt = await run_in_threadpool(_route_chat_with_routes, payload, chat_body, rid)
+    chat_body, cred, headers, url = attempt
     _log_json(f"[{rid}] RESPONSES → CHAT BODY (预览)", chat_body)
     t0 = time.time()
 
@@ -6530,7 +6565,8 @@ async def create_message(request: Request,
     _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
     # Keep blocking credential selection and refresh off the event loop.
     prepared = chat_body        # Preserve canonical input for routing policy checks.
-    chat_body, cred, headers, url = await run_in_threadpool(_route_chat, payload, chat_body, rid)
+    chat_body, attempt = await run_in_threadpool(_route_chat_with_routes, payload, chat_body, rid)
+    chat_body, cred, headers, url = attempt
     _log_json(f"[{rid}] ANTHROPIC → CHAT BODY (预览)", chat_body)
     t0 = time.time()
 

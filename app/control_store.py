@@ -87,7 +87,8 @@ def validate_model(source, rule, models=None, known_models=(), *, legacy_scopes=
                 weighted = True
             normalized_routes.append({"upstream_id": route_id, "weight": weight,
                                       "enabled": enabled, "source": source_kind})
-        if weighted and not any((route["weight"] or 0) > 0 for route in normalized_routes):
+        if weighted and not any((route["weight"] or 0) > 0 and route["enabled"]
+                                for route in normalized_routes):
             raise ValueError("加权路由至少需要一条正权重路线")
         clean["routes"] = normalized_routes
     if type(clean["custom"]) is not bool or (clean["custom"] and clean["keep_original"]):

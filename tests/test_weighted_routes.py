@@ -26,7 +26,9 @@ def config(rule):
 
 class WeightedRouteTests(TestCase):
     def test_legacy_rule_keeps_one_upstream_route(self):
-        self.assertEqual(model_policy.route_candidates({"control_store": None}, "plain"), ["plain"])
+        self.assertEqual(model_policy.route_candidates(
+            {"control_store": Store({"public": {"public_id": "public", "upstream_id": "legacy"}})},
+            "public"), ["legacy"])
 
     def test_ordered_routes_skip_disabled_entries(self):
         rule = {"public_id": "aggregate", "upstream_id": "first", "routes": [
@@ -37,12 +39,13 @@ class WeightedRouteTests(TestCase):
         self.assertEqual(model_policy.route_candidates(config(rule), "aggregate"), ["second", "third"])
 
     def test_weighted_routes_select_a_weighted_first_candidate(self):
-        rule = {"public_id": "aggregate", "upstream_id": "first", "routes": [
+        rule = {"public_id": "weighted-ratio", "upstream_id": "first", "routes": [
             {"upstream_id": "first", "weight": 3},
             {"upstream_id": "second", "weight": 1},
         ]}
-        seen = [model_policy.route_candidates(config(rule), "aggregate")[0] for _ in range(40)]
-        self.assertGreater(seen.count("first"), seen.count("second"))
+        seen = [model_policy.route_candidates(config(rule), "weighted-ratio")[0] for _ in range(40)]
+        self.assertEqual(seen.count("first"), 30)
+        self.assertEqual(seen.count("second"), 10)
         self.assertEqual(set(seen), {"first", "second"})
 
     def test_all_disabled_routes_are_unavailable(self):
@@ -60,11 +63,15 @@ class WeightedRouteTests(TestCase):
             ]}, known_models=["first", "second"])
         self.assertEqual([item["upstream_id"] for item in rule["routes"]], ["first", "second"])
         self.assertFalse(rule["routes"][0]["enabled"])
+        self.assertEqual(rule["routes"][0]["source"], "builtin")
+        self.assertEqual(rule["routes"][1]["source"], "cloud")
         self.assertEqual(rule["routes"][1]["weight"], 2.0)
 
     def test_validation_rejects_zero_weight_only_and_duplicate_routes(self):
         for routes in (
             [{"upstream_id": "first", "weight": 0}],
+            [{"upstream_id": "first", "weight": 2, "enabled": False},
+             {"upstream_id": "second", "weight": 0, "enabled": True}],
             [{"upstream_id": "first"}, {"upstream_id": "first"}],
         ):
             with self.subTest(routes=routes), self.assertRaises(ValueError):

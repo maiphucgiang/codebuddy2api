@@ -1,5 +1,6 @@
 """Local model policies layered over account-owned upstream capabilities."""
 from contextvars import ContextVar
+from math import gcd
 import threading
 
 from fastapi import HTTPException
@@ -9,7 +10,7 @@ from app.model_capabilities import route_metadata
 from app.api_keys import api_principal
 _request_policy = ContextVar("gateway_model_policy", default=None)
 _route_counter_lock = threading.Lock()
-_route_counter = 0
+_route_counters = {}
 
 
 def _principal():
@@ -129,7 +130,7 @@ def rule_for(config, source, policy=None):
     return {**default_rule(source), **_policy(config, policy)["models"].get(source, {})}
 
 
-def _route_candidates_for_rule(rule: dict, auto_routes=None) -> list[str]:
+def _route_candidates_for_rule(rule: dict, auto_routes=None, counter_key=None) -> list[str]:
     routes = rule.get("routes")
     if not isinstance(routes, list) and isinstance(auto_routes, list):
         routes = auto_routes
@@ -142,17 +143,24 @@ def _route_candidates_for_rule(rule: dict, auto_routes=None) -> list[str]:
     if not weighted:
         return [route["upstream_id"] for route in enabled]
     weights = [route.get("weight") if route.get("weight") is not None else 1.0 for route in enabled]
-    total = sum(weights)
+    scale = 1000
+    while scale < 1_000_000 and any(abs(weight * scale - round(weight * scale)) > 1e-9 for weight in weights):
+        scale *= 10
+    units = [max(0, int(round(weight * scale))) for weight in weights]
+    total = sum(units)
     if total <= 0:
         return []
-    global _route_counter
+    key = counter_key or rule.get("public_id") or rule.get("upstream_id")
+    step = units[0]
+    for unit in units[1:]:
+        step = gcd(step, unit)
     with _route_counter_lock:
-        offset = (_route_counter * 1000) % max(1, int(round(total * 1000)))
-        _route_counter += 1
+        offset = (_route_counters.get(key, 0) * step) % total
+        _route_counters[key] = _route_counters.get(key, 0) + 1
     cursor = 0
     selected = 0
-    for index, weight in enumerate(weights):
-        cursor += int(round(weight * 1000))
+    for index, weight in enumerate(units):
+        cursor += weight
         if offset < cursor:
             selected = index
             break
@@ -166,7 +174,8 @@ def route_candidates(config, public_model: str, policy=None) -> list[str]:
         return list(state.get("route_candidates") or ())
     source = source_for(config, public_model, policy)
     return _route_candidates_for_rule(rule_for(config, source, policy),
-                                      (config.get("model_route_groups") or {}).get(source))
+                                      (config.get("model_route_groups") or {}).get(source),
+                                      counter_key=public_model)
 
 
 def route_ids(config, public_model: str, policy=None) -> list[str]:
@@ -249,9 +258,10 @@ def resolve(config, public_model):
         return state["upstream"]
     data = snapshot(config)
     source = next((key for key, value in data["models"].items()
-                   if value.get("public_id", key) == public_model),
-                  embeddings.MODEL_ID if public_model in (embeddings.MODEL_ID, embeddings.PUBLIC_MODEL_ID)
-                  else public_model)
+                   if value.get("public_id", key) == public_model), None)
+    if source is None:
+        source = (embeddings.MODEL_ID if public_model in (embeddings.MODEL_ID, embeddings.PUBLIC_MODEL_ID)
+                  else (config.get("model_route_aliases") or {}).get(public_model, public_model))
     rule = {**default_rule(source), **data["models"].get(source, {})}
     if principal is not None and principal.models is not None and _restriction_source(source) not in principal.models:
         raise HTTPException(status_code=403, detail={"error": {
@@ -261,7 +271,8 @@ def resolve(config, public_model):
         _deny("模型已停用")
     if source == public_model and (rule["custom"] or (rule["public_id"] != source and not rule["keep_original"])):
         _deny("原模型 ID 已停用，请使用已配置的对外 ID", "model_renamed")
-    candidates = _route_candidates_for_rule(rule, (config.get("model_route_groups") or {}).get(source))
+    candidates = _route_candidates_for_rule(rule, (config.get("model_route_groups") or {}).get(source),
+                                            counter_key=public_model)
     if state is None and (not candidates or candidates[0] != source) and rule["upstream_id"] != source:
         raise HTTPException(status_code=503, detail={"error": {"message": "模型路由上下文未初始化",
                             "type": "server_error", "code": "model_policy_context_missing"}})
