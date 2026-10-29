@@ -164,14 +164,14 @@ def route_candidates(config, public_model: str, policy=None) -> list[str]:
     state = _request_policy.get()
     if state and public_model in (state.get("public_model"), state.get("upstream")):
         return list(state.get("route_candidates") or ())
-    source = source_for(config, public_model)
+    source = source_for(config, public_model, policy)
     return _route_candidates_for_rule(rule_for(config, source, policy),
                                       (config.get("model_route_groups") or {}).get(source))
 
 
 def route_ids(config, public_model: str, policy=None) -> list[str]:
     """Return all enabled route IDs without applying weighted selection."""
-    source = source_for(config, public_model)
+    source = source_for(config, public_model, policy)
     rule = rule_for(config, source, policy)
     routes = rule.get("routes")
     if not isinstance(routes, list):
@@ -190,16 +190,18 @@ def bind_route(config, upstream: str, index: int | None = None) -> None:
             state["route_index"] = index
 
 
-def source_for(config, name):
+def source_for(config, name, policy=None):
     """Resolve a public model name or automatic alias to its policy source."""
     if name == "default-model":
         return "auto"
     if name in (embeddings.MODEL_ID, embeddings.PUBLIC_MODEL_ID):
         return embeddings.MODEL_ID
+    data = policy.data if policy is not None else snapshot(config)
     aliases = config.get("model_route_aliases") or {}
-    if name in aliases and name not in snapshot(config).get("models", {}):
-        return aliases[name]
-    data = snapshot(config)
+    if name in aliases:
+        saved = data.get("models", {}).get(name) or {}
+        if not saved.get("custom") and not isinstance(saved.get("routes"), list):
+            return aliases[name]
     for source, rule in data.get("models", {}).items():
         if rule.get("public_id", source) == name:
             return source
@@ -328,8 +330,10 @@ def public_details(gateway, region=None):
     entries = pool.entries() if pool is not None else []
     out = []
     for source in dict.fromkeys([*known, *policies]):
-        if source in (config.get("model_route_aliases") or {}) and source not in policies:
-            continue
+        if source in (config.get("model_route_aliases") or {}):
+            saved = policies.get(source) or {}
+            if not saved.get("custom") and not isinstance(saved.get("routes"), list):
+                continue
         rule = rule_for(config, source, policy)
         upstream = rule["upstream_id"]
         route_names = route_ids(config, source, policy)
