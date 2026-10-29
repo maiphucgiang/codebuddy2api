@@ -377,9 +377,10 @@ def public_details(gateway, region=None):
                                 and route_allowed(config, entry, upstream, rule=rule, policy=policy)):
                             candidates = [entry]
             else:
-                candidates = [entry for entry in entries if route_allowed(
-                    config, entry, upstream, rule=rule, policy=policy)
-                    and pool._eligible(entry, upstream, region=region)]
+                candidates = [entry for entry in entries if any(
+                    route_allowed(config, entry, route, rule=rule, policy=policy)
+                    and pool._eligible(entry, route, region=region, rule=rule, policy=policy)
+                    for route in route_names)]
         finally:
             _request_policy.reset(token)
         if not candidates and (pool is not None or media or embedding or reranking):
@@ -389,16 +390,18 @@ def public_details(gateway, region=None):
         if accounts is not None:
             for entry in candidates:
                 profile = entry.get("profile")
-                for model in gateway._published_account_scope(
-                        accounts.get(entry.get("account_key")) or {}, "serves", model_id=gateway._upstream_model(upstream, profile)) or []:
-                    if model.get("id") == gateway._upstream_model(upstream, profile):
-                        price = gateway._multiplier_value(model.get("credits"))
-                        if price is not None and price <= prices.get(profile, price):
-                            prices[profile] = price
-                            if model.get("credits_source") == "measured":
-                                measured.add(profile)
-                            else:
-                                measured.discard(profile)
+                for route in route_names:
+                    route_id = gateway._upstream_model(route, profile)
+                    for model in gateway._published_account_scope(
+                            accounts.get(entry.get("account_key")) or {}, "serves", model_id=route_id) or []:
+                        if model.get("id") == route_id:
+                            price = gateway._multiplier_value(model.get("credits"))
+                            if price is not None and price <= prices.get(profile, price):
+                                prices[profile] = price
+                                if model.get("credits_source") == "measured":
+                                    measured.add(profile)
+                                else:
+                                    measured.discard(profile)
         else:
             allowed_profiles = {entry.get("profile") for entry in candidates}
             prices = {profile: price for profile, price in item["credits_by_profile"].items()
