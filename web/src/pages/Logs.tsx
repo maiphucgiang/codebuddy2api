@@ -47,6 +47,7 @@ const emptyFilters = {
   profile: "",
   status: "",
   client_ip: "",
+  api_key: "",
   type: "",
   search: "",
 };
@@ -94,12 +95,48 @@ export function Logs() {
   const detailRequest = useRef<AbortController | null>(null);
   useEffect(() => () => detailRequest.current?.abort(), []);
   const [clear, setClear] = useState(false);
+  const [keyNames, setKeyNames] = useState<Record<string, string>>({});
+  useEffect(() => {
+    let active = true;
+    void api
+      .get("/keys")
+      .then((response) => {
+        if (!active) return;
+        const rows = list(object(response.data).items, "密钥列表");
+        setKeyNames(
+          Object.fromEntries(
+            rows
+              .filter((item) => typeof item.id === "string" && typeof item.name === "string")
+              .map((item) => [item.id, item.name]),
+          ),
+        );
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
   const params = new URLSearchParams({ kind, limit: "50" });
   Object.entries(filters).forEach(([key, value]) => {
     if (value) params.set(key, value);
   });
   if (cursors.length) params.set("cursor", cursors.at(-1)!);
   const resource = useResource(`/logs?${params.toString()}`, normalize);
+  const apiKeyLabel = (value: unknown) => {
+    if (value === null || value === undefined || value === "") return t("logs.legacyApiKey");
+    const id = text(value);
+    if (id === "anonymous") return t("logs.anonymousApiKey");
+    if (id === "admin-external") return t("logs.externalApiKey");
+    return keyNames[id] ?? t("logs.deletedApiKey", { id });
+  };
+  const keyOptions = Array.from(
+    new Set([
+      ...Object.keys(keyNames),
+      ...(resource.data?.items.flatMap((item) =>
+        typeof item.api_key === "string" && item.api_key ? [item.api_key] : [],
+      ) ?? []),
+    ]),
+  );
   const closeDetail = () => {
     detailRequest.current?.abort();
     detailRequest.current = null;
@@ -217,6 +254,18 @@ export function Logs() {
                 onChange={(e) => setDraft({ ...draft, client_ip: e.target.value })}
               />
               <Select
+                aria-label={t("logs.filter.apiKey")}
+                value={draft.api_key}
+                onChange={(value) => setDraft({ ...draft, api_key: value })}
+              >
+                <option value="">{t("logs.allApiKeys")}</option>
+                {keyOptions.map((id) => (
+                  <option key={id} value={id}>
+                    {apiKeyLabel(id)}
+                  </option>
+                ))}
+              </Select>
+              <Select
                 aria-label={t("logs.filter.profile")}
                 value={draft.profile}
                 onChange={(value) => setDraft({ ...draft, profile: value })}
@@ -294,6 +343,7 @@ export function Logs() {
                     )}
                     {kind === "request" && (
                       <>
+                        <th>{t("logs.col.apiKey")}</th>
                         <th>{t("logs.col.duration")}</th>
                         <th>Token / Credit</th>
                       </>
@@ -395,6 +445,7 @@ export function Logs() {
                         )}
                         {kind === "request" && (
                           <>
+                            <td>{apiKeyLabel(item.api_key)}</td>
                             <td>{metric(item.duration_ms)} ms</td>
                             <td>
                               {metric(item.total_tokens)}

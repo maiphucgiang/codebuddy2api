@@ -22,7 +22,7 @@ from app.audit_store import AuditStore
 from app.control_store import ControlStore
 from app.observability import AuditMiddleware
 from app.settings import apply_persisted_settings, resolve_settings
-from app.startup import load_startup_env, resolve_startup_key
+from app.startup import load_startup_env, resolve_startup_auth
 from app.adapters.anthropic_adapter import AnthropicStreamConverter
 from app.adapters.responses_adapter import ResponsesStreamConverter
 from app.upstream_io import ChatSSEAccumulator, StreamOutputBudget, UpstreamResponseError
@@ -1423,10 +1423,10 @@ class StreamPolicyTests(unittest.TestCase):
             store.update_settings({"stream_mode": "compatible"}, store.snapshot()["revision"])
             with patch.dict(os.environ, {"CODEBUDDY2API_KEY": "synthetic-test-key"}, clear=True):
                 dotenv_keys = load_startup_env(path)
-                config = {"control_store": store}
+                config = {"control_store": store, "settings_sources": {"api_key": "environment"}}
                 apply_persisted_settings(config, environ=os.environ)
                 config["state_store"] = store.state
-                resolve_startup_key(config, SimpleNamespace(api_key="synthetic-test-key"), dotenv_keys)
+                resolve_startup_auth(config, SimpleNamespace(api_key="synthetic-test-key"), dotenv_keys)
             item = next(value for value in resolve_settings(config) if value["key"] == "stream_mode")
             self.assertEqual((config["stream_mode"], item["source"], item["locked"]),
                              ("realtime", "dotenv", True))
@@ -1435,10 +1435,10 @@ class StreamPolicyTests(unittest.TestCase):
                     "CODEBUDDY2API_KEY": "synthetic-test-key",
                     "CODEBUDDY2API_STREAM_MODE": "compatible"}, clear=True):
                 dotenv_keys = load_startup_env(path)
-                config = {"control_store": store}
+                config = {"control_store": store, "settings_sources": {"api_key": "environment"}}
                 apply_persisted_settings(config, environ=os.environ)
                 config["state_store"] = store.state
-                resolve_startup_key(config, SimpleNamespace(api_key="synthetic-test-key"), dotenv_keys)
+                resolve_startup_auth(config, SimpleNamespace(api_key="synthetic-test-key"), dotenv_keys)
             item = next(value for value in resolve_settings(config) if value["key"] == "stream_mode")
             self.assertEqual((config["stream_mode"], item["source"]), ("compatible", "environment"))
 

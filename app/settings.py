@@ -50,21 +50,29 @@ def normalize_update_mirror(value):
     return value if value.endswith("/") else value + "/"
 
 
-def normalize_trusted_proxies(value):
-    """Normalize a comma/space separated list of trusted proxy IPs or CIDRs."""
+def parse_networks(entries, *, limit, label):
+    """Normalize network entries while retaining caller-specific limits."""
     import ipaddress
-    entries = [entry for entry in re.split(r"[\s,]+", value.strip()) if entry]
-    if len(entries) > 32:
-        raise ValueError("trusted_proxies: 代理数量超出上限")
+    if isinstance(entries, str):
+        entries = [entry for entry in re.split(r"[\s,]+", entries.strip()) if entry]
+    if not isinstance(entries, (list, tuple)) or len(entries) > limit:
+        raise ValueError("trusted_proxies: 代理数量超出上限" if label == "trusted_proxies"
+                         else f"{label}最多 {limit} 条")
     normalized = []
     for entry in entries:
         try:
             network = str(ipaddress.ip_network(entry, strict=False))
         except ValueError:
-            raise ValueError(f"trusted_proxies: 地址无效 {entry!r}") from None
+            raise ValueError(f"trusted_proxies: 地址无效 {entry!r}" if label == "trusted_proxies"
+                             else f"{label}第 {len(normalized) + 1} 条无效") from None
         if network not in normalized:
             normalized.append(network)
-    return ",".join(normalized)
+    return normalized
+
+
+def normalize_trusted_proxies(value):
+    """Normalize a comma/space separated list of trusted proxy IPs or CIDRs."""
+    return ",".join(parse_networks(value, limit=32, label="trusted_proxies"))
 
 
 def validate_projection_max_bytes(value):
@@ -98,7 +106,7 @@ def _item(default, type_, label, *, mode="hot", env=None, minimum=None, maximum=
 SCHEMA = {
     "host": _item("127.0.0.1", "string", "监听地址", mode="restart", env="CODEBUDDY2API_BIND", env_scope="deployment"),
     "port": _item(8787, "integer", "监听端口", mode="restart", env="CODEBUDDY2API_PORT", minimum=1, maximum=65535, env_scope="deployment"),
-    "api_key": _item(None, "secret", "管理与推理密钥", mode="startup", env="CODEBUDDY2API_KEY", sensitive=True, env_scope="deployment"),
+    "api_key": _item(None, "secret", "管理密钥（仅推理）", mode="startup", env="CODEBUDDY2API_KEY", sensitive=True, env_scope="deployment"),
     "auth_file": _item(None, "paths", "显式凭证文件", mode="startup", sensitive=True, env_scope="deployment"),
     "auth_dir": _item(None, "path", "凭证目录", mode="startup", env="CODEBUDDY_AUTH_DIR", sensitive=True, env_scope="deployment"),
     "import_dir": _item(None, "path", "导入目录", mode="startup", env="CODEBUDDY_IMPORT_DIR", sensitive=True, env_scope="deployment"),

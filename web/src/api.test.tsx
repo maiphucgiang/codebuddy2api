@@ -55,7 +55,7 @@ describe("API and session state", () => {
         ),
       );
     }) satisfies AxiosAdapter;
-    await establishSession("isolated-test-key");
+    await establishSession({ username: "admin", password: "isolated-test-key", remember: false });
     await api.get("/oauth/poll", { params: { login_id: "mock-login" } });
     expect(seen[0].withCredentials).toBe(true);
     expect(seen[1].headers.get("X-CSRF-Token")).toBe("mock-csrf");

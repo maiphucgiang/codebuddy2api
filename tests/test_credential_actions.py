@@ -10,10 +10,12 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import converter
+from app import admin_account
 from app.admin_api import install_admin
 from app.audit_store import AuditStore
 from app.control_store import ControlStore
 from app.gateway_management import Management
+from tests.admin_session import credentials, login as session_login
 from tests import test_region_routing as fixtures
 
 
@@ -25,6 +27,7 @@ class CredentialActionTests(unittest.TestCase):
     def setUp(self):
         fixtures.RegionRoutingTests.setUp(self)
         self.control = ControlStore(self.root / "control.sqlite3")
+        admin_account.save(self.control, admin_account.new("admin", "synthetic-management-key", "user"))
         self.audit = AuditStore(self.root / "audit.sqlite3")
         self.addCleanup(self.control.close)
         self.addCleanup(self.audit.close)
@@ -33,8 +36,9 @@ class CredentialActionTests(unittest.TestCase):
         app = FastAPI()
         app.router.routes = list(converter.app.router.routes)
         install_admin(app, converter.CONFIG, Management(converter))
-        self.client = self.enterContext(TestClient(app, base_url="https://testserver",
-            headers={"Authorization": "Bearer synthetic-management-key"}))
+        self.client = self.enterContext(TestClient(app, base_url="https://testserver"))
+        self.client.headers.update(session_login(
+            self.client, origin="https://testserver", password="synthetic-management-key"))
         self.status_query = self.enterContext(patch.object(converter.credits_mod, "fetch_checkin_status",
             return_value={"ok": False, "state": "available", "code": 0}))
         self.travel_mock = self.enterContext(patch("app.travel.perform",
@@ -168,9 +172,10 @@ class CredentialActionTests(unittest.TestCase):
             full.assert_not_called()
 
     def test_api_and_cookie_auth_require_csrf_for_new_actions(self):
-        self.client.headers.pop("authorization")
+        self.client.headers.pop("authorization", None)
+        self.client.cookies.clear()
         self.assertEqual(self.client.post(self.url + "/refresh").status_code, 401)
-        session = self.client.post("/admin/session", json={"api_key": "synthetic-management-key"},
+        session = self.client.post("/admin/session", json=credentials("synthetic-management-key"),
                                    headers={"Origin": "https://testserver"})
         self.assertEqual(session.status_code, 200, session.text)
         self.assertEqual(self.client.post(self.url + "/checkin").status_code, 403)
@@ -192,6 +197,7 @@ class ResetCooldownTests(unittest.TestCase):
         converter.CONFIG.update(api_key="synthetic-management-key", usage_daily_accounts={},
                                 usage_daily={}, cooldowns_path=self.root / "cooldowns.json")
         self.control = ControlStore(self.root / "control.sqlite3")
+        admin_account.save(self.control, admin_account.new("admin", "synthetic-management-key", "user"))
         self.audit = AuditStore(self.root / "audit.sqlite3")
         self.addCleanup(self.control.close)
         self.addCleanup(self.audit.close)
@@ -199,8 +205,9 @@ class ResetCooldownTests(unittest.TestCase):
         app = FastAPI()
         app.router.routes = list(converter.app.router.routes)
         install_admin(app, converter.CONFIG, Management(converter))
-        self.client = self.enterContext(TestClient(app, base_url="https://testserver",
-            headers={"Authorization": "Bearer synthetic-management-key"}))
+        self.client = self.enterContext(TestClient(app, base_url="https://testserver"))
+        self.client.headers.update(session_login(
+            self.client, origin="https://testserver", password="synthetic-management-key"))
 
     def build_pool(self, *, cooldowns_path=None):
         """Build a fresh pool bound to a real cooldown file, as a restart would."""
@@ -336,15 +343,16 @@ class ResetCooldownTests(unittest.TestCase):
     def test_reset_requires_authentication(self):
         pool = self.build_pool()
         entry = self.arm(pool)
-        self.client.headers.pop("authorization")
+        self.client.headers.pop("authorization", None)
+        self.client.cookies.clear()
         self.assertEqual(self.client.post(self.url(entry)).status_code, 401)
         self.assertFalse(pool._healthy(entry))              # Rejected without mutating.
 
     def test_reset_requires_csrf_and_same_origin_for_cookie_sessions(self):
         pool = self.build_pool()
         entry = self.arm(pool)
-        self.client.headers.pop("authorization")
-        session = self.client.post("/admin/session", json={"api_key": "synthetic-management-key"},
+        self.client.headers.pop("authorization", None)
+        session = self.client.post("/admin/session", json=credentials("synthetic-management-key"),
                                    headers={"Origin": "https://testserver"})
         self.assertEqual(session.status_code, 200, session.text)
         self.assertEqual(self.client.post(self.url(entry)).status_code, 403)          # No CSRF yet.

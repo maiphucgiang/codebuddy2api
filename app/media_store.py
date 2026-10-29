@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 DB_NAME = "media.sqlite3"
-SCHEMA_VERSION = 2              # v2 keeps the submitted public model name on video tasks.
+SCHEMA_VERSION = 3              # v3 records the API key that owns each video task.
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 INCOMING_DIR = ".incoming"
@@ -75,9 +75,13 @@ def _row_to_asset(row) -> dict:
     return dict(zip(keys, row))
 
 
+_TASK_COLUMNS = ("task_id,account_key,profile,model,created,updated,status,media_id,error,credit,"
+                 "public_model,api_key")
+
+
 def _row_to_task(row) -> dict:
     keys = ("task_id", "account_key", "profile", "model", "created", "updated",
-            "status", "media_id", "error", "credit", "public_model")
+            "status", "media_id", "error", "credit", "public_model", "api_key")
     return dict(zip(keys, row))
 
 
@@ -108,8 +112,9 @@ class MediaStore:
             CREATE TABLE IF NOT EXISTS tasks(
                 task_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, profile TEXT NOT NULL,
                 model TEXT, created REAL NOT NULL, updated REAL NOT NULL, status TEXT NOT NULL,
-                media_id TEXT, error TEXT, credit REAL, public_model TEXT);
+                media_id TEXT, error TEXT, credit REAL, public_model TEXT, api_key TEXT);
             CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created);
+            CREATE INDEX IF NOT EXISTS tasks_api_key ON tasks(api_key, created);
         """)
 
     def _migrate_schema(self):
@@ -124,6 +129,9 @@ class MediaStore:
         columns = {row[1] for row in self._db.execute("PRAGMA table_info(tasks)").fetchall()}
         if "public_model" not in columns:
             self._db.execute("ALTER TABLE tasks ADD COLUMN public_model TEXT")
+        if "api_key" not in columns:
+            self._db.execute("ALTER TABLE tasks ADD COLUMN api_key TEXT")
+        self._db.execute("CREATE INDEX IF NOT EXISTS tasks_api_key ON tasks(api_key, created)")
         self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._db.commit()
     def close(self):
@@ -319,19 +327,19 @@ class MediaStore:
     # -- video tasks --------------------------------------------------------------------
 
     def create_task(self, task_id: str, account_key: str, profile: str, model,
-                    public_model=None) -> dict | None:
+                    public_model=None, *, api_key=None) -> dict | None:
         with self._lock:
             now = time.time()
             self._db.execute(
                 "INSERT OR IGNORE INTO tasks(task_id,account_key,profile,model,created,updated,"
-                "status,media_id,error,credit,public_model) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "status,media_id,error,credit,public_model,api_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, account_key, profile, model, now, now, "queued", None, None, None,
-                 public_model or model))
+                 public_model or model, api_key))
             self._db.commit()
             return self.get_task(task_id)
     def get_task(self, task_id: str):
         with self._lock:
-            row = self._db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            row = self._db.execute(f"SELECT {_TASK_COLUMNS} FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             return _row_to_task(row) if row else None
 
     def update_task(self, task_id: str, *, status=None, media_id=None, error=UNSET,
@@ -351,7 +359,7 @@ class MediaStore:
                  task_id))
             self._db.commit()
 
-    def list_tasks(self, status=None, cursor=None, limit=DEFAULT_PAGE_SIZE) -> dict:
+    def list_tasks(self, status=None, cursor=None, limit=DEFAULT_PAGE_SIZE, *, api_key=None) -> dict:
         limit = max(1, min(int(limit), MAX_PAGE_SIZE))
         clauses, params = [], []
         if status:
@@ -362,6 +370,9 @@ class MediaStore:
                 params.append(status)
             else:
                 raise ValueError("invalid task status")
+        if api_key is not None:
+            clauses.append("api_key=?")
+            params.append(api_key)
         if cursor:
             try:
                 stamp, row_id = json.loads(cursor)
@@ -374,7 +385,7 @@ class MediaStore:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self._lock:
             rows = self._db.execute(
-                f"SELECT * FROM tasks{where} ORDER BY created DESC, task_id DESC LIMIT ?",
+                f"SELECT {_TASK_COLUMNS} FROM tasks{where} ORDER BY created DESC, task_id DESC LIMIT ?",
                 (*params, limit + 1)).fetchall()
         more = len(rows) > limit
         rows = rows[:limit]

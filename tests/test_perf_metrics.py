@@ -17,8 +17,10 @@ from fastapi.testclient import TestClient
 
 import converter
 from app import perf_metrics
+from app import admin_account
 from app.admin_api import install_admin
 from app.control_store import ControlStore
+from tests.admin_session import credentials
 
 
 class PerfMetricsTests(unittest.TestCase):
@@ -90,6 +92,7 @@ class AdminPerformanceViewTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.store = ControlStore(root / "control.sqlite3")
         self.addCleanup(self.store.close)
+        admin_account.save(self.store, admin_account.new("admin", "synthetic-key", "user"))
         self.config = {"api_key": "synthetic-key", "control_store": self.store, "max_images": 16,
                        "session_path": root / "admin-sessions.json"}
         self.audit = Mock()
@@ -102,7 +105,7 @@ class AdminPerformanceViewTests(unittest.TestCase):
 
     def test_requires_admin_login_and_returns_counters_only(self):
         self.assertEqual(self.client.get("/admin/performance").status_code, 401)
-        self.client.post("/admin/session", json={"api_key": "synthetic-key"},
+        self.client.post("/admin/session", json=credentials("synthetic-key"),
                          headers={"Origin": "http://testserver"})
         perf_metrics.inc("route_pick_duration_marker")
         result = self.client.get("/admin/performance")

@@ -10,6 +10,7 @@ import converter
 from app import checkin, credits, daily_chat, growth_tasks, model_policy
 from app.control_store import ControlStore
 from tests import test_credential_actions as fixtures
+from tests.admin_session import credentials
 
 
 class AutomationTests(unittest.TestCase):
@@ -235,9 +236,10 @@ class AutomationTests(unittest.TestCase):
             self.assertTrue(model_policy.credential_enabled(converter.CONFIG, entry))
 
     def test_cookie_preferences_require_csrf(self):
-        self.client.headers.pop('authorization')
+        self.client.headers.pop('authorization', None)
+        self.client.cookies.clear()
         self.assertEqual(self.client.patch(self.url, json={'auto_checkin': False}).status_code, 401)
-        r = self.client.post('/admin/session', json={'api_key': 'synthetic-management-key'}, headers={'Origin': 'https://testserver'})
+        r = self.client.post('/admin/session', json=credentials('synthetic-management-key'), headers={'Origin': 'https://testserver'})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.client.patch(self.url, json={'auto_checkin': False}).status_code, 403)
         self.client.headers.update({'Origin': 'https://testserver', 'X-CSRF-Token': r.json()['csrf_token']})

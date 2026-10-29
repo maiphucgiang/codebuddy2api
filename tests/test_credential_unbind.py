@@ -13,10 +13,14 @@ from unittest.mock import patch
 import threading
 
 
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import converter
+from app import admin_account
+from app.admin_api import install_admin
+from app.audit_store import AuditStore
+from tests.admin_session import login as session_login
 from app.control_store import ControlStore
 from app.gateway_management import Management
 
@@ -42,6 +46,19 @@ class UnbindDeleteTests(unittest.TestCase):
     def bind(self):
         self.store.update_model("glm-4-flash", {"credential_ids": [self.identity]}, 0)
 
+
+    def route_client(self, config):
+        audit = AuditStore(self.store.path.parent / "audit.sqlite3")
+        self.addCleanup(audit.close)
+        admin_account.save(self.store, admin_account.new("admin", "secret-key", "user"))
+        config.update(audit_store=audit, state_store=self.store.state,
+                      session_path=self.store.path.parent / "sessions.json")
+        app = FastAPI()
+        app.router.routes = list(converter.app.router.routes)
+        install_admin(app, config, self.management)
+        client = self.enterContext(TestClient(app, base_url="https://testserver"))
+        headers = session_login(client, origin="https://testserver", password="secret-key")
+        return client, headers
     def test_bound_delete_is_blocked_without_the_confirmation_flag(self):
         self.bind()
         with self.assertRaises(HTTPException) as ctx:
@@ -75,9 +92,8 @@ class UnbindDeleteTests(unittest.TestCase):
     def test_route_keeps_bindings_when_removal_fails(self):
         self.bind()
         config = dict(self.config, api_key="secret", management=self.management)
+        client, headers = self.route_client(config)
         self.enterContext(patch.dict(converter.CONFIG, config))
-        client = TestClient(converter.app)
-        headers = {"X-Api-Key": "secret"}
         with patch.object(self.pool, "remove_file", return_value=False):
             response = client.delete("/admin/credentials/account.info?unbind=1", headers=headers)
             self.assertEqual(response.status_code, 404, response.text)
@@ -92,9 +108,8 @@ class UnbindDeleteTests(unittest.TestCase):
         self.bind()
         config = dict(self.config, api_key="secret", management=self.management,
                       admin_mutation_lock=threading.RLock())
+        client, headers = self.route_client(config)
         self.enterContext(patch.dict(converter.CONFIG, config))
-        client = TestClient(converter.app)
-        headers = {"X-Api-Key": "secret"}
         real_remove = self.pool.remove_file
         def rebind_during_removal(file_name):
             # A writer outside the shared lock rebinds while the credential is pooled.

@@ -415,7 +415,16 @@ class PersistedSessionTests(unittest.TestCase):
         for _ in range(MAX_PERSISTED_SESSIONS + 20):
             self.login(auth)
         self.assertLessEqual(len(auth.sessions), MAX_PERSISTED_SESSIONS)
-        self.assertLessEqual(len(self.revive(next(iter(auth.sessions)))[1]), 2)
+        self.assertLessEqual(len(self.revive(next(iter(auth.sessions)))[1]), 3)
+
+    def test_session_capacity_evicts_the_least_recently_used_entry(self):
+        auth = AdminAuth(self.config)
+        sids = [self.login(auth)[0] for _ in range(MAX_PERSISTED_SESSIONS)]
+        self.assertEqual(auth.session(request(cookie=sids[0]))[0], sids[0])
+        newest, _ = self.login(auth)
+        self.assertIn(sids[0], auth.sessions)
+        self.assertIn(newest, auth.sessions)
+        self.assertNotIn(sids[1], auth.sessions)
 
     def test_snapshot_is_owner_only_where_the_platform_supports_it(self):
         import stat as stat_module

@@ -16,7 +16,7 @@ import uuid
 from typing import Any
 from urllib.parse import quote
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _CLEANUP_BATCH = 128
 _CLEANUP_SECONDS = 0.05
 METRICS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
@@ -200,7 +200,7 @@ class AuditStore:
             self._db.execute("BEGIN IMMEDIATE")
             version = self._db.execute("PRAGMA user_version").fetchone()[0]
             tables = self._db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            if version not in (0, 1, 2, 3, SCHEMA_VERSION) or (version == 0 and tables):
+            if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION) or (version == 0 and tables):
                 raise ValueError("unsupported audit schema")
             self._db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL, detail_generation INTEGER NOT NULL, cleared_at REAL NOT NULL)")
             self._db.execute("INSERT OR IGNORE INTO state VALUES(1,0,0,0)")
@@ -216,6 +216,7 @@ class AuditStore:
             self._migrate_ingest_time()
             self._migrate_client_ip()
             self._migrate_duration()
+            self._migrate_api_key()
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._epoch = self._db.execute("SELECT epoch FROM state").fetchone()[0]
             self._db.execute("COMMIT")
@@ -250,6 +251,12 @@ class AuditStore:
             self._db.execute("ALTER TABLE requests ADD COLUMN duration_ms REAL")
             self._db.execute("UPDATE requests SET duration_ms=json_extract(payload,'$.duration_ms')")
         self._db.execute("CREATE INDEX IF NOT EXISTS requests_duration ON requests(started_at,duration_ms)")
+
+    def _migrate_api_key(self):
+        columns = [row[1] for row in self._db.execute("PRAGMA table_info(requests)").fetchall()]
+        if "api_key" not in columns:
+            self._db.execute("ALTER TABLE requests ADD COLUMN api_key TEXT")
+        self._db.execute("CREATE INDEX IF NOT EXISTS requests_api_key ON requests(api_key, started_at)")
 
     def _migrate_attempts(self):
         # Attempts live only in the request payload; the per-row copy was never read.
@@ -423,7 +430,7 @@ class AuditStore:
         # Unknown model/profile/credential values get no bucket of their own: the global
         # row still counts the request, and an empty key would rank as "未识别模型".
         dimensions += [(key, value)
-                       for key in ("model", "profile", "credential")
+                       for key in ("model", "profile", "credential", "api_key")
                        if (value := record.get("public_model" if key == "model" else key))]
         for table, seconds in (("stats_hourly", 3600), ("stats_daily", 86400), ("stats_totals", 0)):
             bucket = int(record["started_at"] // seconds) * seconds if seconds else 0
@@ -436,6 +443,10 @@ class AuditStore:
         result = {key: safe_label(source.get(key)) for key in
                   ("upstream_model", "profile", "credential", "protocol", "error_code", "usage_source")}
         result["client_ip"] = safe_label(source.get("client_ip"))
+        api_key = source.get("api_key")
+        result["api_key"] = api_key if isinstance(api_key, str) and (
+            re.fullmatch(r"k_[A-Za-z0-9_-]{12}", api_key)
+            or api_key in ("admin-external", "anonymous")) else None
         result["user_agent"] = safe_agent(source.get("user_agent"))
         result["stream_mode"] = (source.get("stream_mode")
                                  if source.get("stream_mode") in ("compatible", "realtime") else None)
@@ -491,10 +502,10 @@ class AuditStore:
             if keep:
                 payload = json.dumps(data, separators=(",", ":"))
                 db.execute(
-                    "INSERT INTO requests(id,started_at,model,profile,credential,outcome,status_code,payload,logical_bytes,client_ip,duration_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO requests(id,started_at,model,profile,credential,outcome,status_code,payload,logical_bytes,client_ip,duration_ms,api_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (data["id"], data["started_at"], data["model"], data["profile"], data["credential"],
                      data["outcome"], data["status_code"], payload,
-                     len(payload.encode()) + 256, data["client_ip"], data["duration_ms"]))
+                     len(payload.encode()) + 256, data["client_ip"], data["duration_ms"], data["api_key"]))
             self._prune()
             return {"ok": True, "recorded": True, "details": bool(keep and db.execute("SELECT 1 FROM requests WHERE id=?", (data["id"],)).fetchone())}
         return self._run(commit, {"ok": False, "recorded": False, "reason": "storage_failure"}, write=True, dropped=True)
@@ -608,7 +619,7 @@ class AuditStore:
             clauses.append("(started_at<? OR (started_at=? AND id<?))")
             params.extend((stamp, stamp, record_id))
         if kind == "request":
-            for key in ("model", "profile", "credential", "outcome", "status_code", "client_ip"):
+            for key in ("model", "profile", "credential", "outcome", "status_code", "client_ip", "api_key"):
                 value = filters.get(key)
                 if value is not None and value != "":
                     clauses.append(f"{key}=?")
@@ -755,6 +766,30 @@ class AuditStore:
             return out
         return self._read_run(fetch, {})
 
+    def api_key_stats(self, now=None):
+        """Return approximate rolling-24-hour aggregates keyed by API key id."""
+        now = time.time() if now is None else float(now)
+        start = int(now // 3600) * 3600 - 23 * 3600
+
+        def fetch(db):
+            result = {}
+            rows = db.execute(
+                "SELECT dimension_key,payload FROM stats_hourly "
+                "WHERE dimension='api_key' AND bucket>=?", (start,)).fetchall()
+            for row in rows:
+                target = result.setdefault(row[0], {"requests": 0, "success": 0, "error": 0,
+                                                     "total_tokens": None, "credit": None})
+                stats = json.loads(row[1])
+                for key in ("requests", "success", "error"):
+                    target[key] += stats.get(key) or 0
+                for key in ("total_tokens", "credit"):
+                    value = stats.get(key)
+                    if isinstance(value, (int, float)):
+                        target[key] = (target[key] or 0) + value
+            return {"degraded": False, "items": result}
+
+        return self._read_run(fetch, {"degraded": True, "items": {}})
+
     def credit_samples(self, since):
         """Per-request upstream charges with their token counts, oldest first.
 
@@ -883,7 +918,7 @@ class AuditStore:
                     last = (0.0, "")
                     while True:
                         rows = step(lambda last=last: self._db.execute(
-                            "SELECT id,started_at,model,profile,credential,outcome,status_code,payload,client_ip "
+                            "SELECT id,started_at,model,profile,credential,outcome,status_code,payload,client_ip,api_key "
                             "FROM requests WHERE started_at<? AND (started_at,id)>(?,?) "
                             "ORDER BY started_at,id LIMIT 2000",
                             (cutoff, *last)).fetchall())
@@ -893,7 +928,8 @@ class AuditStore:
                             handle.write(json.dumps(
                                 {"kind": "request", "id": row[0], "started_at": row[1], "model": row[2],
                                  "profile": row[3], "credential": row[4], "outcome": row[5],
-                                 "status_code": row[6], "payload": json.loads(row[7]), "client_ip": row[8]},
+                                 "status_code": row[6], "payload": json.loads(row[7]), "client_ip": row[8],
+                                 "api_key": row[9]},
                                 ensure_ascii=False) + "\n")
                             request_ids.append(row[0])
                         last = (rows[-1][1], rows[-1][0])

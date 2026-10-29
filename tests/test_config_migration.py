@@ -87,9 +87,20 @@ class ConfigMigrationTests(unittest.TestCase):
 
     def test_identity_check_accepts_a_control_store(self):
         info = config_migration.inspect_database(self.db)
-        self.assertEqual((info["version"], info["revision"], info["accounts"]), (2, 0, 0))
+        self.assertEqual((info["version"], info["revision"], info["accounts"]), (3, 0, 0))
         self.assertIsNone(info["lease"])
 
+
+    def test_v2_requires_upgrade_and_api_keys_table_is_mandatory(self):
+        with sqlite3.connect(self.db) as db:
+            db.execute("PRAGMA user_version=2")
+        with self.assertRaisesRegex(config_migration.MigrationError, "schema=2.*先用当前版本服务启动"):
+            config_migration.inspect_database(self.db)
+        with sqlite3.connect(self.db) as db:
+            db.execute("PRAGMA user_version=3")
+            db.execute("DROP TABLE api_keys")
+        with self.assertRaisesRegex(config_migration.MigrationError, "api_keys"):
+            config_migration.inspect_database(self.db)
     def test_dry_run_reports_changes_without_writing(self):
         self.write_env("CODEBUDDY2API_MAX_IMAGES=8\nCODEBUDDY2API_STREAM_MODE=realtime\n")
         report = config_migration.migrate(cwd=self.root, db=self.db, env_file=self.env, environ={}, dry_run=True)

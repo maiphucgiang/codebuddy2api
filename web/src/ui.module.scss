@@ -384,6 +384,131 @@ $white: var(--page);
   align-items: center;
   flex-wrap: wrap;
 }
+
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  border: 1px solid var(--warning);
+  border-radius: 12px;
+  color: var(--warning);
+  background: var(--warning-bg);
+  font-size: 12px;
+}
+.notice a {
+  color: inherit;
+  font-weight: 600;
+}
+.notice button {
+  margin-left: auto;
+  min-height: 28px;
+  padding: 4px;
+  border-color: transparent;
+  color: inherit;
+  background: transparent;
+}
+.notice button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.drawerForm {
+  display: grid;
+  gap: 16px;
+}
+// Grid items keep their margins, so the shared field margins would stack on top of the gap.
+.drawerForm > :is(.field, .check, .fieldset, .note, .error, .warning) {
+  margin: 0;
+}
+.drawerForm > .actions {
+  justify-content: flex-end;
+}
+.drawerForm .fieldset .check {
+  margin: 10px 0;
+}
+.accountForm {
+  max-width: 520px;
+}
+
+.inputGroup {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.inputGroup > svg {
+  position: absolute;
+  left: 12px;
+  z-index: 1;
+  width: 16px;
+  height: 16px;
+  color: var(--muted);
+  pointer-events: none;
+}
+.inputGroup input {
+  flex: 1;
+  min-width: 0;
+  padding-left: 40px;
+  padding-right: 44px;
+}
+.inputGroup input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.inputGroup input[aria-invalid="true"] {
+  border-color: var(--error);
+}
+.inputAction {
+  position: absolute;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+}
+.inputAction:hover {
+  background: var(--selected);
+}
+.capsHint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--warning);
+  font-size: 11px;
+}
+.capsHint svg {
+  width: 14px;
+  height: 14px;
+}
+.check input {
+  accent-color: var(--accent);
+}
+// Eleven columns plus row actions: tighter cells keep the actions in view at desktop widths.
+.keysTable :is(th, td) {
+  padding-inline: 12px;
+}
+.keysTable td {
+  white-space: nowrap;
+}
+.keysTable .wrapCell {
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+.secretValue {
+  display: block;
+  margin-bottom: 18px;
+  overflow-wrap: anywhere;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--surface-tint);
+  font-family: "SFMono-Regular", Consolas, monospace;
+}
 .primary {
   background: linear-gradient(140deg, #568a3c, #386e35);
   border-color: #437b35;
@@ -2422,12 +2547,47 @@ $white: var(--page);
   gap: 18px;
 }
 .login {
+  position: relative;
   min-height: 100dvh;
   display: grid;
   grid-template-columns: 1.1fr 1fr;
-  background: radial-gradient(ellipse at 20% 80%, #e0edcd, transparent 70%), $white;
+  overflow: hidden;
+  background: radial-gradient(ellipse at 20% 80%, var(--glow), transparent 70%), var(--page);
+}
+.loginBackdrop {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.loginBackdrop span {
+  position: absolute;
+  width: 360px;
+  height: 360px;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.7;
+  background: var(--glow);
+  animation: loginDrift 28s ease-in-out infinite alternate;
+}
+.loginBackdrop span:nth-child(1) {
+  top: -120px;
+  left: -80px;
+}
+.loginBackdrop span:nth-child(2) {
+  right: 5%;
+  bottom: -140px;
+  background: var(--glow-alt);
+  animation-delay: -8s;
+}
+.loginBackdrop span:nth-child(3) {
+  top: 30%;
+  left: 45%;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  animation-delay: -16s;
 }
 .loginIntro {
+  z-index: 1;
   padding: 60px max(50px, 9vw);
   display: flex;
   flex-direction: column;
@@ -2440,63 +2600,77 @@ $white: var(--page);
   top: 55px;
   left: max(50px, 9vw);
 }
-.loginIntro > .eyebrow {
-  margin-top: 90px;
-  margin-bottom: 22px;
-}
 .loginIntro h1 {
   font-size: clamp(42px, 4vw, 64px);
   line-height: 1.3;
   letter-spacing: -2px;
   position: relative;
   z-index: 1;
-}
-.loginIntro h1 em {
-  color: $deep;
-  font-style: normal;
-}
-.loginIntro > p:not(.eyebrow) {
-  color: #839674;
-  margin-top: 22px;
-  line-height: 2;
-}
-.loginIntro > small {
-  position: absolute;
-  bottom: 44px;
-  color: #91a180;
-  font-size: 9px;
-  letter-spacing: 2px;
+  color: var(--text);
+  background: linear-gradient(120deg, var(--text), var(--strong));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 .loginOrbit {
+  position: relative;
   width: 240px;
   height: 240px;
-  border: 1px solid #ffffffb3;
-  background: linear-gradient(135deg, #ffffff80, #cce2b336);
+  border: 1px solid var(--highlight);
+  background: linear-gradient(135deg, var(--highlight), var(--selected));
   border-radius: 50%;
   margin-top: 40px;
   box-shadow:
-    inset 0 0 40px #ffffffa3,
-    0 30px 80px #729d3520;
+    inset 0 0 40px var(--highlight),
+    0 30px 80px var(--shadow);
   display: grid;
   place-items: center;
-  transform: rotate(-15deg);
+  animation: loginFloat 6s ease-in-out infinite alternate;
+}
+.loginOrbit::before,
+.loginOrbit::after {
+  content: "";
+  position: absolute;
+  inset: -20px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  pointer-events: none;
+  animation: spin 80s linear infinite;
+}
+.loginOrbit::after {
+  inset: -38px;
+  border-style: dashed;
+  animation-duration: 120s;
+  animation-direction: reverse;
 }
 .loginOrbit svg {
-  color: #78ad48b0;
+  color: var(--accent);
   width: 110px;
   height: 110px;
   stroke-width: 0.7;
 }
 .loginCard {
+  position: relative;
+  z-index: 1;
   width: min(410px, calc(100% - 60px));
   align-self: center;
   justify-self: center;
   padding: 36px;
   @include glass(0.6, 22px);
   border-radius: 28px;
+  animation: loginCardIn 320ms ease-out both;
+}
+.loginCard::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 28px;
+  left: 28px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--highlight), transparent);
 }
 .loginCard > svg {
-  color: $green;
+  color: var(--accent);
   width: 28px;
   height: 28px;
   margin-bottom: 25px;
@@ -2505,32 +2679,62 @@ $white: var(--page);
   font-size: 24px;
   margin: 7px 0 10px;
 }
-.loginCard > p:not(.eyebrow) {
-  color: #8d9981;
-  font-size: 12px;
-}
 .loginCard form {
   margin-top: 28px;
 }
 .loginCard .primary {
   width: 100%;
   justify-content: space-between;
+  background: var(--primary);
   padding: 12px 16px;
   margin-top: 8px;
 }
-.loginNote {
-  display: flex;
-  gap: 9px;
-  margin-top: 27px;
-  color: #9aa68f;
-  font-size: 10px;
-  line-height: 1.8;
+.loginCard .primary[aria-busy="true"] svg {
+  animation: spin 0.9s linear infinite;
 }
-.loginNote svg {
-  width: 15px;
-  height: 15px;
-  flex-shrink: 0;
-  margin-top: 2px;
+.loginShake {
+  animation: loginShake 300ms ease-in-out;
+}
+@keyframes loginDrift {
+  from {
+    transform: translate3d(-4%, -3%, 0);
+  }
+  to {
+    transform: translate3d(6%, 5%, 0);
+  }
+}
+@keyframes loginFloat {
+  from {
+    transform: rotate(-15deg) translateY(0);
+  }
+  to {
+    transform: rotate(-15deg) translateY(-8px);
+  }
+}
+@keyframes loginCardIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes loginShake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-6px);
+  }
+  55% {
+    transform: translateX(6px);
+  }
+  80% {
+    transform: translateX(-3px);
+  }
 }
 .mono {
   font-family: "SFMono-Regular", Consolas, monospace;
@@ -3667,19 +3871,11 @@ $white: var(--page);
   .loginIntro .brand {
     position: static;
   }
-  .loginIntro > .eyebrow {
-    margin-top: 36px;
-    margin-bottom: 12px;
-  }
   .loginIntro h1 {
     font-size: 35px;
   }
-  .loginIntro > p:not(.eyebrow) {
-    margin-top: 13px;
-    font-size: 12px;
-  }
-  .loginIntro > small,
-  .loginOrbit {
+  .loginOrbit,
+  .loginBackdrop span:nth-child(n + 2) {
     display: none;
   }
   .loginCard {
@@ -3690,6 +3886,9 @@ $white: var(--page);
   }
 }
 @media (max-width: 440px) {
+  .loginCard {
+    padding: 22px;
+  }
   .modalOverlay {
     padding: 8px;
   }
@@ -3775,6 +3974,11 @@ $white: var(--page);
     background: var(--surface);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
+  }
+  .loginBackdrop span,
+  .loginOrbit::before,
+  .loginOrbit::after {
+    display: none;
   }
   .modalOverlay::backdrop {
     backdrop-filter: none;

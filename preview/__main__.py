@@ -29,8 +29,9 @@ def prepare(directory: Path) -> Path:
     if any(directory.iterdir()):
         sys.exit(f"预览数据目录必须为空或由预览服务创建：{directory}")
     seed.write_credentials(directory)
-    seed.write_history(directory / "logs.sqlite3")
-    seed.write_media(directory)
+    key_ids = seed.write_api_keys(directory)
+    seed.write_history(directory / "logs.sqlite3", key_ids=list(key_ids.values()))
+    seed.write_media(directory, api_key=key_ids["models"])
     (directory / MARKER).write_text("codebuddy2api preview data\n", encoding="utf-8")
     return directory
 

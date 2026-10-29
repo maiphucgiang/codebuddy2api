@@ -23,6 +23,9 @@ type State = {
   modelRules: Map<string, Json>;
   deletedModels: Set<string>;
   customSequence: number;
+  account: Json;
+  keys: Json[];
+  keySequence: number;
 };
 
 const PREVIEW_HEADER = "x-codebuddy-preview";
@@ -57,6 +60,14 @@ const initialState = (): State => ({
   modelRules: new Map(),
   deletedModels: new Set(),
   customSequence: 0,
+  account: {
+    username: "admin",
+    password_source: "external",
+    bootstrap: true,
+    changed_at: 1761600000,
+  },
+  keys: [],
+  keySequence: 0,
 });
 
 function response(config: InternalAxiosRequestConfig, data: unknown, status = 200): AxiosResponse {
@@ -183,6 +194,22 @@ function notFound(config: InternalAxiosRequestConfig) {
   throw new AxiosError("媒体资源不存在或已清理", "ERR_BAD_REQUEST", config, undefined, result);
 }
 
+function keyView(item: Json): Json {
+  const result = clone(item);
+  delete result.secret;
+  if (item.type === "standard") result.masked = `${item.prefix}…${item.secret.slice(-4)}`;
+  result.usage = null;
+  return result;
+}
+
+function nextKey(state: State) {
+  const sequence = ++state.keySequence;
+  return {
+    id: `k_${String(sequence).padStart(12, "0")}`,
+    secret: `cb-${String(sequence).padStart(32, "0")}`,
+  };
+}
+
 function localWrite(
   config: InternalAxiosRequestConfig,
   path: string,
@@ -190,6 +217,85 @@ function localWrite(
   state: State,
 ): AxiosResponse | null {
   const body = requestBody(config);
+  if (path === "/session") {
+    if (method === "GET" || method === "POST")
+      return response(config, {
+        authenticated: true,
+        csrf_token: "local-session-csrf",
+        bootstrap: state.account.bootstrap,
+      });
+    if (method === "DELETE") return response(config, { authenticated: false });
+  }
+  if (path === "/sessions" && method === "DELETE") return response(config, { ok: true });
+  if (path === "/account") {
+    if (method === "GET") return response(config, clone(state.account));
+    if (method === "PUT") {
+      if (typeof body.username === "string") state.account.username = body.username;
+      if (typeof body.new_password === "string") state.account.password_source = "user";
+      state.account.bootstrap = false;
+      state.account.changed_at = Date.now() / 1000;
+      return response(config, {
+        username: state.account.username,
+        bootstrap: false,
+        csrf_token: "local-account-csrf",
+      });
+    }
+  }
+  if (path === "/keys") {
+    if (method === "GET")
+      return response(config, {
+        external: { type: "admin", source: "external", origin: "cli", occupied: true },
+        items: state.keys.map(keyView),
+      });
+    if (method === "POST") {
+      const generated = nextKey(state);
+      const item: Json = {
+        id: generated.id,
+        name: body.name,
+        type: body.type,
+        secret: generated.secret,
+        prefix: generated.secret.slice(0, 8),
+        enabled: true,
+        expires_at: body.expires_at ?? null,
+        ip_allow: body.ip_allow ?? null,
+        rpm: body.rpm ?? null,
+        models: body.models ?? null,
+        created_at: Date.now() / 1000,
+        last_used_at: null,
+        version: 1,
+      };
+      state.keys.push(item);
+      return response(config, { ...keyView(item), secret: generated.secret });
+    }
+  }
+  const keyMatch = path.match(/^\/keys\/([^/]+)(?:\/(rotate|reveal))?$/);
+  if (keyMatch) {
+    const id = decodeURIComponent(keyMatch[1]!);
+    const index = state.keys.findIndex((item) => item.id === id);
+    if (index < 0) notFound(config);
+    const item = state.keys[index]!;
+    const action = keyMatch[2];
+    if (method === "PATCH") {
+      for (const field of ["name", "enabled", "expires_at", "ip_allow", "rpm", "models"]) {
+        if (Object.hasOwn(body, field)) item[field] = clone(body[field]);
+      }
+      item.version += 1;
+      return response(config, keyView(item));
+    }
+    if (method === "DELETE") {
+      state.keys.splice(index, 1);
+      return response(config, { ok: true });
+    }
+    if (method === "POST" && action === "rotate") {
+      const generated = nextKey(state);
+      item.secret = generated.secret;
+      item.prefix = generated.secret.slice(0, 8);
+      item.version += 1;
+      return response(config, { ...keyView(item), secret: generated.secret });
+    }
+    if (method === "POST" && action === "reveal" && item.type === "standard")
+      return response(config, { secret: item.secret });
+  }
   if (method === "DELETE" && path.startsWith("/media/assets/")) {
     const id = decodeURIComponent(path.slice("/media/assets/".length));
     if (!id || id.includes("/")) return null;

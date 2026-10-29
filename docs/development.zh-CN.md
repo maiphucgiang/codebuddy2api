@@ -14,13 +14,13 @@ uv run --locked --no-build python -B -m preview --port 8790 --data-dir /tmp/cb-p
 | 参数 | 默认值 | 作用 |
 |------|--------|------|
 | `--host` / `--port` | `127.0.0.1` / `8790` | 监听地址 |
-| `--api-key` | `preview` | WebUI 与 API 使用的密钥 |
+| `--api-key` | `preview` | 外部管理推理密钥及初始 WebUI 密码 |
 | `--data-dir` | 每次新建临时目录 | 跨重启保留预览数据；目录必须为空或由预览服务创建 |
 | `--public` | 关闭 | 拒绝不适合共享演示的操作，见[公开部署](#公开部署) |
 | `--reset-hours` | `0`（不重置） | 运行指定小时后退出，由进程管理器用全新数据重启 |
 | 其他参数 | — | 原样传给网关，例如 `--admin-allowed-origins` |
 
-打开 `http://127.0.0.1:8790/dashboard`，用密钥登录。修改前端需要热更新时，保持预览服务运行，再让开发服务器代理到它：
+打开 `http://127.0.0.1:8790/dashboard`，使用账号 `admin` 和密码 `preview`（或 `--api-key` 的设置值）登录；API 客户端把该值作为外部管理密钥。预览还预置了分别展示过期、IP 和模型限制的三个普通密钥。修改前端需要热更新时，保持预览服务运行，再让开发服务器代理到它：
 
 ```bash
 cd web
@@ -82,7 +82,7 @@ services:
       - /tmp:size=256m
 ```
 
-在 `127.0.0.1:8790` 前面放一个启用 TLS 的反向代理，并把它的公网来源写进 `--admin-allowed-origins`，否则 WebUI 登录会被 Origin 校验拒绝。密钥本就是公开的，随链接一起提供即可。
+在 `127.0.0.1:8790` 前面放一个启用 TLS 的反向代理，并把它的公网来源写进 `--admin-allowed-origins`，否则 WebUI 登录会被 Origin 校验拒绝。演示账号 `admin`、密码 `preview` 和推理密钥 `preview` 本就是公开的，随链接一起提供即可。
 
 ## 隔离
 

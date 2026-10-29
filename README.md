@@ -10,7 +10,7 @@ Use your **WorkBuddy / CodeBuddy (Tencent)** subscription as local **OpenAI- and
 - Automatic multi-account routing across domestic and international sites, with credential refresh.
 - Per-account automation: domestic personal accounts check in and dispatch Buddy travel by default, with independent switches; international check-in is opt-in. The growth center is personal-only: finished tasks are claimed automatically, with per-task switches for behavior chains; enterprise accounts are excluded.
 
-**Live preview:** [codebuddy2api.elaina-love.com](https://codebuddy2api.elaina-love.com/dashboard), key `preview`. It runs the WebUI and APIs against a simulated upstream with synthetic accounts, holds no real credentials and resets every 6 hours; credential import and export, settings changes and log clearing are disabled there. See [Development preview](docs/development.md) to run it locally.
+**Live preview:** [codebuddy2api.elaina-love.com](https://codebuddy2api.elaina-love.com/dashboard). Sign in as `admin` with password `preview`; the inference key is also `preview`. It runs the WebUI and APIs against a simulated upstream with synthetic accounts, holds no real credentials and resets every 6 hours; credential import and export, settings changes and log clearing are disabled there. See [Development preview](docs/development.md) to run it locally.
 
 ## Quick start
 
@@ -22,7 +22,7 @@ cd codebuddy2api
 cp .env.example .env
 ```
 
-Edit `.env`: set `CODEBUDDY2API_KEY` to your own random key. Compose loads the whole file into the container, so every key applies and unknown keys are harmless. Preserve an existing `.env` on upgrades.
+Edit `.env`: set `CODEBUDDY2API_KEY` to your own random key. It is the external admin inference key and the initial WebUI password until you change the password. Compose loads the whole file into the container, so every key applies and unknown keys are harmless. Preserve an existing `.env` on upgrades.
 
 ```bash
 docker compose pull
@@ -33,9 +33,10 @@ Compose pulls `latest` by default (`CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/cod
 
 First use:
 
-1. Open **http://127.0.0.1:8787/dashboard** and sign in with your API key.
+1. Open **http://127.0.0.1:8787/dashboard** and sign in as `admin` with your `CODEBUDDY2API_KEY` password.
 2. In **Credentials**, add a domestic or international account through browser login, import an `.info` file, or paste refresh tokens for a chosen endpoint.
-3. In **Models**, find an available model and use its public ID in your client.
+3. In **Keys**, create an inference key for each client and assign its model, IP, expiry and rate limits.
+4. In **Models**, find an available model and use its public ID in your client.
 
 The template binds to localhost only. Configure HTTPS and restrict network access before allowing remote connections; keep and securely back up the `auth/` data directory. To run current source or log in from a terminal instead, see the [deployment guide](docs/deployment.md).
 
@@ -51,7 +52,7 @@ The template binds to localhost only. Configure HTTPS and restrict network acces
 
 - Media generation is billed per upstream credit and only routes to verified account products; see [Media generation](docs/clients.md#media-generation).
 
-- **API key:** the same key used to sign in to the WebUI.
+- **API key:** use a key created in **Keys**, or the externally configured admin key. The WebUI management Cookie cannot call `/v1/*`.
 - **Model:** a public ID from the WebUI or `GET /v1/models`.
 - All accounts share these URLs; no region parameter is needed. Anthropic SDKs append `/v1/messages` themselves, so leave it out of the Base URL.
 - The search and fetch endpoints never call a model. Declaring Anthropic `web_search_*` / `web_fetch_*` or OpenAI `web_search` server tools makes the gateway execute them itself. See [Web search and fetch](docs/clients.md#web-search-and-fetch).
@@ -90,7 +91,7 @@ The template binds to localhost only. Configure HTTPS and restrict network acces
 ## FAQ
 
 - **WebUI sign-in fails behind an HTTPS domain/reverse proxy?** Trust your public origin via `admin_allowed_origins` — see [Management Origin checks](docs/advanced.md#management-origin--csrf-switch).
-- **No Docker?** After installing dependencies and the WebUI, run `uv run --locked --no-build converter.py` or `python3 converter.py` without `.env`. First local startup saves a default key and displays it once — see [Local Python setup](docs/deployment.md#local-python-setup).
+- **No Docker?** After installing dependencies and the WebUI, run `uv run --locked --no-build converter.py` or `python3 converter.py` without `.env`. First startup prints the initial admin username and random password; no inference key is created until you add one in **Keys** — see [Local Python setup](docs/deployment.md#local-python-setup).
 - **Where is my data?** Everything lives in `auth/` (or `/data/auth` in Docker): credentials, settings and log databases — see [Data and backups](docs/webui.md#data-and-backups).
 - **Which image tag should I use?** `latest` follows stable releases, `edge` follows main, version tags pin one release — see [Published images](docs/deployment.md#use-published-images).
 - **Responses tool output/arguments compressed or need verbatim passthrough?** Set `responses_projection_mode` (default `balanced`, or `passthrough` to disable projection) and `responses_projection_max_bytes` (default `40000`, `0` disables per-item trimming). Balanced trimming keeps the head/tail and reports original bytes, estimated tokens and total lines; client addresses stay unchanged — see [Responses projection](docs/clients.md#responses-projection) and [details](docs/advanced.md#responses-projection).

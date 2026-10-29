@@ -5,7 +5,12 @@ from fastapi import HTTPException
 
 from app import growth_tasks, perf_metrics, travel
 from app.model_capabilities import route_metadata
+from app.api_keys import api_principal
 _request_policy = ContextVar("gateway_model_policy", default=None)
+
+
+def _principal():
+    return api_principal.get()
 
 
 class PolicyScopeMiddleware:
@@ -119,6 +124,24 @@ def rule_for(config, source, policy=None):
     return {**default_rule(source), **_policy(config, policy)["models"].get(source, {})}
 
 
+def source_for(config, name):
+    """Resolve a public model name or automatic alias to its policy source."""
+    if name == "default-model":
+        return "auto"
+    data = snapshot(config)
+    for source, rule in data.get("models", {}).items():
+        if rule.get("public_id", source) == name:
+            return source
+        if rule.get("keep_original") and source == name:
+            return source
+    return name
+
+
+
+def _restriction_source(source):
+    """Use the canonical automatic-model source for key restrictions."""
+    return "auto" if source == "default-model" else source
+
 def _deny(message, code="model_disabled"):
     raise HTTPException(status_code=404, detail={"error": {
         "message": message, "type": "invalid_request_error", "param": "model", "code": code}})
@@ -143,7 +166,12 @@ def resolve(config, public_model):
     if not isinstance(public_model, str) or not public_model.strip():
         raise HTTPException(status_code=400, detail={"error": {"message": "model must be a non-empty string"}})
     state = _request_policy.get()
+    principal = _principal()
     if state and public_model in (state.get("upstream"), state.get("public_model")):
+        if principal is not None and principal.models is not None and _restriction_source(state.get("source")) not in principal.models:
+            raise HTTPException(status_code=403, detail={"error": {
+                "message": "模型不在当前 API key 的允许列表中", "type": "permission_error",
+                "code": "model_not_allowed", "param": "model"}})
         if rule_for(config, state["source"]) != state["rule"]:
             _deny("模型策略已变更，请重新请求", "model_policy_changed")
         return state["upstream"]
@@ -151,6 +179,10 @@ def resolve(config, public_model):
     source = next((key for key, value in data["models"].items()
                    if value.get("public_id", key) == public_model), public_model)
     rule = {**default_rule(source), **data["models"].get(source, {})}
+    if principal is not None and principal.models is not None and _restriction_source(source) not in principal.models:
+        raise HTTPException(status_code=403, detail={"error": {
+            "message": "模型不在当前 API key 的允许列表中", "type": "permission_error",
+            "code": "model_not_allowed", "param": "model"}})
     if not rule["enabled"]:
         _deny("模型已停用")
     if source == public_model and (rule["custom"] or (rule["public_id"] != source and not rule["keep_original"])):

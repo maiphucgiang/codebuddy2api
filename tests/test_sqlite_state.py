@@ -21,9 +21,7 @@ from app.control_store import ControlStore
 from app.credential_cooldowns import CredentialCooldowns
 from app.credits import CreditLedger, ModelCatalogCache
 from app.model_blocks import ModelBlocks
-from app.safe_logging import sanitize_log_text
-from app.settings import resolve_settings
-from app.startup import announce_default_key, load_startup_env, resolve_startup_key
+from app.startup import load_startup_env, resolve_startup_auth
 from app.state_store import LEGACY_FILES
 from app.trial_rewards import TrialLedger, attempt_trial
 from app.usage_snapshots import UsageSnapshots
@@ -149,7 +147,7 @@ class SQLiteStateTests(unittest.TestCase):
         self.control._db.execute("PRAGMA user_version=1")
         other = self.open_control()
         self.assertEqual(other.snapshot()["settings"]["max_images"], 3)
-        self.assertEqual(other._db.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(other._db.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_trial_reservation_is_atomic_across_connections_and_failures_are_closed(self):
         other = self.open_control()
@@ -239,254 +237,9 @@ class SQLiteStateTests(unittest.TestCase):
                 auth.reconcile()
         self.assertEqual(auth._configured_key, FIXED_KEY)
 
-    def test_default_key_is_atomic_private_and_survives_restart(self):
-        other = self.open_control()
-        with concurrent.futures.ThreadPoolExecutor(2) as executor:
-            results = list(executor.map(lambda state: state.default_key(create=True), [self.state, other.state]))
-        self.assertEqual(results[0], results[1])
-        key, pending = results[0]
-        self.assertRegex(key, r"^cb-[0-9a-f]{32}$")
-        self.assertTrue(pending)
-        self.assertNotIn(key, json.dumps(self.control.snapshot()))
-        self.assertEqual(self.open_control().state.default_key(), (key, True))
-        with self.state.claim_announcement(key) as claimed:
-            self.assertTrue(claimed)
-        with other.state.claim_announcement(key) as claimed:
-            self.assertFalse(claimed)
-        self.assertEqual(other.state.default_key(), (key, False))
-
-    def test_broken_saved_key_is_not_regenerated(self):
-        self.state.default_key(create=True)
-        self.control._db.execute("UPDATE gateway_secrets SET value='broken'")
-        with self.assertRaises(ValueError):
-            self.state.default_key(create=True)
-        self.assertEqual(self.control._db.execute("SELECT value FROM gateway_secrets").fetchone()[0], "broken")
-
     def config(self, source="default", key=""):
         return {"state_store": self.state, "control_store": self.control, "api_key": key,
                 "host": "127.0.0.1", "settings_sources": {"api_key": source}}
-
-    def test_successful_announcement_is_committed_and_not_repeated(self):
-        config = self.config()
-        terminal = self.console()
-        with patch("sys.stderr", io.StringIO()) as output:
-            resolve_startup_key(config, SimpleNamespace(api_key=""))
-            key = config["api_key"]
-            self.assertEqual(terminal.getvalue(), "")
-            announce_default_key(config)
-            announce_default_key(config)
-            again = self.config()
-            resolve_startup_key(again, SimpleNamespace(api_key=""))
-            announce_default_key(again)
-        self.assertEqual(terminal.getvalue().count(key), 1)
-        self.assertNotIn(key, output.getvalue())
-        self.assertEqual(again["api_key"], key)
-        self.assertIsNone(next(row for row in resolve_settings(config) if row["key"] == "api_key")["value"])
-        self.assertNotIn(key, sanitize_log_text("key leaked " + key))
-        with patch("sys.stderr", io.StringIO()):
-            resolve_startup_key(self.config(), SimpleNamespace(api_key=""))
-
-    def test_missing_terminal_at_disclosure_does_not_consume_announcement(self):
-        terminal = self.console()
-        config = self.config()
-        resolve_startup_key(config, SimpleNamespace(api_key=""))
-        self.console_open.side_effect = OSError("terminal gone")
-        with self.assertRaises(OSError):
-            announce_default_key(config)
-        self.assertEqual(self.state.default_key(), (config["api_key"], True))
-        self.assertEqual(terminal.getvalue(), "")
-
-    def test_announcement_reservation_failure_never_writes_terminal(self):
-        terminal = self.console()
-        config = self.config()
-        resolve_startup_key(config, SimpleNamespace(api_key=""))
-        with patch.object(self.state, "claim_announcement", side_effect=sqlite3.OperationalError("locked")), \
-             self.assertRaises(sqlite3.OperationalError):
-            announce_default_key(config)
-        self.assertEqual(terminal.getvalue(), "")
-        self.assertEqual(self.state.default_key(), (config["api_key"], True))
-
-
-    def test_terminal_write_and_flush_failures_leave_default_key_pending(self):
-        for operation in ("write", "flush"):
-            with self.subTest(operation=operation):
-                self.control._db.execute("DELETE FROM gateway_secrets")
-                terminal = self.console()
-                config = self.config()
-                resolve_startup_key(config, SimpleNamespace(api_key=""))
-                key = config["api_key"]
-                with patch.object(terminal, operation, side_effect=BrokenPipeError("fixture terminal lost")), \
-                     self.assertRaises(BrokenPipeError):
-                    announce_default_key(config)
-                self.assertEqual(self.state.default_key(), (key, True))
-                self.assertTrue(config["announce_default_key"])
-                recovered = self.console()
-                announce_default_key(config)
-                self.assertEqual(recovered.getvalue().count(key), 1)
-                self.assertEqual(self.state.default_key(), (key, False))
-
-    def test_process_crash_during_disclosure_rolls_back_the_marker(self):
-        import subprocess
-        key, _ = self.state.default_key(create=True)
-        script = '''
-import os, sys
-from app.control_store import ControlStore
-control = ControlStore(sys.argv[1])
-key, _ = control.state.default_key()
-with control.state.claim_announcement(key) as claimed:
-    assert claimed
-    os._exit(17)
-'''
-        result = subprocess.run([sys.executable, "-B", "-c", script, str(self.control.path)],
-                                capture_output=True, timeout=15)
-        self.assertEqual(result.returncode, 17)
-        self.assertEqual((result.stdout, result.stderr), (b"", b""))
-        self.assertEqual(self.open_control().state.default_key(), (key, True))
-
-
-    def test_commit_failure_after_disclosure_keeps_recovery_pending(self):
-        terminal = self.console()
-        config = self.config()
-        resolve_startup_key(config, SimpleNamespace(api_key=""))
-        key = config["api_key"]
-        def deny_commit(action, arg1, arg2, database, trigger):
-            return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT" else sqlite3.SQLITE_OK
-        self.control._db.set_authorizer(deny_commit)
-        try:
-            with self.assertRaises(sqlite3.DatabaseError):
-                announce_default_key(config)
-        finally:
-            self.control._db.set_authorizer(None)
-        self.assertFalse(self.control._db.in_transaction)
-        self.assertEqual(terminal.getvalue().count(key), 1)
-        self.assertEqual(self.state.default_key(), (key, True))
-        self.assertTrue(config["announce_default_key"])
-        recovered = self.console()
-        announce_default_key(config)
-        self.assertEqual(recovered.getvalue().count(key), 1)
-        self.assertEqual(self.state.default_key(), (key, False))
-
-    def test_concurrent_disclosures_print_only_after_acquiring_exclusive_claim(self):
-        import threading
-        terminal = self.console()
-        key, _ = self.state.default_key(create=True)
-        other = self.open_control()
-        configs = [{**self.config(), "state_store": state, "api_key": key, "announce_default_key": True}
-                   for state in (self.state, other.state)]
-        barrier = threading.Barrier(2, timeout=5)
-        def announce(config):
-            barrier.wait()
-            announce_default_key(config)
-        with concurrent.futures.ThreadPoolExecutor(2) as executor:
-            list(executor.map(announce, configs))
-        self.assertEqual(terminal.getvalue().count(key), 1)
-        self.assertEqual(self.state.default_key(), (key, False))
-        self.assertTrue(all(not config["announce_default_key"] for config in configs))
-
-    def test_terminal_failure_after_binding_shuts_down_with_pending_key(self):
-        import asyncio
-        import uvicorn
-        from fastapi import FastAPI
-        from unittest.mock import AsyncMock
-        from app.startup import run_server
-        terminal = self.console()
-        config = self.config()
-        resolve_startup_key(config, SimpleNamespace(api_key=""))
-        async def ready(server, sockets=None):
-            server.started = True
-        with patch.object(uvicorn.Server, "startup", ready), \
-             patch.object(uvicorn.Server, "shutdown", new=AsyncMock()) as shutdown, \
-             patch.object(uvicorn.Server, "run", lambda server: asyncio.run(server.startup())), \
-             patch.object(terminal, "flush", side_effect=BrokenPipeError("fixture")), \
-             self.assertRaises(BrokenPipeError):
-            run_server(FastAPI(), config, host="127.0.0.1", port=8787)
-        shutdown.assert_awaited_once()
-        self.assertEqual(self.state.default_key(), (config["api_key"], True))
-
-
-    def test_explicit_sources_do_not_overwrite_saved_default_or_print(self):
-        key, _ = self.state.default_key(create=True)
-        for source in ("cli", "environment", "dotenv"):
-            for supplied in ("", "override-fixture"):
-                config = self.config(source, supplied)
-                with patch("sys.stderr", io.StringIO()) as output:
-                    resolve_startup_key(config, SimpleNamespace(api_key=supplied))
-                    announce_default_key(config)
-                self.assertEqual(config["api_key"], supplied)
-                self.assertEqual(output.getvalue(), "")
-                self.assertEqual(self.state.default_key()[0], key)
-
-    def test_nonterminal_and_public_first_start_do_not_generate_hidden_key(self):
-        with patch("sys.stderr", io.StringIO()), self.assertRaises(ValueError):
-            resolve_startup_key(self.config(), SimpleNamespace(api_key=""))
-        config = self.config()
-        config["host"] = "0.0.0.0"
-        with patch("sys.stderr", Terminal()), self.assertRaises(ValueError):
-            resolve_startup_key(config, SimpleNamespace(api_key=""))
-        self.assertEqual(self.state.default_key(), (None, False))
-
-    def test_explicit_noauth_opt_in_skips_first_key_generation_without_a_terminal(self):
-        for value in ("1", "true", "yes", "TRUE"):
-            for host in ("127.0.0.1", "0.0.0.0"):
-                config = {**self.config(), "host": host}
-                with self.subTest(value=value, host=host), \
-                     patch.dict(os.environ, {"CODEBUDDY2API_ALLOW_OPEN_NOAUTH": value}, clear=True):
-                    resolve_startup_key(config, SimpleNamespace(api_key=""))
-                    self.assertFalse(config["api_key"])
-                    self.assertFalse(config["announce_default_key"])
-                    self.assertEqual(self.state.default_key(), (None, False))
-        self.console_open.assert_not_called()
-
-    def test_disabled_noauth_opt_in_keeps_first_start_protection(self):
-        for value in ("", "0", "false", "no", "invalid"):
-            with self.subTest(value=value), \
-                 patch.dict(os.environ, {"CODEBUDDY2API_ALLOW_OPEN_NOAUTH": value}, clear=True), \
-                 self.assertRaises(ValueError):
-                resolve_startup_key({**self.config(), "host": "0.0.0.0"}, SimpleNamespace(api_key=""))
-        self.assertEqual(self.state.default_key(), (None, False))
-
-    def test_noauth_opt_in_never_downgrades_an_existing_default_or_override(self):
-        key, _ = self.state.default_key(create=True)
-        with patch.dict(os.environ, {"CODEBUDDY2API_ALLOW_OPEN_NOAUTH": "true"}, clear=True):
-            with self.assertRaises(ValueError):
-                resolve_startup_key(self.config(), SimpleNamespace(api_key=""))
-            with self.state.claim_announcement(key):
-                pass
-            config = {**self.config(), "host": "0.0.0.0"}
-            resolve_startup_key(config, SimpleNamespace(api_key=""))
-            self.assertEqual(config["api_key"], key)
-            for source in ("cli", "environment", "dotenv"):
-                config = self.config(source, "configured-fixture")
-                resolve_startup_key(config, SimpleNamespace(api_key="configured-fixture"))
-                self.assertEqual(config["api_key"], "configured-fixture")
-
-    def test_docker_default_without_key_or_terminal_reaches_server(self):
-        import converter
-        from fastapi import FastAPI
-        dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
-        command = json.loads(next(line[4:] for line in dockerfile.splitlines() if line.startswith("CMD ")))
-        self.assertIn("ENV CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true", dockerfile)
-        with contextlib.chdir(self.root), contextlib.ExitStack() as stack:
-            stack.enter_context(patch.dict(os.environ, {"HOME": str(self.root), "CODEBUDDY_AUTH_DIR": str(self.root),
-                                                        "CODEBUDDY2API_ALLOW_OPEN_NOAUTH": "true"}, clear=True))
-            stack.enter_context(patch.dict(converter.CONFIG))
-            stack.enter_context(patch.object(converter, "app", FastAPI()))
-            stack.enter_context(patch.object(sys, "argv", command[1:]))
-            stack.enter_context(patch.object(converter, "seed_credentials"))
-            stack.enter_context(patch.object(converter, "CredentialPool"))
-            stack.enter_context(patch.object(converter, "_publish_model_cache"))
-            stack.enter_context(patch.object(converter.threading, "Thread"))
-            stack.enter_context(patch("sys.stderr", io.StringIO()))
-            captured = {}
-            def serve(app, config, **kwargs):
-                captured.update(kwargs, key=config["api_key"], announcement=config["announce_default_key"])
-            stack.enter_context(patch.object(converter, "run_server", side_effect=serve))
-            converter.main()
-        self.assertEqual((captured["host"], captured["port"]), ("0.0.0.0", 8787))
-        self.assertFalse(captured["key"])
-        self.assertFalse(captured["announcement"])
-        self.assertEqual(self.state.default_key(), (None, False))
-        self.console_open.assert_not_called()
 
 
     def test_dotenv_is_optional_and_process_environment_wins(self):
@@ -500,7 +253,7 @@ with control.state.claim_announcement(key) as claimed:
             self.assertEqual(os.environ["CODEBUDDY2API_KEY"], "file-fixture")
             self.assertEqual(changed, {"CODEBUDDY2API_KEY"})
             config = self.config("environment", "file-fixture")
-            resolve_startup_key(config, SimpleNamespace(api_key="file-fixture"), changed)
+            resolve_startup_auth(config, SimpleNamespace(api_key="file-fixture"), changed)
             self.assertEqual(config["settings_sources"]["api_key"], "dotenv")
 
     def test_invalid_dotenv_fails_without_loading_partial_values(self):
@@ -513,9 +266,9 @@ with control.state.claim_announcement(key) as claimed:
             self.assertNotIn("CODEBUDDY2API_PORT", os.environ)
 
 
-    def test_full_startup_precedence_and_default_restore(self):
+    def test_full_startup_precedence_and_external_removal(self):
         import converter
-        from app import runtime_management
+        from app import admin_account, runtime_management
         from fastapi import FastAPI
 
         def boot(env=None, flags=()):
@@ -533,8 +286,8 @@ with control.state.claim_announcement(key) as claimed:
                 stack.enter_context(patch.object(runtime_management, "install"))
                 output = stack.enter_context(patch("sys.stderr", Terminal()))
                 def serve(app, config, **kwargs):
-                    observed.update(kwargs, key=config["api_key"], sources=dict(config["settings_sources"]))
-                    announce_default_key(config)
+                    observed.update(kwargs, key=config["api_key"], sources=dict(config["settings_sources"]),
+                                    account=admin_account.load(config["control_store"]))
                 stack.enter_context(patch.object(converter, "run_server", side_effect=serve))
                 converter.main()
                 observed["output"] = output.getvalue()
@@ -542,44 +295,48 @@ with control.state.claim_announcement(key) as claimed:
             return observed
 
         first = boot()
-        key = first["key"]
-        self.assertEqual(first["terminal"].count(key), 1)
-        self.assertNotIn(key, first["output"])
-        self.assertEqual(first["sources"]["api_key"], "generated")
+        self.assertEqual(first["key"], "")
+        self.assertEqual(first["sources"]["api_key"], "default")
+        self.assertEqual(first["account"].password_source, "generated")
+        self.assertEqual(first["terminal"].count("初始管理密码："), 1)
+        self.assertNotIn("初始管理密码：", first["output"])
         envfile = self.root / ".env"
         envfile.write_text("CODEBUDDY2API_PORT=9092\nCODEBUDDY2API_KEY=file-fixture\n")
         file_run = boot()
         self.assertEqual((file_run["port"], file_run["key"], file_run["sources"]["api_key"]), (9092, "file-fixture", "dotenv"))
+        self.assertEqual(file_run["account"].password_source, "external")
         environment = boot({"CODEBUDDY2API_PORT": "9093", "CODEBUDDY2API_KEY": "env-fixture"})
-        self.assertEqual((environment["port"], environment["key"]), (9093, "env-fixture"))
+        self.assertEqual((environment["port"], environment["key"], environment["sources"]["api_key"]),
+                         (9093, "env-fixture", "environment"))
         cli = boot({"CODEBUDDY2API_PORT": "9093", "CODEBUDDY2API_KEY": "env-fixture"},
                    ("--port", "9094", "--api-key", "cli-fixture"))
-        self.assertEqual((cli["port"], cli["key"]), (9094, "cli-fixture"))
+        self.assertEqual((cli["port"], cli["key"], cli["sources"]["api_key"]), (9094, "cli-fixture", "cli"))
         envfile.unlink()
         resumed = boot()
-        self.assertEqual(resumed["key"], key)
-        self.assertNotIn(key, resumed["output"])
-        self.assertEqual(resumed["terminal"], "")
-        self.assertEqual(self.state.default_key(), (key, False))
+        self.assertEqual(resumed["key"], "")
+        self.assertEqual(resumed["sources"]["api_key"], "default")
+        self.assertEqual(resumed["account"].password_source, "generated")
+        self.assertEqual(resumed["terminal"].count("初始管理密码："), 1)
         self.assertFalse(list(self.root.glob("*.json")))
 
-    def test_listener_failure_does_not_consume_announcement(self):
+    def test_listener_failure_keeps_initialized_account(self):
         import asyncio
         import uvicorn
         from fastapi import FastAPI
         from unittest.mock import AsyncMock
+        from app import admin_account
         from app.startup import run_server
         config = self.config()
         terminal = self.console()
         with patch("sys.stderr", io.StringIO()):
-            resolve_startup_key(config, SimpleNamespace(api_key=""))
-            key = config["api_key"]
+            resolve_startup_auth(config, SimpleNamespace(api_key=""))
             with patch.object(uvicorn.Server, "startup", new=AsyncMock(side_effect=SystemExit(3))), \
                  patch.object(uvicorn.Server, "run", lambda server: asyncio.run(server.startup())):
                 with self.assertRaises(SystemExit):
                     run_server(FastAPI(), config, host="127.0.0.1", port=8787)
-            self.assertNotIn(key, terminal.getvalue())
-            self.assertEqual(self.state.default_key(), (key, True))
+            self.assertEqual(terminal.getvalue().count("初始管理密码："), 1)
+            self.assertEqual(admin_account.load(self.control).password_source, "generated")
+            self.assertEqual(config["api_key"], "")
 
 
 

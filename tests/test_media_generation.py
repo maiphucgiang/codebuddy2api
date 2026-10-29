@@ -26,11 +26,12 @@ from fastapi.testclient import TestClient
 from pathlib import Path as _Path
 
 import converter
-from app import media_generation, media_store
+from app import admin_account, media_generation, media_store
 from app.admin_api import install_admin
 from app.control_store import ControlStore
 from app.media_store import MediaStore
 from tests import test_region_routing as fixtures
+from tests.admin_session import credentials
 
 
 def _png(rgb=(0x7C, 0x66, 0xDC)):
@@ -433,7 +434,8 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         db = sqlite3.connect(self.store.path)
         db.execute("ALTER TABLE tasks DROP COLUMN public_model")
-        db.execute("INSERT INTO tasks VALUES('task_old','acct','cn-cli','upstream',1,1,'queued',NULL,NULL,NULL)")
+        db.execute("INSERT INTO tasks(task_id,account_key,profile,model,created,updated,status,media_id,error,credit) "
+                   "VALUES('task_old','acct','cn-cli','upstream',1,1,'queued',NULL,NULL,NULL)")
         db.execute("PRAGMA user_version=1")
         db.commit()
         db.close()
@@ -443,6 +445,26 @@ class StoreTests(unittest.TestCase):
         created = reopened.create_task("task_new", "acct", "cn-cli", "upstream", public_model="alias")
         self.assertEqual(created["model"], "upstream")
         self.assertEqual(created["public_model"], "alias")
+
+    def test_video_task_api_key_roundtrip_and_filter(self):
+        self.store.create_task("owned", "acct", "cn-cli", "m", api_key="k_owned")
+        self.store.create_task("other", "acct", "cn-cli", "m", api_key="k_other")
+        self.assertEqual(self.store.get_task("owned")["api_key"], "k_owned")
+        page = self.store.list_tasks(api_key="k_owned")
+        self.assertEqual([item["task_id"] for item in page["items"]], ["owned"])
+
+    def test_v2_database_adds_api_key_without_losing_tasks(self):
+        self.store.close()
+        db = sqlite3.connect(self.store.path)
+        db.execute("PRAGMA user_version=2")
+        db.commit()
+        db.close()
+        reopened = MediaStore(self.store.root)
+        self.addCleanup(reopened.close)
+        columns = {row[1] for row in reopened._db.execute("PRAGMA table_info(tasks)").fetchall()}
+        self.assertIn("api_key", columns)
+        self.assertIsNone(reopened.create_task("legacy", "acct", "cn-cli", "m")["api_key"])
+        self.assertEqual(reopened._db.execute("PRAGMA user_version").fetchone()[0], 3)
 
 
 class MediaRoutingTests(fixtures.RegionRoutingTests):
@@ -665,6 +687,23 @@ class MediaRoutingTests(fixtures.RegionRoutingTests):
         self.enterContext(patch.dict(converter.CONFIG, {"api_key": "secret"}))
         self.assertEqual(self.client.post("/v1/images/generations", json={"prompt": "x"}).status_code, 401)
         self.assertEqual(self.client.get("/v1/videos/any").status_code, 401)
+        asset = self.store.save_asset("image", PNG_BYTES, model="m", ttl_hours=72, max_total_bytes=1 << 20)
+        self.assertEqual(self.client.get(f"/v1/media/images/{asset['id']}").status_code, 200)
+
+    def test_standard_key_cannot_refresh_another_keys_task(self):
+        from app.api_keys import KeyStore
+        control = ControlStore(self.root / "video-owner.sqlite3")
+        self.addCleanup(control.close)
+        keys = KeyStore(control)
+        _, secret = keys.create(name="limited", kind="standard")
+        self.enterContext(patch.dict(converter.CONFIG, {"key_store": keys}))
+        self.store.create_task("foreign", "acct", "cn-cli", "m", api_key="k_other")
+        before = len(self.media_requests)
+        for suffix in ("", "/content"):
+            result = self.client.get(f"/v1/videos/foreign{suffix}", headers={"Authorization": f"Bearer {secret}"})
+            self.assertEqual(result.status_code, 404, result.text)
+            self.assertEqual(result.json()["error"]["code"], "task_not_found")
+        self.assertEqual(len(self.media_requests), before)
 
     # -- videos --------------------------------------------------------------------------
 
@@ -1241,6 +1280,7 @@ class AdminMediaApiTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.control = ControlStore(self.root / "control.sqlite3")
         self.addCleanup(self.control.close)
+        admin_account.save(self.control, admin_account.new("admin", "synthetic-key", "user"))
         self.config = {"api_key": "synthetic-key", "control_store": self.control,
                        "media_store": self.store, "media_public_base_url": "https://media.example.com",
                        "media_max_total_mb": 1024, "media_ttl_hours": 72,
@@ -1261,7 +1301,7 @@ class AdminMediaApiTests(unittest.TestCase):
         self.app = FastAPI()
         install_admin(self.app, self.config, self.gateway)
         self.client = self.enterContext(TestClient(self.app))
-        session = self.client.post("/admin/session", json={"api_key": "synthetic-key"},
+        session = self.client.post("/admin/session", json=credentials("synthetic-key"),
                                    headers={"Origin": "http://testserver"})
         self.headers = {"Origin": "http://testserver", "X-CSRF-Token": session.json()["csrf_token"]}
 
@@ -1312,6 +1352,19 @@ class AdminMediaApiTests(unittest.TestCase):
         missing = self.client.post("/admin/media/tasks/missing/refresh", headers=self.headers)
         self.assertEqual(missing.status_code, 404)
         self.assertIn("视频任务不存在", missing.json()["error"]["message"])
+
+    def test_task_listing_filters_by_api_key_and_labels_owners(self):
+        item, _ = self.config["key_store"].create(name="CI key", kind="standard")
+        self.store.create_task("owned", "acct", "cn-cli", "m", api_key=item["id"])
+        self.store.create_task("other", "acct", "cn-cli", "m", api_key="k_deleted")
+        self.store.create_task("legacy", "acct", "cn-cli", "m")
+        listed = self.client.get(f"/admin/media/tasks?api_key={item['id']}", headers=self.headers).json()
+        self.assertEqual([entry["task_id"] for entry in listed["items"]], ["owned"])
+        self.assertEqual(listed["items"][0]["api_key_name"], "CI key")
+        all_items = self.client.get("/admin/media/tasks", headers=self.headers).json()["items"]
+        labels = {entry["task_id"]: entry["api_key_name"] for entry in all_items}
+        self.assertEqual(labels["other"], "k_deleted（已删除）")
+        self.assertEqual(labels["legacy"], "—（升级前）")
 
     def test_expired_assets_disappear_from_admin_views(self):
         meta = self.store.save_asset("image", PNG_BYTES, model="m", ttl_hours=72, max_total_bytes=1 << 20)

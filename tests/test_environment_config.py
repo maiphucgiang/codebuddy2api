@@ -89,9 +89,11 @@ class EnvironmentConfigTests(unittest.TestCase):
             with self.subTest(env=env), self.assertRaises(ValueError):
                 self.start(env)
 
-    def test_environment_public_binding_without_key_is_rejected(self):
-        with self.assertRaises(SystemExit):
-            self.start({'CODEBUDDY2API_BIND': '0.0.0.0', 'CODEBUDDY2API_KEY': ''})
+    def test_environment_public_binding_without_key_starts_with_blank_key_unset(self):
+        server, _, config = self.start({'CODEBUDDY2API_BIND': '0.0.0.0', 'CODEBUDDY2API_KEY': ''})
+        self.assertEqual(server['host'], '0.0.0.0')
+        self.assertEqual(config['api_key'], '')
+        self.assertEqual(config['settings_sources']['api_key'], 'default')
 
     def test_existing_runtime_limit_and_retry_variables_reach_effective_config(self):
         values = {'MAX_INBOUND_BYTES': '4096', 'MAX_COLLECT_BYTES': '0', 'MAX_CONCURRENT': '2',

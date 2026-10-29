@@ -12,10 +12,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import converter
+from app import admin_account
 from app.admin_api import install_admin
 from app.audit_store import AuditStore
 from app.control_store import ControlStore
 from app.gateway_management import Management, install_pages
+from tests.admin_session import credentials, login as session_login
 from app.model_policy import PolicyScopeMiddleware, default_rule
 from app.observability import AuditMiddleware
 from tests import test_region_routing as fixtures
@@ -25,6 +27,7 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
     def setUp(self):
         super().setUp()
         self.control = ControlStore(self.root / "control.sqlite3")
+        admin_account.save(self.control, admin_account.new("admin", "synthetic-management-key", "user"))
         self.audit = AuditStore(self.root / "logs.sqlite3")
         self.addCleanup(self.control.close)
         self.addCleanup(self.audit.close)
@@ -43,6 +46,8 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
         self.client = self.enterContext(TestClient(application, headers={"Authorization": "Bearer synthetic-management-key"},
                                                   base_url="https://testserver"))
 
+        self.client.headers.update(session_login(
+            self.client, origin="https://testserver", password="synthetic-management-key"))
     def policy(self, source="shared-model", **kwargs):
         rule = {**default_rule(source), **kwargs}
         self.control.update_model(source, rule, self.control.snapshot()["revision"],
@@ -254,7 +259,7 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
         denied = self.client.post("/admin/logs/clear", json={"scope": "all"})
         self.assertEqual(denied.status_code, 403)
         done = self.client.post("/admin/logs/clear", json={"scope": "all", "confirmation": "清空全部日志与统计",
-                                                         "api_key": "synthetic-management-key"})
+                                                         "password": "synthetic-management-key"})
         self.assertEqual(done.status_code, 200, done.text)
         self.assertEqual(self.audit.dashboard(1)["summary"]["requests"], 0)
         self.assertEqual(len(list(self.root.glob("*.info"))), 4)
@@ -264,7 +269,7 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
             response = self.client.get(path, follow_redirects=False)
             self.assertEqual(response.status_code, 302)
             self.assertEqual(response.headers["location"], "/dashboard")
-        for path in ("/dashboard", "/dashboard/models", "/dashboard/login"):
+        for path in ("/dashboard", "/dashboard/models", "/dashboard/keys", "/dashboard/login"):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200)
             self.assertIn("isolated management shell", response.text)
@@ -319,7 +324,7 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
     def test_managed_cookie_oauth_poll_without_browser_origin_still_requires_csrf(self):
         from unittest.mock import Mock
         origin = {"Origin": "https://testserver"}
-        login = self.client.post("/admin/session", json={"api_key": "synthetic-management-key"}, headers=origin)
+        login = self.client.post("/admin/session", json=credentials("synthetic-management-key"), headers=origin)
         csrf = login.json()["csrf_token"]
         self.client.headers.pop("authorization")
         manager = Mock()

@@ -28,6 +28,43 @@ class ControlStoreTests(unittest.TestCase):
         self.addCleanup(other.close)
         self.assertEqual(other.snapshot()["settings"], {"max_images": 3})
 
+    def test_v2_database_upgrades_api_keys_schema(self):
+        self.store.update_settings({"max_images": 3}, 0)
+        self.store.close()
+        with sqlite3.connect(self.path) as db:
+            db.execute("DROP INDEX api_keys_single_admin")
+            db.execute("DROP TABLE api_keys")
+            db.execute("PRAGMA user_version=2")
+        reopened = ControlStore(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.snapshot()["settings"], {"max_images": 3})
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertIn("api_keys", {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")})
+            self.assertTrue(db.execute(
+                "SELECT 1 FROM pragma_index_list('api_keys') WHERE name='api_keys_single_admin' AND \"unique\"=1"
+            ).fetchone())
+
+    def test_corrupt_api_keys_schema_is_rejected_without_deleting_rows(self):
+        from app.api_keys import KeyStore
+        for mode in ("column", "index"):
+            with self.subTest(mode=mode):
+                path = self.root / f"corrupt-{mode}.sqlite3"
+                store = ControlStore(path)
+                KeyStore(store).create(name="preserved", kind="standard")
+                store.close()
+                with sqlite3.connect(path) as db:
+                    if mode == "column":
+                        db.execute("ALTER TABLE api_keys DROP COLUMN version")
+                    else:
+                        db.execute("DROP INDEX api_keys_single_admin")
+                        db.execute("CREATE INDEX api_keys_single_admin ON api_keys(type)")
+                with self.assertRaisesRegex(ValueError, "api_keys (表|索引)结构不匹配"):
+                    ControlStore(path)
+                with sqlite3.connect(path) as db:
+                    self.assertEqual(db.execute("SELECT count(*) FROM api_keys").fetchone()[0], 1)
+
     def test_snapshot_is_detached(self):
         self.store.update_model("real", {"public_id": "public", "credential_ids": ["fingerprint"]}, 0)
         snapshot = self.store.snapshot()

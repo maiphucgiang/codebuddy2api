@@ -18,6 +18,7 @@ import httpx
 
 from app import auth_oauth
 import converter
+from tests.admin_session import direct_request
 
 
 class LoginTests(unittest.TestCase):
@@ -175,9 +176,9 @@ class LoginTests(unittest.TestCase):
         pool = converter.CredentialPool(scan=False)
         with patch.object(converter, "_OAUTH", self.manager()), \
                 patch.dict(converter.CONFIG, {"cred_pool": pool, "api_key": "synthetic-admin-key"}):
-            started = converter.admin_oauth_start(site="cn", authorization="Bearer synthetic-admin-key")
-            self.assertEqual(converter.admin_oauth_poll(started["login_id"], authorization="Bearer synthetic-admin-key"), {"done": False})
-            result = converter.admin_oauth_poll(started["login_id"], authorization="Bearer synthetic-admin-key")
+            started = converter.admin_oauth_start(direct_request(), site="cn")
+            self.assertEqual(converter.admin_oauth_poll(direct_request(), started["login_id"]), {"done": False})
+            result = converter.admin_oauth_poll(direct_request(), started["login_id"])
         self.assertTrue(result["done"])
         self.assertEqual(result["uid"], "u1")
         self.assertTrue(Path(result["imported"]).is_file())

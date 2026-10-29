@@ -11,7 +11,7 @@ codebuddy2api is a personal gateway that exposes a WorkBuddy / CodeBuddy (Tencen
 The backend is a uv project with `package = false`, so it runs from source without being installed. Install dependencies with `uv sync --locked`, or `pip install --require-hashes -r requirements.txt`.
 
 ```bash
-uv run --locked --no-build converter.py             # serve on 127.0.0.1:8787 (subcommands: serve | login | config migrate|status)
+uv run --locked --no-build converter.py             # serve on 127.0.0.1:8787 (subcommands: serve | login | config migrate|status | admin reset-password)
 uv run --locked --no-build python -B -m preview     # real gateway + simulated upstream + synthetic accounts on :8790, key "preview"
 uv run python -B tests/test_routing_scheduler.py    # one test file (each file is a standalone unittest script)
 uv run python -B tests/test_version.py VersionTests.test_matching_tag   # one test case

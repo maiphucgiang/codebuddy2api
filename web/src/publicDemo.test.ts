@@ -217,6 +217,54 @@ describe("public preview browser-local adapter", () => {
     expect(initial.data.models[0].public_id).toBe("hy-image-3.5");
     expect(initial.data.models).toHaveLength(2);
   });
+  it("supports account, session and API key workflows locally", async () => {
+    const delegate = vi.fn(async (request: InternalAxiosRequestConfig) =>
+      reply(request, { authenticated: true, csrf_token: "initial-csrf", bootstrap: true }),
+    ) as AxiosAdapter;
+    const adapter = createPublicDemoAdapter(delegate);
+    await adapter(config("get", "/session"));
+
+    const account = await adapter(config("get", "/account"));
+    expect(account.data).toMatchObject({ username: "admin", bootstrap: true });
+    const changed = await adapter(
+      config("put", "/account", { current_password: "preview", username: "operator" }),
+    );
+    expect(changed.data).toMatchObject({
+      username: "operator",
+      bootstrap: false,
+      csrf_token: "local-account-csrf",
+    });
+
+    const external = await adapter(config("get", "/keys"));
+    expect(external.data.external).toMatchObject({ origin: "cli", occupied: true });
+    const created = await adapter(
+      config("post", "/keys", {
+        name: "Demo key",
+        type: "standard",
+        expires_at: null,
+        ip_allow: null,
+        rpm: 60,
+        models: ["auto"],
+      }),
+    );
+    const id = created.data.id as string;
+    const firstSecret = created.data.secret as string;
+    expect(firstSecret).toMatch(/^cb-/);
+    expect(created.data.rpm).toBe(60);
+    expect((await adapter(config("post", `/keys/${id}/reveal`))).data.secret).toBe(firstSecret);
+    const updated = await adapter(
+      config("patch", `/keys/${id}`, { version: 1, name: "Renamed", enabled: false }),
+    );
+    expect(updated.data).toMatchObject({ name: "Renamed", enabled: false, version: 2 });
+    const rotated = await adapter(config("post", `/keys/${id}/rotate`, { version: 2 }));
+    expect(rotated.data.secret).not.toBe(firstSecret);
+    expect(rotated.data.version).toBe(3);
+    expect((await adapter(config("delete", `/keys/${id}`, { version: 3 }))).data.ok).toBe(true);
+    expect((await adapter(config("get", "/keys"))).data.items).toEqual([]);
+    expect((await adapter(config("delete", "/sessions"))).data.ok).toBe(true);
+    expect(delegate).toHaveBeenCalledTimes(1);
+  });
+
   it("installs around the default adapter array", async () => {
     const delegate = vi.fn(async (request: InternalAxiosRequestConfig) =>
       reply(request, { configured: false, base_url: "", usage: {}, tasks: {} }),

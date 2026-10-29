@@ -444,9 +444,9 @@ class IdentitySyncTests(unittest.TestCase):
                     patch.object(c, "run_server", side_effect=barrier), \
                     patch("sys.stderr", new=io.StringIO()):
                 c.main()
-            # refresher, reconcile, housekeeper, lease heartbeat, update check, scheduled backups
-            # and the server itself.
-            self.assertEqual(len(observed), 7)
+            # refresher, reconcile, housekeeping, key housekeeping, lease heartbeat, update check,
+            # scheduled backups and the server itself.
+            self.assertEqual(len(observed), 8)
 
 
 if __name__ == "__main__":

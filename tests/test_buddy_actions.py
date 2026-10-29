@@ -10,6 +10,7 @@ from unittest.mock import patch
 import converter
 from app import buddy, credential_actions, credits
 from tests import test_credential_actions as fixtures
+from tests.admin_session import credentials
 
 
 class BuddyActionTests(unittest.TestCase):
@@ -117,7 +118,7 @@ class BuddyActionTests(unittest.TestCase):
 
     def test_cookie_confirmation_requires_csrf(self):
         self.client.headers['Authorization'] = ''
-        login = self.client.post('/admin/session', json={'api_key': 'synthetic-management-key'},
+        login = self.client.post('/admin/session', json=credentials('synthetic-management-key'),
                                  headers={'Origin': 'https://testserver'})
         self.assertEqual(login.status_code, 200, login.text)
         payload = {'confirm_buddy': True, 'agreement_revision': buddy.AGREEMENT_REVISION}
@@ -162,7 +163,9 @@ class BuddyActionTests(unittest.TestCase):
 
 
     def test_confirmation_requires_authentication(self):
-        response = self.client.post(self.url + '/travel', headers={'Authorization': ''}, json={
+        self.client.headers.pop("authorization", None)
+        self.client.cookies.clear()
+        response = self.client.post(self.url + '/travel', json={
             'confirm_buddy': True, 'agreement_revision': buddy.AGREEMENT_REVISION})
         self.assertEqual(response.status_code, 401)
         self.travel_mock.assert_not_called()

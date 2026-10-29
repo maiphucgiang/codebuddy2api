@@ -1,12 +1,17 @@
-"""Resolve optional environment files and announce a saved default key once."""
+"""Resolve startup environment and initialize the management account."""
 from __future__ import annotations
 
 import io
+import hashlib
+import json
 import os
+import re
+import secrets
 import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 import stat
 
@@ -15,6 +20,7 @@ from dotenv.parser import parse_stream
 import uvicorn
 
 from .settings import SCHEMA
+from . import admin_account
 
 
 def load_startup_env(path=None):
@@ -62,45 +68,111 @@ def allows_open_noauth():
     return os.environ.get("CODEBUDDY2API_ALLOW_OPEN_NOAUTH", "").lower() in ("1", "true", "yes")
 
 
-def resolve_startup_key(config, args, dotenv_keys=()):
+def _external_key(config, args, dotenv_keys=()):
     sources = config["settings_sources"]
     for name, spec in SCHEMA.items():
         if sources.get(name) == "environment" and spec["env"] in dotenv_keys:
             sources[name] = "dotenv"
-    config["announce_default_key"] = False
-    if sources.get("api_key") in ("cli", "environment", "dotenv"):
+    source = sources.get("api_key")
+    value = config.get("api_key") if source in ("cli", "environment", "dotenv") else ""
+    value = value.strip() if isinstance(value, str) else ""
+    if not value:
+        config["api_key"] = ""
+        args.api_key = ""
+        if source in ("cli", "environment", "dotenv"):
+            variable = "CODEBUDDY2API_KEY" if source != "cli" else "--api-key"
+            print(f"[auth] {variable} 为空，按未设置处理", file=sys.stderr)
+        sources["api_key"] = "default"
+        return ""
+    config["api_key"] = args.api_key = value
+    return value
+
+
+def _announce_admin_password(password, *, username="admin"):
+    message = f"\n管理账户：{username}\n初始管理密码：{password}\n请登录后尽快修改密码。\n"
+    try:
+        with terminal_stream() as terminal:
+            terminal.write(message)
+            terminal.flush()
         return
-    store = config["state_store"]
-    key, pending = store.default_key()
-    if key is None and allows_open_noauth():
-        return
-    if key is None and config["host"] not in ("127.0.0.1", "::1", "localhost"):
-        raise ValueError("非回环监听请显式设置 API key；默认密钥仅在本地首次启动时生成")
-    if key is None or pending:
-        try:
-            with terminal_stream():
-                pass
-        except OSError:
-            raise ValueError("首次显示默认 API key 需要交互终端；后台运行请显式配置 CODEBUDDY2API_KEY") from None
-    if key is None:
-        key, pending = store.default_key(create=True)
-    config["api_key"] = args.api_key = key
-    sources["api_key"] = "generated"
-    config["announce_default_key"] = pending
+    except OSError:
+        pass
+    try:
+        sys.stdout.write(message)
+        sys.stdout.flush()
+    except BaseException:
+        raise ValueError("无法输出初始管理密码") from None
 
 
-def announce_default_key(config):
-    if not config.get("announce_default_key"):
-        return
-    with terminal_stream() as terminal:
-        key = config["api_key"]
-        with config["state_store"].claim_announcement(key) as claimed:
-            if claimed:
-                terminal.write(f"\n默认 API key：{key}\n已保存到 control.sqlite3，仅显示这一次；管理登录与 API 请求共用。\n")
-                terminal.flush()
-    config["announce_default_key"] = False
+def _account_row(control):
+    row = control._db.execute(
+        "SELECT value,announced FROM gateway_secrets WHERE name='admin_account'").fetchone()
+    if row is None:
+        return None
+    if row[1] != 1:
+        raise ValueError("管理账户公告状态无效")
+    try:
+        return admin_account._validate_document(json.loads(row[0]))
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        raise ValueError("管理账户数据无效") from error
 
 
+def _legacy_key_row(control):
+    row = control._db.execute(
+        "SELECT value,announced FROM gateway_secrets WHERE name='default_api_key'").fetchone()
+    if row is None:
+        return None
+    if not isinstance(row[0], str) or not re.fullmatch(r"cb-[0-9a-f]{32}", row[0]) or row[1] not in (0, 1):
+        raise ValueError("Invalid saved API key; restore the control database")
+    return row[0], bool(row[1])
+
+
+def resolve_startup_auth(config, args, dotenv_keys=()):
+    """Initialize auth atomically; disclose generated passwords before committing them."""
+    external = _external_key(config, args, dotenv_keys)
+    control = config["control_store"]
+    with control.state.transaction():
+        account = admin_account.load(control)
+        marker = control._db.execute(
+            "SELECT 1 FROM state_imports WHERE name='admin_auth_v1'").fetchone()
+        legacy = _legacy_key_row(control) if marker is None else None
+        if marker is not None and account is None:
+            raise ValueError("管理账户迁移记录存在但账户缺失")
+        if account is None:
+            if external:
+                account = admin_account.new("admin", external, "external")
+            elif legacy:
+                if not legacy[1]:
+                    _announce_admin_password(legacy[0])
+                account = admin_account.new("admin", legacy[0], "migrated")
+            else:
+                password = secrets.token_urlsafe(12)
+                _announce_admin_password(password)
+                account = admin_account.new("admin", password, "generated")
+        elif account.password_source != "user":
+            if external:
+                if admin_account.verify(account, account.username, external):
+                    account = admin_account.Account(account.username, "external", account.password,
+                                                    account.session_epoch, account.changed_at)
+                else:
+                    account = admin_account.with_password(account, external, source="external")
+            elif account.password_source == "external":
+                password = secrets.token_urlsafe(12)
+                _announce_admin_password(password, username=account.username)
+                account = admin_account.with_password(account, password, source="generated")
+        if legacy and not external:
+            secret = legacy[0]
+            control._db.execute(
+                "INSERT INTO api_keys(id,name,type,secret,secret_hash,prefix,created_at) "
+                "VALUES(?,?,'admin',NULL,?,?,?)",
+                ("k_" + secrets.token_urlsafe(9), "默认密钥",
+                 hashlib.sha256(secret.encode()).hexdigest(), secret[:8], time.time()))
+        admin_account.save(control, account)
+        if marker is None:
+            control._db.execute("DELETE FROM gateway_secrets WHERE name='default_api_key'")
+            control._db.execute(
+                "INSERT INTO state_imports(name,imported,migrated_at) VALUES('admin_auth_v1',?,?)",
+                (int(legacy is not None), time.time()))
 
 
 def _install_lease_release(config):
@@ -127,23 +199,9 @@ def _install_lease_release(config):
 
 def run_server(app, config, *, host, port):
     _install_lease_release(config)
-    server_class = uvicorn.Server
-    if config.get("announce_default_key"):
-        class FirstStartServer(uvicorn.Server):
-            async def startup(self, sockets=None):
-                await super().startup(sockets=sockets)
-                if self.started and not self.should_exit:
-                    try:
-                        announce_default_key(config)
-                    except BaseException:
-                        # A failed announcement/commit must not leave a hidden-key server running.
-                        self.should_exit = True
-                        await self.shutdown(sockets=sockets)
-                        raise
-        server_class = FirstStartServer
 
     # Same behavior as uvicorn.run, but keeps the server so a restart can stop it gracefully.
-    server = server_class(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
     config["server"] = server
     try:
         server.run()

@@ -446,7 +446,7 @@ class Management:
 def install_pages(app, directory):
     """Fallback only applies to pages; management/client APIs never serve HTML."""
     root = Path(directory).resolve()
-    pages = {"", "models", "credentials", "logs", "media", "storage", "settings", "updates", "login"}
+    pages = {"", "models", "credentials", "keys", "logs", "media", "storage", "settings", "updates", "login"}
     # Release detail pages carry the tag, whose dots would otherwise read as a file suffix.
     release_page = re.compile(r"updates/v\d+\.\d+\.\d+").fullmatch
     assets = StaticFiles(directory=root / "assets", check_dir=False)

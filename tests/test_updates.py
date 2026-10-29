@@ -26,7 +26,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import httpx
 
-from app import startup, updates
+from app import admin_account, startup, updates
 from app.admin_api import install_admin
 from app.backups import BackupError, Backups
 from app.control_store import ControlStore
@@ -34,6 +34,7 @@ from app.gateway_management import install_pages
 from app.settings import normalize_update_mirror
 from app.updates import REPOSITORY_URL, UpdateError, Updater
 
+from tests.admin_session import login as session_login
 
 def tarball(files, *, prefix):
     buffer = io.BytesIO()
@@ -598,10 +599,11 @@ class AdminRouteTests(UpdaterFixture):
                            session_path=self.root / "admin-sessions.json")
         self.config["updater"] = self.updater()
         self.config["backups"] = self.config["updater"].backups
+        admin_account.save(store, admin_account.new("admin", "synthetic-key", "user"))
         app = FastAPI()
         install_admin(app, self.config, SimpleNamespace())
         self.client = self.enterContext(TestClient(app))
-        self.headers = {"Authorization": "Bearer synthetic-key"}
+        self.headers = session_login(self.client)
 
     def test_update_routes_report_state_and_map_failures_to_messages(self):
         view = self.client.get("/admin/update", headers=self.headers).json()

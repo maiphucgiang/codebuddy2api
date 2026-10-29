@@ -104,6 +104,7 @@ def run(converter, credits_mod, perf_metrics, count, repeat, model):
     pool = build(converter, credits_mod, count, root)
     rows = []
     try:
+        control = None
         rows.append(measure(converter, perf_metrics, "pick", lambda: pool.pick("session", model), repeat))
         rows.append(measure(converter, perf_metrics, "headers_for",
                             lambda: pool.headers_for(None, model), repeat))
@@ -141,7 +142,23 @@ def run(converter, credits_mod, perf_metrics, count, repeat, model):
         rows.append(measure(converter, perf_metrics, "current_models", converter.current_models, repeat))
         rows.append(measure(converter, perf_metrics, "current_model_details", converter.current_model_details, repeat))
         rows.append(measure(converter, perf_metrics, "pick + revision churn", churned, repeat))
+        from app.api_keys import KeyStore
+        from app.control_store import ControlStore
+        control = ControlStore(root / "control.sqlite3")
+        keys = KeyStore(control)
+        _, secret = keys.create(name="benchmark", kind="standard", rpm=100000)
+        auth_config = {"api_key": "", "allow_open_noauth": False, "trusted_proxies": ""}
+        auth_scope = {"type": "http", "method": "POST", "path": "/v1/chat/completions",
+                      "headers": [(b"authorization", f"Bearer {secret}".encode())],
+                      "client": ("127.0.0.1", 1234)}
+
+        def authenticated():
+            for _ in range(1000):
+                keys.authenticate(auth_scope, auth_config, count_rpm=True)
+        rows.append(measure(converter, perf_metrics, "api key auth x1000", authenticated, repeat))
     finally:
+        if control is not None:
+            control.close()
         temporary.cleanup()
         converter.CONFIG.update({"cred_pool": None, "ledger": None, "account_catalogs": None,
                                  "catalog_index": None, "model_catalogs": {},

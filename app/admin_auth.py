@@ -1,4 +1,4 @@
-"""Single-key, management-only sessions and ASGI protection for legacy routes."""
+"""Password-backed management sessions and ASGI protection for legacy routes."""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from . import admin_account
 
 COOKIE_NAME = "cb_admin_session"
 SESSION_TTL = 12 * 3600
@@ -127,6 +129,7 @@ class AdminAuth:
         self.lock = threading.RLock()
         self.sessions = OrderedDict()
         self.failures = OrderedDict()
+        self._renewed_at = {}
         self._configured_key = None
         self._identity = None
         self._store = config.get("state_store")
@@ -140,6 +143,14 @@ class AdminAuth:
         It identifies the epoch; revocation clears its persisted snapshot.
         """
         return hmac.new(key.encode(), _SESSION_KEY_LABEL, hashlib.sha256).hexdigest()
+
+    def _account(self):
+        control = self.config.get("control_store")
+        if control is None and self._store is not None:
+            control = getattr(self._store, "control", None)
+        if control is None:
+            return None
+        return admin_account.load(control)
 
     @staticmethod
     def _token(value):
@@ -179,7 +190,10 @@ class AdminAuth:
         """Revoke the persisted snapshot; returns False when it could not be cleared."""
         if self._store is not None:
             try:
-                self._store.delete("sessions")
+                if self._store._db.in_transaction:
+                    self._store._db.execute("DELETE FROM runtime_state WHERE name='sessions'")
+                else:
+                    self._store.delete("sessions")
             except (OSError, ValueError, sqlite3.Error) as error:
                 self._storage_failed(error)
                 return False
@@ -269,15 +283,19 @@ class AdminAuth:
         now = self.wall_clock()
         restored = OrderedDict()
         for sid, item in entries.items():
-            if not isinstance(item, dict) or set(item) != {"csrf_token", "expires"}:
+            if not isinstance(item, dict) or set(item) not in ({"csrf_token", "expires"},
+                                                                {"csrf_token", "expires", "remember"}):
                 return False
             token = self._token(sid)
             csrf_token = self._token(item["csrf_token"])
             expires = self._deadline(item["expires"])
             if token is None or csrf_token is None or expires is None:
                 return False
+            remember = item.get("remember", False)
+            if type(remember) is not bool:
+                return False
             if expires > now:
-                restored[token] = {"csrf_token": csrf_token, "expires": expires}
+                restored[token] = {"csrf_token": csrf_token, "expires": expires, "remember": remember}
         self.sessions.update(restored)
         if len(restored) != len(entries):
             # Expired records were dropped: rewrite the snapshot, so a wall clock that
@@ -295,11 +313,15 @@ class AdminAuth:
             # A disabled key revokes everywhere; drop the snapshot instead of writing one.
             return self._revoke()
         document = {"version": SESSION_FILE_VERSION, "fingerprint": self._fingerprint(self._configured_key),
-                    "sessions": {sid: {"csrf_token": item["csrf_token"], "expires": item["expires"]}
+                    "sessions": {sid: {"csrf_token": item["csrf_token"], "expires": item["expires"],
+                                        "remember": bool(item.get("remember", False))}
                                  for sid, item in self.sessions.items()}}
         if self._store is not None:
             try:
-                self._store.put("sessions", document)
+                if self._store._db.in_transaction:
+                    self._store._put("sessions", document)
+                else:
+                    self._store.put("sessions", document)
                 self._storage_ok()
                 return True
             except (OSError, ValueError, sqlite3.Error) as error:
@@ -335,7 +357,8 @@ class AdminAuth:
         return True
 
     def _key(self):
-        key = self.config.get("api_key") or ""
+        account = self._account()
+        key = account.session_epoch if account is not None else self.config.get("api_key") or ""
         if not isinstance(key, str):
             key = ""
         if self._configured_key is None or not hmac.compare_digest(key.encode(), self._configured_key.encode()):
@@ -370,6 +393,9 @@ class AdminAuth:
         """Only an explicitly disabled startup option skips browser-origin protection."""
         return self.config.get("admin_csrf", True) is not False
 
+    def account_mode(self):
+        return self._account() is not None
+
     def allowed_origins(self):
         """Extra trusted browser origins from hot configuration."""
         return origin_allowlist(self.config.get("admin_allowed_origins"))
@@ -394,16 +420,26 @@ class AdminAuth:
 
     def check_key(self, candidate):
         with self.lock:
+            if self._account() is not None:
+                return False
             key = self._key()
             return bool(key) and isinstance(candidate, str) and hmac.compare_digest(candidate.encode(), key.encode())
 
     def header_identity(self, request):
+        if self._account() is not None:
+            return None
         authorization = request.headers.get("authorization", "")
         bearer = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-        with self.lock:
-            if self.check_key(bearer) or self.check_key(request.headers.get("x-api-key")):
-                return "key:" + self._identity
+        if self.check_key(bearer) or self.check_key(request.headers.get("x-api-key")):
+            return "key:" + self._identity
         return None
+
+    def check_password(self, username, password):
+        with self.lock:
+            account = self._account()
+            if account is None:
+                return self.check_key(password)
+        return admin_account.verify(account, username, password)
 
     def session(self, request):
         sid = request.cookies.get(COOKIE_NAME, "")
@@ -411,38 +447,68 @@ class AdminAuth:
             self._key()
             item = self.sessions.get(sid)
             if item and item["expires"] > self.wall_clock():
+                self.sessions.move_to_end(sid)
                 return sid, dict(item)
             if self.sessions.pop(sid, None) is not None:
                 self._persist()
         return None, None
 
-    def login(self, request, key):
+    def login(self, request, username, password=None, remember=False):
+        if self._account() is None:
+            with self.lock:
+                now = self.clock()
+                self._key()
+                for peer, (started, _) in list(self.failures.items()):
+                    if now - started >= 60:
+                        del self.failures[peer]
+                address = request.client.host if request.client else "unknown"
+                started, count = self.failures.get(address, (now, 0))
+                if count >= 10:
+                    return None, 429
+                if not self.check_key(username):
+                    self.failures[address] = (started, count + 1)
+                    self.failures.move_to_end(address)
+                    while len(self.failures) > 1024:
+                        self.failures.popitem(last=False)
+                    return None, 401
+                self.failures.pop(address, None)
+            return self.issue_session(request, remember=False), 200
         address = request.client.host if request.client else "unknown"
-        now = self.clock()
-        with self.lock:
-            self._key()
-            for peer, (started, _) in list(self.failures.items()):
-                if now - started >= 60:
-                    del self.failures[peer]
-            started, count = self.failures.get(address, (now, 0))
-            if count >= 10:
+        for attempt in range(2):
+            with self.lock:
+                now = self.clock()
+                self._key()
+                for peer, (started, _) in list(self.failures.items()):
+                    if now - started >= 60:
+                        del self.failures[peer]
+                started, count = self.failures.get(address, (now, 0))
+                if count >= 10:
+                    return None, 429
+                account = self._account()
+            if account is None:
+                return None, 503
+            try:
+                valid = admin_account.verify(account, username, password)
+            except admin_account.AccountBusy:
                 return None, 429
-            if not self.check_key(key):
-                self.failures[address] = (started, count + 1)
-                self.failures.move_to_end(address)
-                while len(self.failures) > 1024:
-                    self.failures.popitem(last=False)
-                return None, 401
-            self.failures.pop(address, None)
-            old = request.cookies.get(COOKIE_NAME)
-            self.sessions.pop(old, None)
-            sid = secrets.token_urlsafe(32)
-            item = {"csrf_token": secrets.token_urlsafe(32), "expires": self.wall_clock() + SESSION_TTL}
-            self.sessions[sid] = item
-            while len(self.sessions) > MAX_PERSISTED_SESSIONS:
-                self.sessions.popitem(last=False)
-            self._persist()
-            return (sid, dict(item)), 200
+            with self.lock:
+                control = self.config["control_store"]
+                # The database lock/transaction also serializes a CLI reset using a different
+                # connection; the verified epoch and the persisted session are one decision.
+                with control.state.transaction():
+                    current = self._account()
+                    if current is None or current.session_epoch != account.session_epoch:
+                        continue
+                    if not valid:
+                        started, count = self.failures.get(address, (started, 0))
+                        self.failures[address] = (started, count + 1)
+                        self.failures.move_to_end(address)
+                        while len(self.failures) > 1024:
+                            self.failures.popitem(last=False)
+                        return None, 401
+                    self.failures.pop(address, None)
+                    return self.issue_session(request, remember=remember), 200
+        return None, 503
 
     def logout(self, request):
         """Revoke the cookie's session; returns False when the snapshot could not be updated.
@@ -458,6 +524,33 @@ class AdminAuth:
             if self._persist():
                 return True
             self.sessions[sid] = item
+            self._renewed_at[sid] = self.wall_clock()
+            return False
+
+    def issue_session(self, request, *, remember=False):
+        with self.lock:
+            self._key()
+            old = request.cookies.get(COOKIE_NAME)
+            self.sessions.pop(old, None)
+            sid = secrets.token_urlsafe(32)
+            item = {"csrf_token": secrets.token_urlsafe(32),
+                    "expires": self.wall_clock() + (400 * 86400 if remember else SESSION_TTL),
+                    "remember": bool(remember)}
+            self.sessions[sid] = item
+            while len(self.sessions) > MAX_PERSISTED_SESSIONS:
+                self.sessions.popitem(last=False)
+            if not self._persist():
+                self.sessions.pop(sid, None)
+                raise SessionStoreError("无法保存管理会话")
+            return sid, dict(item)
+
+    def revoke_all(self):
+        with self.lock:
+            previous = self.sessions
+            self.sessions = OrderedDict()
+            if self._persist():
+                return True
+            self.sessions = previous
             return False
 
 
@@ -470,21 +563,25 @@ class AdminMiddleware:
             return await self.app(scope, receive, send)
         request = Request(scope, receive)
 
+        renewal = None
+
         async def no_cache(message):
             if message["type"] == "http.response.start":
                 headers = [(k, v) for k, v in message.get("headers", []) if k.lower() not in (b"cache-control", b"pragma", b"expires")]
                 message = {**message, "headers": headers + [(b"cache-control", b"no-store"), (b"pragma", b"no-cache"), (b"expires", b"0")]}
+                if renewal is not None:
+                    message["headers"].append((b"set-cookie", renewal.encode("latin-1")))
             await send(message)
 
         try:
-            enabled = self.auth.enabled()
+            enabled = self.auth.enabled() and self.auth.account_mode()
         except SessionStoreError:
             # The key epoch changed but its superseded snapshot survives. Deny rather than
             # continue: startup refuses this case, so it is only reachable mid-process.
             return await error_response(
                 503, "会话快照无法安全读取或持久化，管理接口已锁定；请检查控制库后重启")(scope, receive, no_cache)
         if not enabled:
-            return await error_response(503, "未配置 API key，管理接口已锁定")(scope, receive, no_cache)
+            return await error_response(503, "管理账户未初始化")(scope, receive, no_cache)
         path, method = scope["path"], scope["method"]
         public_session = path == "/admin/session" and method in ("POST", "GET")
         identity = self.auth.header_identity(request)
@@ -499,14 +596,20 @@ class AdminMiddleware:
                 return await error_response(403, "Origin 或 CSRF 校验失败")(scope, receive, no_cache)
         scope.setdefault("state", {}).update(admin_identity=identity or sid, admin_cookie=cookie,
                                               admin_session=session)
-        if cookie:
-            # Only this /admin ASGI scope receives the header, never the client or inference scope.
+        if (cookie and session.get("remember") is True and method not in ("DELETE",)
+                and path != "/admin/account"):
+            now = self.auth.wall_clock()
             with self.auth.lock:
-                key = self.auth._key()
-                if sid not in self.auth.sessions:
-                    return await error_response(401, "管理会话已失效")(scope, receive, no_cache)
-            scope = {**scope, "headers": [(k, v) for k, v in scope["headers"] if k.lower() not in (b"authorization", b"x-api-key")]
-                     + [(b"authorization", ("Bearer " + key).encode())]}
+                last = session["expires"] - 400 * 86400
+                if now - last >= 86400:
+                    current = self.auth.sessions.get(sid)
+                    if current is not None:
+                        current["expires"] = now + 400 * 86400
+                        self.auth._renewed_at[sid] = now
+                        self.auth._persist()
+                        renewal = (f"{COOKIE_NAME}={sid}; Max-Age={400 * 86400}; HttpOnly; "
+                                    f"Path=/admin; SameSite=Strict" +
+                                    ("; Secure" if scope.get("scheme") == "https" else ""))
         if self.dispatch and not public_session:
             response = await self.dispatch(Request(scope, receive))
             if response is not None:

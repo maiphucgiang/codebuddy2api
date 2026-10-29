@@ -6,7 +6,7 @@
 
 ## 配置与 CLI
 
-配置优先级：**显式 CLI 参数 > 进程环境变量 > `.env` > SQLite 保存值 > 默认值**。热更新设置立即生效，标记为重启的项需手动重启；锁定项请在对应来源修改，WebUI 不改写 `.env` 或返回 API key 明文。
+配置优先级：**显式 CLI 参数 > 进程环境变量 > `.env` > SQLite 保存值 > 默认值**。热更新设置立即生效，标记为重启的项需手动重启；锁定项请在对应来源修改，WebUI 不改写 `.env`；普通密钥可再次查看，管理密钥只保存哈希。
 
 Compose 会加载 `.env` 中的每个键，注释掉一行即可解除锁定；只有 `CODEBUDDY_AUTH_DIR` 和 `CODEBUDDY2API_ALLOW_OPEN_NOAUTH` 由 Compose 文件固定。修改这些值后重建容器。
 
@@ -17,7 +17,7 @@ Compose 会加载 `.env` 中的每个键，注释掉一行即可解除锁定；�
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--host` / `--port` | `127.0.0.1` / `8787` | 本地监听地址与端口 |
-| `--api-key` | 已保存的默认 key | 管理与推理共用；缺失时首次本地交互启动生成并保存；显式空值锁定管理 |
+| `--api-key` | 未设置 | 外部管理推理密钥及初始 WebUI 密码；空白按未设置处理，数据库密钥不会提升为该值 |
 | `--admin-csrf [true/false]` | `true` | 管理 Origin/CSRF 校验；仅启动配置可关闭，API key 和会话鉴权不变 |
 | `--admin-allowed-origins` | 无 | 额外信任的管理页来源（逗号分隔，裸域名按 HTTPS），用于反代登录；热生效，可在 WebUI 配置 |
 | `--auth-file` | 扫描 `auth/` | 指定凭据文件，可重复传入；不再扫描其他文件 |
@@ -181,6 +181,9 @@ scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` 
 | `PATCH /admin/credentials/{id}` | 按账号设置单个布尔字段（`enabled`、`auto_checkin`、`auto_travel`、`auto_daily_chat` 或 `auto_growth`）或 `growth_auto` 任务码映射；保存自动任务开关不立即领取 |
 | `GET /admin/credentials/{id}/growth-tasks` · `POST .../growth-tasks/auto` · `.../auto-all` · `GET /admin/growth-jobs` · `POST /admin/credentials/growth-batch` | 实时成长任务列表；以后台任务执行单任务或全部已开任务；各账号当前与最近任务；为已选账号批量设置任务开关 |
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | 发起与轮询登录；`site=cn`（默认）、`intl`（国际 WorkBuddy）或 `intl-codebuddy`（国际 CodeBuddy） |
+| `POST` / `GET` / `DELETE /admin/session` · `DELETE /admin/sessions` | 密码登录、会话查看/退出及全部撤销；记住我会话用同一 SID 滑动续期 |
+| `GET` / `PUT /admin/account` | 查看或修改管理用户名/密码；修改后更换会话 epoch 和 CSRF token |
+| `GET` / `POST /admin/keys` · `PATCH` / `DELETE /admin/keys/{id}` · `POST .../rotate` · `POST .../reveal` | 创建和管理推理密钥；写操作使用乐观版本，普通密钥可查看，管理密钥只显示一次 |
 | `GET /admin/credits` · `POST /admin/checkin` | 查询额度；按日幂等签到，国内按开关继续旅行 |
 | `POST /admin/sync` | 同步全部启用账号的余额、目录和用量，不签到、不领取试用 |
 | `POST /admin/credentials/{id}/{action}` | 单账号 `refresh`、`checkin`、`sync`、`travel-status`（仅查询）、`travel`（领取后派出）、`trial`（一次性体验积分）或 `reset-cooldown`（仅本地状态） |
@@ -191,7 +194,13 @@ scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` 
 
 页面使用 `/dashboard/*`，管理 API 使用 `/admin/*`，客户端保留原 `/v1/*`；不注册 `/cn`、`/intl` API 前缀。模型自动选路不要求客户端改变地址。
 
-管理必须配置 API key；WebUI 使用同 key 建立 HttpOnly 管理 Cookie，Cookie 仅授权 `/admin/*`，不能用于 `/v1/*`。命令行 API 请求携带 `Authorization: Bearer <key>` 或 `X-Api-Key`。空 key 仅保留推理接口的历史无鉴权行为，不开放管理；`/health` 不返回账号、路径或异常详情。
+**`OPEN_NOAUTH` 匿名模式会同时开放推理和账号池 billing（`/v1/dashboard/billing/*`）。** 仅在没有任何外部密钥和 `api_keys` 记录时生效，缺失或占位 token 都会放行，公网部署绝不可使用。只要存在任意密钥记录，包括停用或过期记录，匿名模式即失效。
+
+管理端使用用户名和密码，任何 API key 都不能登录管理接口。HttpOnly Cookie 仅授权 `/admin/*`，推理密钥仅授权 `/v1/*`。普通登录有效期 12 小时；「记住我」有效期 400 天并滑动续期。修改账户或「退出所有会话」会撤销所有会话。
+
+外部 `CODEBUDDY2API_KEY` 是初始密码和不受限的管理推理密钥。旧默认 key 会迁移为初始密码和数据库管理密钥；修改密码后，登录不再跟随外部密钥变化。忘记密码时，交互执行 `converter.py admin reset-password`。
+
+普通密钥支持有效期、IP/CIDR 白名单、RPM 和上游模型限制，可再次查看并以明文保存。管理密钥不受限、最多一个，只保存哈希。普通密钥不能读取 billing 或其他密钥的视频任务。公开 `/v1/media/...` 资源在媒体 TTL 到期前始终可读，撤销创建密钥不会将其撤回。
 
 ### 管理 Origin / CSRF 开关
 
@@ -308,7 +317,9 @@ Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 
 
 ## 部署暴露与凭据导入
 
-- Compose 默认映射回环地址。没有配置或已保存的 key 时，`CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true` 显式允许后台／非回环匿名推理，不生成密钥，管理仍锁定。镜像保留此兼容开关，对外暴露前请配置 `CODEBUDDY2API_KEY`；该开关不会停用已有 key。
+- Compose 默认映射回环地址。对外开放前配置外部密钥或创建数据库密钥，不要把匿名模式当作公网访问方案。
+- **没有任何外部或数据库密钥时，`CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true` 会匿名开放推理和账号池 billing，缺失或占位 token 均可。** 存在任意密钥记录即强制鉴权；没有密钥且开关关闭时，所有推理请求返回 401 `api_key_required`。
+- 每个数据目录只运行一个网关进程。其他进程的密钥变更约 1 秒内可见，但 RPM 计数与 `last_used_at` 聚合按进程独立。备份含普通密钥明文，必须按凭证保护。
 - 配置 key 时，生成及 token 估算 POST 在缓冲请求体、预留推理名额之前校验请求头；即使名额已满，无效 key 仍返回 401。其他路由保留原有鉴权和路由行为。
 - 凭据导入/上传在落盘前把 token 别名归一化为官方字段名；严格 JSON 解析拒绝 NaN/Infinity，`expiresAt`/`lastRefreshTime` 必须是合理的有限毫秒时间戳。
 
@@ -323,8 +334,8 @@ Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 
 
 | 现象 | 处理与边界 |
 |------|------------|
-| WebUI 无法登录 | 确认设置了 API key；更换 key 后重新登录并重新发起未完成的 OAuth。HTTPS 反代后经域名登录失败时，用 `admin_allowed_origins` 信任对外来源（见上文） |
-| 本地 401 | 客户端密钥与网关不一致 |
+| WebUI 无法登录 | 使用初始或当前管理密码，或执行 `converter.py admin reset-password`。HTTPS 反代后经域名登录失败时，用 `admin_allowed_origins` 信任对外来源（见上文） |
+| 本地 401 / 403 / 429 | 检查推理密钥是否存在、启用且未过期，再检查 IP/模型允许范围和 RPM；鉴权与权限错误按客户端协议返回 |
 | 上游 401 / 403 | 凭证级认证熔断；在 WebUI 检查并重新登录 |
 | 渠道校验（11128） | 可用时仅在同账号 `/console` 回退一次；第二次渠道拒绝可把 system 指令降为 user 后在同账号重试一次。最终仍拒绝则直接返回，不冷却任何账号；搜索/MCP 没有回退端点，账号保持可用 |
 | 账号限制（11140） | 标记账号为官方限制并休眠 2 小时，保留证据且暂时移出选路；申诉通过后可在凭证页一键重新启用。当前请求不换账号重放 |
@@ -346,4 +357,4 @@ Messages 的 `enabled` / `adaptive` 启用 Chat 推理，`output_config.effort` 
 
 ## 降级与回滚
 
-功能开关不藏隐状态：关闭守卫或模式即对新请求停止生效，回退源码即恢复旧行为。例外是持久化设置与自动化状态：`control.sqlite3` 保存 WebUI 设置、模型规则与奖励预留，旧代码会拒绝未知字段。源码降级前移除新增的启动参数，停止服务，备份**当前**数据目录，并使用上面的窄范围离线 `settings.<name>` 删除流程，递增 revision 并执行完整性检查。不要恢复升级前数据库，也不要混用 WAL/SHM 代数，否则可能回滚较新的领取、会话、撤销和账号状态。回滚无法撤销已完成的上游签到、领取或旅行派出。
+功能开关不藏隐状态：关闭守卫或模式即对新请求停止生效，回退源码即恢复旧行为。例外是持久化设置与自动化状态：`control.sqlite3` 保存 WebUI 设置、模型规则与奖励预留，旧代码会拒绝未知字段。含 `api_keys` 的控制库 schema v3、审计库 schema v5 和媒体库 schema v3 均不能被 1.4.x 读取；降级必须停机并从升级前备份恢复。更早的纯设置变更可移除新增启动参数，并使用上面的窄范围离线 `settings.<name>` 删除流程，递增 revision 并执行完整性检查。不要恢复升级前数据库，也不要混用 WAL/SHM 代数，否则可能回滚较新的领取、会话、撤销和账号状态。回滚无法撤销已完成的上游签到、领取或旅行派出。
