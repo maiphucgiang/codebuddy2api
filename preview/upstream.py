@@ -155,6 +155,7 @@ class Upstream:
             "/v2/plugin/auth/token": self.login_token,
             "/v2/plugin/login/account": self.login_account,
             "/v3/config": self.catalog,
+            "/v2/enterprises/personal/models": self.personal_models,
             "/console/accounts": self.console_accounts,
             "/v2/billing/meter/get-user-resource": self.resources,
             "/v2/billing/meter/get-enterprise-user-usage": self.enterprise_usage,
@@ -324,6 +325,16 @@ class Upstream:
                    "models": list(state.account.models)}]
         models[0]["isDefault"] = True
         return ok({"models": models, "agents": agents})
+
+    def personal_models(self, request, body, state):
+        if state.account.enterprise:
+            return fail(403, "enterprise account has no personal model table")
+        reply = self.catalog(request, body, state)
+        data = reply.payload["data"]
+        data.update(endpoint=f"https://{request.url.host}", mergeStrategy="merge",
+                    defaultVideoModel=next((name for name in state.account.media
+                                            if "video" in media_generation.model_kinds(name)), None))
+        return reply
 
     def console_accounts(self, request, body, state):
         account = state.account

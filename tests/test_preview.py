@@ -92,6 +92,18 @@ class UpstreamTests(Isolated):
         usage = credits.fetch_request_usage(token, uid=uid, domain=domain)
         self.assertEqual(usage["requests"], 30 * ACCOUNTS["dune"].daily_requests)
 
+    def test_personal_model_table_has_rich_catalog_fields(self):
+        token, uid, domain = login("aurora")
+        response = httpx.get("https://www.codebuddy.cn/v2/enterprises/personal/models",
+                             headers={"Authorization": f"Bearer {token}", "X-User-Id": uid,
+                                      "X-Domain": domain, "X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["code"], 0)
+        self.assertIn("agents", payload["data"])
+        self.assertIn("models", payload["data"])
+        self.assertTrue(payload["data"]["models"])
+
     def test_checkin_once_per_day(self):
         token, uid, domain = login("cedar")
         self.assertEqual(credits.daily_checkin(token, uid, domain)["state"], "success")
