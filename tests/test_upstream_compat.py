@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from copy import deepcopy
+import gzip
 import json
 import time
 import unittest
@@ -25,6 +26,11 @@ CHANNEL_ERROR = {
     "type": "error",
 }
 MODEL_MISSING = {"code": 11102, "msg": "model [shared-model] service info not found"}
+
+
+def request_json(request):
+    raw = gzip.decompress(request.content) if request.headers.get("Content-Encoding") == "gzip" else request.content
+    return json.loads(raw)
 
 
 class ToolPatternTests(unittest.TestCase):
@@ -190,7 +196,7 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
                         "name": "agent_run", "parameters": schema}}]
                 response = self.client.post("/v1/" + endpoint, json=payload)
                 self.assertEqual(response.status_code, 200, response.text)
-                sent = json.loads(self.requests[-1].content)
+                sent = request_json(self.requests[-1])
                 pattern = sent["tools"][0]["function"]["parameters"]["properties"]["runId"]["pattern"]
                 self.assertEqual(pattern, "^agent_run_")
 
@@ -203,7 +209,7 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
                     "name": "result", "schema": {"properties": {"runId": {"pattern": r"^agent\_run\_"}}}}}
                 response = self.client.post("/v1/" + endpoint, json=payload)
                 self.assertEqual(response.status_code, 200, response.text)
-                sent = json.loads(self.requests[-1].content)
+                sent = request_json(self.requests[-1])
                 schema = sent["response_format"]["json_schema"]["schema"]
                 self.assertEqual(schema["properties"]["runId"]["pattern"], "^agent_run_")
 
@@ -248,7 +254,7 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual([request.url.path for request in self.requests], [
             "/v2/chat/completions", "/console/chat/completions", "/console/chat/completions"])
         self.assertEqual(len({request.headers["x-user-id"] for request in self.requests}), 1)
-        moved = json.loads(self.requests[-1].content)
+        moved = request_json(self.requests[-1])
         self.assertEqual(moved["messages"][0], {"role": "system", "content": "You are a helpful assistant."})
         self.assertEqual(moved["messages"][1]["role"], "user")
         self.assertIn("<instructions>\nprivate system instructions", moved["messages"][1]["content"])
@@ -324,6 +330,9 @@ class AutomationCompatTests(unittest.TestCase):
             with self.assertRaises(growth_events.Failure):
                 growth_events.desktop_chat("https://synthetic.invalid", {})
         self.assertEqual([request.url.path for request in calls], ["/v2/chat/completions"])
+        self.assertEqual(calls[0].headers["X-Agent-Type"], "auxiliary")
+        self.assertEqual(calls[0].headers["X-Agent-Runtime"], "local-agent")
+        self.assertEqual(calls[0].headers["X-IDE-Version"], "5.9.3")
 
     def test_rate_probe_uses_console_after_channel_rejection(self):
         calls = []

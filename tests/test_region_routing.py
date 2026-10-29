@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from copy import deepcopy
+import gzip
 import json
 import os
 import tempfile
@@ -27,6 +28,14 @@ DOMAINS = {
 }
 HOSTS = dict(DOMAINS, **{"cn-cli": "copilot.tencent.com"})
 GENERATIONS = ("chat/completions", "responses", "messages")
+
+
+def request_content(request):
+    return gzip.decompress(request.content) if request.headers.get("Content-Encoding") == "gzip" else request.content
+
+
+def request_json(request):
+    return json.loads(request_content(request))
 
 
 def model(identifier, credits=None):
@@ -150,7 +159,13 @@ class RegionRoutingTests(unittest.TestCase):
         self.assertEqual(request.url.host, HOSTS[profile])
         self.assertEqual(request.headers["x-domain"], self.credentials[uid]["auth"]["domain"])
         self.assertEqual(request.headers["authorization"], "Bearer synthetic-access-" + uid)
-        for name, value in client_profiles.identity_headers(profile).items():
+        expected_private = "true" if request.headers.get("X-Enterprise-Id") else "false"
+        if profile in ("cn-cli", "cn-work"):
+            self.assertEqual(request.headers["X-Private-Data"], expected_private, profile)
+        expected_identity = client_profiles.identity_headers(profile)
+        if profile == "cn-work":
+            expected_identity["X-Private-Data"] = expected_private
+        for name, value in expected_identity.items():
             self.assertEqual(request.headers[name], value, (profile, name))
         self.assertEqual(request.headers["x-ide-type"],
                          "CLI" if profile.endswith("-cli") else "WorkBuddy")
@@ -216,7 +231,7 @@ class RegionRoutingTests(unittest.TestCase):
                 self.assertEqual(data["content"][0]["text"], "ok")
         self.assertEqual(len(self.requests), before + 1, response.text)
         request = self.requests[-1]
-        return request, json.loads(request.content)
+        return request, request_json(request)
 
     def post_rejected(self, endpoint, payload, statuses=(404, 503)):
         self.allowed_profiles = set()

@@ -1,6 +1,6 @@
 """Growth-center behavior chains: desktop/web event reporting and real-chat helpers.
 
-Payload shapes mirror the official WorkBuddy desktop client (5.5.6) field-for-field, as
+Payload shapes mirror the official WorkBuddy desktop client (5.9.3) field-for-field, as
 validated by the upstream panel across multiple live accounts. Report hosts follow the
 account's own product endpoint; the desktop fingerprint is stable per uid so repeated
 chains look like one persistent device.
@@ -14,8 +14,8 @@ import time
 
 import httpx
 
-DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) WorkBuddyDesktop/5.5.6 "
-              "Chrome/132.0.6834.83 Electron/34.0.0 Safari/537.36")
+DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) WorkBuddyDesktop/5.9.3 "
+              "Chrome/148.0.7778.97 Electron/41.8.1 Safari/537.36")
 WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
 REPORT_PATH = "/v2/report"
@@ -42,13 +42,13 @@ def fingerprint(uid, nickname=""):
     now = int(time.time() * 1000)
     return {"timezone": "Asia/Shanghai", "reportDelay": 2000, "userId": uid,
             "username": nickname, "userNickname": nickname, "product": "SaaS",
-            "releaseDate": 1789036585355,
-            "commit": "5f9692923c93033111c51ad7b003eb80204a9b75",
-            "ideName": "WorkBuddy", "ideType": "WorkBuddy", "ideVersion": "5.5.6",
+            "releaseDate": 1789632000000,
+            "commit": "c41253385fa07bebfcae8a7a4728914f09af96d0",
+            "ideName": "WorkBuddy", "ideType": "WorkBuddy", "ideVersion": "5.9.3",
             "machineId": derive_id(uid, "machine"), "sessionId": derive_id(uid, "session"),
-            "extName": "workbuddy-desktop", "extVersion": "5.5.6",
-            "os": "win32", "arch": "x64", "osVersion": "10.0.26220",
-            "cpuCores": 20, "memorySize": 24, "timestamp": now, "presentAt": now}
+            "extName": "workbuddy-desktop", "extVersion": "5.9.3",
+            "os": "win32", "arch": "x64", "osVersion": "10.0.26200",
+            "cpuCores": 24, "memorySize": 32, "timestamp": now, "presentAt": now}
 
 
 def _post_json(base, path, headers, payload):
@@ -106,13 +106,15 @@ def chat_request_event(uid, conversation_id, request_id="", model_id="", model_n
             "inputLength": 12, "requestModelId": model_id,
             "requestModelName": model_name or model_id, "isPlan": False,
             "isAutoExecuteTerminal": False, "isAutoModify": False, "codebaseEnable": False,
-            "maxToken": 0, "maxSteps": 0, "temperature": 0, "maxRetries": 0,
+            "maxToken": 0, "maxSteps": 0, "temperature": 0.7, "maxRetries": 2,
             "mentionContexts": [], "knowledgeId": [], "knowledgeName": [], "codebaseId": "",
             "mentionContextCount": 0, "command": "", "expertId": "", "recommendId": "",
             "skillId": "", "skillCount": 0, "totalCount": 0, "fileUri": "",
             "presentAt": now, "traceId": "", "rootRequestId": request_id,
             "parentConversationId": conversation_id, "agentName": "default",
-            "agentType": "conversation", "userId": uid}
+            "agentType": "conversation", "device_id": uid, "device_type": "desktop",
+            "sdk_version": "5.9.3", "chat_session_uuid": conversation_id,
+            "platform": "windows", "title": "对话", "userId": uid}
 
 
 def report_chat_activity(base, token, uid, conversation_id, request_id="", model_id="",
@@ -260,8 +262,10 @@ def desktop_chat(base, headers, expert_id="", model=FAST_MODEL, prompt="1+1等�
             "stream_options": {"include_usage": True}}
     outgoing = {**headers, "X-Domain": base, "X-Product": "SaaS", "X-Conversation-ID": conversation_id,
                 "X-Request-ID": str(int(time.time() * 1000)), "X-Agent-Intent": "craft",
-                "X-Agent-Type": "main", "X-IDE-Name": "WorkBuddy", "X-IDE-Type": "WorkBuddy",
-                "X-IDE-Version": "5.5.6", "x-codebuddy-request": "1",
+                "X-Agent-Type": "auxiliary", "X-Agent-Runtime": "local-agent",
+                "X-IDE-Name": "WorkBuddy", "X-IDE-Type": "WorkBuddy",
+                "X-IDE-Version": "5.9.3", "x-codebuddy-request": "1",
+                "X-Requested-With": "XMLHttpRequest", "User-Agent": DESKTOP_UA,
                 "Accept": "text/event-stream"}
     outgoing.pop("X-Client-Platform", None)
     if expert_id:

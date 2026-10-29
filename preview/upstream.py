@@ -7,6 +7,7 @@ Upstream state (balances, check-ins, trips, tasks) lives in memory and resets on
 """
 
 import asyncio
+import gzip
 from dataclasses import dataclass, field
 import itertools
 import json
@@ -217,6 +218,11 @@ class Upstream:
 
     def dispatch(self, request: httpx.Request, raw: bytes) -> Reply:
         path = request.url.path
+        if request.headers.get("content-encoding", "").lower() == "gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except (OSError, EOFError):
+                return fail(400, "gzip 请求体无法解压")
         if request.url.host == "api.github.com":
             return self.releases()
         if path.endswith(".tar.gz"):

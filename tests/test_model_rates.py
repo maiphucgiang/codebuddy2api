@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
+import gzip
 import json
 import os
 import tempfile
@@ -188,9 +189,15 @@ class ProbeOnceTests(unittest.TestCase):
         with patch("httpx.Client") as factory:
             factory.return_value.__enter__ = Mock(return_value=client)
             factory.return_value.__exit__ = Mock(return_value=False)
-            result = rate_measurement.probe_once("https://upstream/chat", {"Authorization": "Bearer t"}, "promo-f")
+            result = rate_measurement.probe_once(
+                "https://upstream/chat",
+                {"Authorization": "Bearer t", "X-Domain": "www.workbuddy.cn", "X-IDE-Type": "WorkBuddy"},
+                "promo-f")
         self.assertEqual(result, {"credit": 0.06, "input_tokens": 8100, "cache_read_tokens": 0, "output_tokens": 2})
-        body = client.stream.call_args.kwargs["json"]
+        kwargs = client.stream.call_args.kwargs
+        body = json.loads(gzip.decompress(kwargs["content"])) if "content" in kwargs else kwargs["json"]
+        self.assertEqual(client.stream.call_args.kwargs["headers"]["X-Agent-Type"], "auxiliary")
+        self.assertEqual(client.stream.call_args.kwargs["headers"]["X-Agent-Runtime"], "local-agent")
         self.assertEqual(body["model"], "promo-f")
         self.assertGreater(len(body["messages"][1]["content"]), 20000)
 

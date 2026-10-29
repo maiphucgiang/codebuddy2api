@@ -8,6 +8,7 @@ import itertools
 import math
 import os
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -166,6 +167,8 @@ def _checkin_request(access_token, uid, domain, path):
     headers = {"accept": "application/json", "content-type": "application/json",
                "authorization": f"Bearer {access_token}", "x-user-id": str(uid or ""),
                "x-domain": str(domain or "")}
+    if profile_for_auth({"accessToken": access_token, "domain": domain}) == "cn-work":
+        headers.update({"X-Request-ID": secrets.token_hex(16), "User-Agent": "axios/1.16.1"})
     url = host + path
     with httpx.Client() as client:
         try:

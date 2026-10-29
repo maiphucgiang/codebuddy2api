@@ -19,6 +19,7 @@ import converter as gateway
 from app import upstream_io
 from app.adapters.responses_adapter import responses_request_to_chat
 import test_region_routing as fixtures
+request_json = fixtures.request_json
 
 REAL_ASYNC_CLIENT = httpx.AsyncClient
 
@@ -231,7 +232,7 @@ class CacheKeyTests(GatewayFixture, unittest.TestCase):
                         payload["prompt_cache_key"] = "synthetic-cache"
                         response = self.fx.client.post("/v1/" + route, json=payload)
                         self.assertEqual(response.status_code, 200, response.text)
-                        self.assertEqual(json.loads(self.fx.requests[-1].content)["prompt_cache_key"], "synthetic-cache")
+                        self.assertEqual(request_json(self.fx.requests[-1])["prompt_cache_key"], "synthetic-cache")
 
 
 class PreparationResponsivenessTests(GatewayFixture, unittest.IsolatedAsyncioTestCase):

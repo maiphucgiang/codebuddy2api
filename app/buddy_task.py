@@ -49,7 +49,8 @@ def _chat(client, headers, record, model):
                "X-Parent-Conversation-ID": conversation, "X-Request-ID": request_id,
                "X-Root-Request-ID": request_id, "X-Conversation-Request-ID": request_id,
                "X-Conversation-Message-ID": request_id, "X-Agent-Intent": "craft",
-               "X-Agent-Purpose": "conversation", "X-Agent-Type": "main"}
+               "X-Agent-Purpose": "conversation", "X-Agent-Type": "auxiliary",
+               "X-Agent-Runtime": "local-agent"}
     event = {"eventCode": "chat_request_send", "id": conversation, "extra": {
         "inputLength": len(PROMPT), "requestModelId": model["id"], "requestModelName": model["name"],
         "mode": "craft", "command": "", "expertId": ""}}

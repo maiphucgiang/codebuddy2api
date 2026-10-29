@@ -124,6 +124,16 @@ class BehaviorChainTests(ChainHarness):
         self.assertEqual(len(reports), 2)      # 3/5 → 补 2 条
         self.assertEqual(reports[0]["body"][0]["eventCode"], "chat_request_send")
         self.assertEqual(reports[0]["body"][0]["userId"], "u1")
+        event = reports[0]["body"][0]
+        self.assertEqual(event["ideVersion"], "5.9.3")
+        self.assertEqual(event["sdk_version"], "5.9.3")
+        self.assertEqual(event["platform"], "windows")
+        self.assertEqual(event["chat_session_uuid"], event["conversationId"])
+        self.assertEqual(event["title"], "对话")
+        self.assertEqual(event["temperature"], 0.7)
+        self.assertEqual(event["maxRetries"], 2)
+        self.assertEqual(event["cpuCores"], 24)
+        self.assertIn("WorkBuddyDesktop/5.9.3", reports[0]["headers"]["user-agent"])
 
     def test_library_read_uses_web_shape_on_account_domain(self):
         result = self.run_chain("Library_read")

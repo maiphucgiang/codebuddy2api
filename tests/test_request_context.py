@@ -1,11 +1,13 @@
 """Verify request/session isolation and tracing with synthetic credentials and offline upstreams."""
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import gzip
 from copy import deepcopy
 import json
 from pathlib import Path
 import sys
 import unittest
+import uuid
 from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
 
@@ -31,6 +33,10 @@ def context(payload, *, protocol="chat", headers=(), messages=None):
     ctx = RequestContext(protocol, "scoped", headers)
     ctx.bind_session(payload, payload.get("messages", [USER]) if messages is None else messages)
     return ctx
+
+
+def request_body(request):
+    return gzip.decompress(request.content) if request.headers.get("Content-Encoding") == "gzip" else request.content
 
 
 class SessionTests(unittest.TestCase):
@@ -135,6 +141,37 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(headers["traceparent"], f"00-{ctx.request_id}-{attempt.span}-01")
             self.assertEqual(headers["X-B3-SpanId"], attempt.span)
         self.assertEqual(base, {"Authorization": "synthetic", "X-Conversation-ID": "conversation"})
+    def test_cn_work_session_ids_are_stable_uuid7_and_attempt_scoped(self):
+        first = context({"conversation_id": "same"})
+        second = context({"conversation_id": "same"})
+        conversation = first.conversation_id("cn-work", "account")
+        self.assertEqual(conversation, second.conversation_id("cn-work", "account"))
+        self.assertNotEqual(conversation, first.conversation_id("cn-work", "other"))
+        self.assertEqual(uuid.UUID(conversation).version, 7)
+
+        base = {"X-Conversation-ID": conversation, "X-Agent-Intent": "craft"}
+        headers = first.attempt_headers(base, first.start_attempt(), profile="cn-work")
+        later = second.attempt_headers(base, second.start_attempt(), profile="cn-work")
+        self.assertEqual(headers["X-Session-ID"], conversation)
+        self.assertEqual(headers["X-Agent-Runtime"], "local-agent")
+        self.assertEqual(uuid.UUID(headers["acp-connection-id"]).version, 7)
+        self.assertEqual(headers["acp-connection-id"], later["acp-connection-id"])
+        self.assertEqual(headers["X-Root-Request-ID"], later["X-Root-Request-ID"])
+        self.assertNotEqual(headers["X-Conversation-Request-ID"], later["X-Conversation-Request-ID"])
+        self.assertNotEqual(headers["X-Root-Request-ID"], headers["X-Conversation-Request-ID"])
+        baggage = dict(item.split("=", 1) for item in headers["baggage"].split(","))
+        self.assertEqual(set(baggage), {
+            "buddyId", "buddyName", "codebuddy.session_id", "codebuddy.conversation_request_id",
+            "x-agent-runtime", "x-agent-intent"})
+        self.assertEqual(baggage["codebuddy.session_id"], conversation)
+        self.assertEqual(baggage["codebuddy.conversation_request_id"], headers["X-Conversation-Request-ID"])
+
+        for profile in ("cn-cli", "intl-cli", "intl-work"):
+            other = first.attempt_headers(base, first.start_attempt(), profile=profile)
+            self.assertNotIn("X-Agent-Runtime", other)
+            self.assertNotIn("acp-connection-id", other)
+            self.assertNotIn("baggage", other)
+
 
 
 class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
@@ -146,13 +183,20 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         root = response.headers["X-Request-ID"]
         self.assertRegex(root, r"^[0-9a-f]{32}$")
-        self.assertEqual({r.headers["X-Root-Request-ID"] for r in seen}, {root})
         self.assertEqual(len({r.headers["X-Request-ID"] for r in seen}), len(seen))
         self.assertEqual(len({r.headers["X-Conversation-ID"] for r in seen}), 1 if same_account else len(seen))
         for request in seen:
             headers = request.headers
             workbuddy = headers["X-IDE-Type"] == "WorkBuddy"
             trace = headers["X-Trace-ID"]
+            if gateway.profile_for_headers(headers) == "cn-work":
+                self.assertRegex(headers["X-Root-Request-ID"], r"^[0-9a-f]{32}$")
+                self.assertNotEqual(headers["X-Root-Request-ID"], root)
+                self.assertEqual(headers["X-Session-ID"], headers["X-Conversation-ID"])
+                self.assertEqual(headers["X-Agent-Runtime"], "local-agent")
+            else:
+                self.assertEqual(headers["X-Root-Request-ID"], root)
+                self.assertNotIn("X-Agent-Runtime", headers)
             if workbuddy:
                 self.assertNotEqual(trace, root)
                 self.assertNotEqual(headers["X-Request-ID"], headers["X-Conversation-Message-ID"])
@@ -185,7 +229,7 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                             prefix = {"chat/completions": "chatcmpl-", "responses": "resp_", "messages": "msg_"}[route]
                             self.assertTrue(first.json()["id"].startswith(prefix))
                             self.assertNotEqual(first.json()["id"], first.headers["X-Request-ID"])
-                        self.assertNotIn("metadata", json.loads(request.content))
+                        self.assertNotIn("metadata", json.loads(request_body(request)))
 
     def test_channel_identity_guard_reaches_all_protocols_when_desensitize_off(self):
         source = "You are an AI agent powered by DeepSeek Harness."
@@ -199,7 +243,7 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                 with patch.dict(gateway.CONFIG, {"desensitize": False}):
                     response = self.fx.client.post("/v1/" + route, json=body)
                 self.assertEqual(response.status_code, 200, response.text)
-                upstream = self.fx.requests[-1].content.decode("utf-8")
+                upstream = request_body(self.fx.requests[-1]).decode("utf-8")
                 self.assertNotIn(source, upstream)
                 self.assertGreaterEqual(upstream.count("You are WorkBuddy, a powerful AI assistant"), 2)
 
@@ -220,7 +264,7 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                             with patch.dict(gateway.CONFIG, {"prompt_mode": mode, "desensitize": False}):
                                 response = self.fx.client.post("/v1/" + route, json=body)
                             self.assertEqual(response.status_code, 200, response.text)
-                            upstream = json.loads(self.fx.requests[-1].content)
+                            upstream = json.loads(request_body(self.fx.requests[-1]))
                             messages = upstream["messages"]
                             systems = [m for m in messages if m.get("role") == "system"]
                             if mode == "prepend":
@@ -394,7 +438,10 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                 response = self.fx.client.post("/v1/" + route, json=self.fx.payload(route, stream=True))
             self.assertIn("late", response.text)
             self.assertEqual(len(seen), 1)
-            self.assertEqual(seen[0].headers["X-Root-Request-ID"], response.headers["X-Request-ID"])
+            if gateway.profile_for_headers(seen[0].headers) == "cn-work":
+                self.assertNotEqual(seen[0].headers["X-Root-Request-ID"], response.headers["X-Request-ID"])
+            else:
+                self.assertEqual(seen[0].headers["X-Root-Request-ID"], response.headers["X-Request-ID"])
             self.assertEqual(self.fx.pool._capacity._counts, {})
 
 
