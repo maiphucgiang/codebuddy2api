@@ -198,6 +198,32 @@ class SeedTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_api_keys_history_and_media_ownership_are_seeded(self):
+        from app.api_keys import KeyStore
+        from app.control_store import ControlStore
+        from app.media_store import MediaStore
+        with tempfile.TemporaryDirectory() as directory:
+            ids = seed.write_api_keys(Path(directory))
+            self.assertEqual(set(ids), {"expired", "ip", "models"})
+            control = ControlStore(Path(directory) / "control.sqlite3")
+            keys = KeyStore(control)
+            rows = {item["name"]: item for item in keys.list()}
+            self.assertLess(rows["expired"]["expires_at"], __import__("time").time())
+            self.assertEqual(list(rows["ip"]["ip_allow"]), ["127.0.0.1/32"])
+            self.assertEqual(list(rows["models"]["models"]), ["auto"])
+            seed.write_history(Path(directory) / "logs.sqlite3", days=1,
+                               key_ids=list(ids.values()))
+            audit = AuditStore(Path(directory) / "logs.sqlite3")
+            self.assertGreater(sum(item["requests"] for item in audit.api_key_stats()["items"].values()), 0)
+            audit.close()
+            control.close()
+            seed.write_media(Path(directory), api_key=ids["models"])
+            media = MediaStore(Path(directory))
+            tasks = {item["task_id"]: item["api_key"] for item in media.list_tasks()["items"]}
+            self.assertEqual(tasks["seedvideotask-complete"], ids["models"])
+            self.assertIsNone(tasks[seed.SEED_VIDEO_TASK_ID])
+            media.close()
+
 
 class PublicTests(unittest.TestCase):
     def test_guard_refuses_credential_transfer_and_shared_changes(self):

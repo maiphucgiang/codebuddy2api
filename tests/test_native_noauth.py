@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NativeNoAuthTests(unittest.TestCase):
-    def test_image_default_starts_without_key_but_keeps_management_locked(self):
+    def test_image_default_starts_without_key_and_creates_admin_account(self):
         dockerfile = (ROOT / 'Dockerfile').read_text()
         command = json.loads(next(line[4:] for line in dockerfile.splitlines() if line.startswith('CMD ')))
         self.assertIn('ENV CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true', dockerfile)
@@ -37,10 +37,12 @@ class NativeNoAuthTests(unittest.TestCase):
                 with httpx.Client(base_url=f'http://127.0.0.1:{port}', transport=httpx.HTTPTransport(retries=5),
                                   timeout=5, trust_env=False) as client:
                     self.assertEqual(client.get('/health').json(), {'status': 'ok'})
-                    self.assertEqual(client.get('/admin/session').status_code, 503)
+                    session = client.get('/admin/session')
+                    self.assertEqual(session.status_code, 200)
+                    self.assertEqual(session.json(), {'authenticated': False, 'csrf_token': None})
                     self.assertEqual(client.get('/v1/models').status_code, 200)
                 with contextlib.closing(sqlite3.connect(root / 'auth/control.sqlite3')) as db:
-                    self.assertEqual(db.execute('SELECT count(*) FROM gateway_secrets').fetchone()[0], 0)
+                    self.assertEqual(db.execute('SELECT count(*) FROM gateway_secrets').fetchone()[0], 1)
             finally:
                 if process.poll() is None:
                     process.send_signal(signal.SIGINT) if os.name == 'posix' else process.terminate()

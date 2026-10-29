@@ -128,6 +128,13 @@ class InferenceAdmissionTests(unittest.IsolatedAsyncioTestCase):
         status, body = await self.request(ROUTES[0], ((b"x-api-key", b"replacement-key"),))
         self.assertEqual(status, 200, body)
 
+    async def test_auth_middleware_allows_conditional_inference_requests(self):
+        for path in ROUTES:
+            with self.subTest(path=path):
+                status, body = await self.request(path, ((b"if-none-match", b'"etag"'),
+                                                         (b"authorization", b"Bearer synthetic-key")))
+                self.assertEqual(status, 200, body)
+
     async def test_unknown_routes_and_methods_preserve_routing_errors(self):
         for path, method, expected in (("/v1/missing", "GET", 404),
                                        ("/v1/missing", "POST", 404),

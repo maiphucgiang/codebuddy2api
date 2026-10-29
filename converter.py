@@ -6,6 +6,7 @@ import base64
 
 import argparse
 import asyncio
+import getpass
 import weakref
 import hashlib
 import itertools
@@ -95,7 +96,8 @@ from app.catalog_probe import AggregateCatalog
 from app.catalog_index import account_scope as _catalog_account_scope
 from app import model_rates
 from app.rate_measurement import RateBook
-from app.inference_auth import require_api_key
+from app.inference_auth import _ANTHROPIC_ERROR_TYPES, require_api_key
+from app.api_keys import ApiKeyError, api_principal
 from app.admin_auth import SessionStoreError
 from app.content_filter import ContentFilterDetector, is_filter_error
 from app.upstream_compat import (channel_fallback_url, is_channel_check_error, normalize_tool_schemas,
@@ -103,7 +105,7 @@ from app.upstream_compat import (channel_fallback_url, is_channel_check_error, n
 from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
 from app import perf_metrics
-from app.startup import allows_open_noauth, capture_launch, load_startup_env, restart_process, run_server
+from app.startup import capture_launch, load_startup_env, restart_process, run_server
 from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
                               profile_for_auth, profile_for_headers, profile_region, profile_product,
                               profile_site, chat_url_for_headers, search_url_for_headers, fetch_url_for_headers,
@@ -2843,14 +2845,6 @@ PASSTHROUGH_BODY_KEYS = {
 app = FastAPI(title="codebuddy2api", version=APP_VERSION, lifespan=inference_lifespan)
 app.add_middleware(InferenceResourcesMiddleware, config=lambda: CONFIG)
 
-# Anthropic error types: https://platform.claude.com/docs/en/api/errors
-_ANTHROPIC_ERROR_TYPES = {
-    "auth_error": "authentication_error",
-    "rate_limit_error": "rate_limit_error",
-    "invalid_request_error": "invalid_request_error",
-    "not_found_error": "not_found_error",
-    "upstream_error": "api_error",
-}
 
 
 @app.exception_handler(HTTPException)
@@ -2944,15 +2938,39 @@ def _truncate(s: str, n: int = 80) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
-def _check_auth(authorization: Optional[str], x_api_key: Optional[str]):
-    require_api_key(CONFIG["api_key"], authorization, x_api_key)
+def _check_auth(request: Request):
+    if not isinstance(request, Request):
+        if CONFIG.get("key_store") is not None:
+            # Direct function calls in offline tests have no ASGI scope. Keep the
+            # installed gateway fail-closed rather than inventing a header value.
+            raise ApiKeyError(401, "API key 无效", "invalid_api_key")
+        require_api_key(CONFIG["api_key"], None, None)
+        return None
+    principal = getattr(request.state, "api_principal", None)
+    if principal is None:
+        key_store = CONFIG.get("key_store")
+        if key_store is not None:
+            principal = key_store.authenticate(request.scope, CONFIG, count_rpm=False)
+            request.scope.setdefault("state", {})["api_principal"] = principal
+            api_principal.set(principal)
+        else:
+            require_api_key(CONFIG["api_key"], request.headers.get("authorization"),
+                            request.headers.get("x-api-key"))
+            return None
+    return principal
 
 
-def _check_admin_auth(authorization: Optional[str], x_api_key: Optional[str]):
+def _check_admin_auth(request):
+    if isinstance(request, Request):
+        identity = getattr(request.state, "admin_identity", None)
+        if identity:
+            return identity
+        raise HTTPException(status_code=503, detail={"error": {
+            "message": "管理会话未初始化", "type": "management_locked"}})
     if not CONFIG.get("api_key"):
         raise HTTPException(status_code=503, detail={"error": {"message": "管理接口需要配置 API key",
                                                              "type": "management_locked"}})
-    _check_auth(authorization, x_api_key)
+    require_api_key(CONFIG["api_key"], request, None)
 
 
 def _apply_session_headers(headers: dict, profile, skey: str | None, context) -> None:
@@ -3091,10 +3109,11 @@ def health():
 
 
 @app.get("/admin/credentials")
-def admin_list_credentials(authorization: Optional[str] = Header(default=None),
+def admin_list_credentials(request: Request,
+                           authorization: Optional[str] = Header(default=None),
                            x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Return account expiry, health and session-binding metadata."""
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     pool = CONFIG.get("cred_pool")
     if CONFIG.get("management") is not None:
         return {"credentials": CONFIG["management"].admin_credential_inventory()}
@@ -3146,7 +3165,7 @@ async def admin_add_credential(request: Request,
                                authorization: Optional[str] = Header(default=None),
                                x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Validate and atomically import credentials from the controlled directory."""
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     try:
         body = await request.json()
     except (ValueError, UnicodeError):
@@ -3184,12 +3203,12 @@ async def admin_add_credential(request: Request,
 
 
 @app.delete("/admin/credentials/{name}")
-def admin_del_credential(name: str,
+def admin_del_credential(name: str, request: Request,
                          unbind: bool = False,
                          authorization: Optional[str] = Header(default=None),
                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Delete the named .info file, unbinding model rules only after removal succeeds."""
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     pool = CONFIG.get("cred_pool")
     rollback = {}
     identity = None
@@ -3241,11 +3260,11 @@ def _save_oauth_credential(cred: dict) -> Path:
 
 
 @app.post("/admin/oauth/start")
-def admin_oauth_start(site: str = "cn",
+def admin_oauth_start(request: Request, site: str = "cn",
                       authorization: Optional[str] = Header(default=None),
                       x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Start OAuth and return the browser authorization URL."""
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     try:
         return _OAUTH.start(site=site)
     except ValueError as e:
@@ -3255,11 +3274,11 @@ def admin_oauth_start(site: str = "cn",
 
 
 @app.get("/admin/oauth/poll")
-def admin_oauth_poll(login_id: str = "",
+def admin_oauth_poll(request: Request, login_id: str = "",
                      authorization: Optional[str] = Header(default=None),
                      x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Poll OAuth and persist completed logins with pool reload."""
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     try:
         r = _OAUTH.poll(login_id)
     except Exception as e:
@@ -3280,28 +3299,28 @@ def admin_oauth_poll(login_id: str = "",
     return {"done": True, "uid": uid, "nickname": r.get("nickname") or "", "imported": str(target)}
 
 @app.get("/admin/credits")
-def admin_credits(authorization: Optional[str] = Header(default=None),
+def admin_credits(request: Request, authorization: Optional[str] = Header(default=None),
                   x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Return cached balances, credit expiry segments and check-in status."""
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     ledger = CONFIG.get("ledger")
     return {"credits": ledger.snapshot() if ledger else {}}
 
 
 @app.get("/admin/model-blocks")
-def admin_model_blocks(authorization: Optional[str] = Header(default=None),
+def admin_model_blocks(request: Request, authorization: Optional[str] = Header(default=None),
                        x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Return unsupported backend/model pairs and their retry deadlines."""
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     pool = CONFIG.get("cred_pool")
     return {"model_blocks": pool.model_blocks_detail() if pool is not None else []}
 
 
 @app.post("/admin/checkin")
-def admin_checkin(authorization: Optional[str] = Header(default=None),
+def admin_checkin(request: Request, authorization: Optional[str] = Header(default=None),
                   x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Run daily-idempotent manual check-in without implicitly syncing balances or usage."""
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     return _admin_credential_action("checkin")
 
 
@@ -3311,9 +3330,9 @@ def _admin_credential_action(action, identity=None, *, consent_revision=None):
 
 
 @app.post("/admin/sync")
-def admin_sync(authorization: Optional[str] = Header(default=None),
+def admin_sync(request: Request, authorization: Optional[str] = Header(default=None),
                x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     return _admin_credential_action("sync")
 
 
@@ -3321,7 +3340,7 @@ def admin_sync(authorization: Optional[str] = Header(default=None),
 async def admin_credential_action(identity: str, action: str, request: Request,
                                  authorization: Optional[str] = Header(default=None),
                                  x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    _check_admin_auth(authorization, x_api_key)
+    _check_admin_auth(request)
     from app.admin_api import _body
     try:
         body = await _body(request, 4096, allow_empty=True)
@@ -3395,9 +3414,13 @@ def _billing_totals() -> dict:
 
 @app.get("/v1/dashboard/billing/subscription")
 def billing_subscription(authorization: Optional[str] = Header(default=None),
-                         x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+                         x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+                         request: Request = None):
     """Expose subscription estimates with balance equal to the hard limit minus usage."""
-    _check_auth(authorization, x_api_key)
+    principal = _check_auth(request)
+    if principal is not None and principal.type not in ("admin", "anonymous"):
+        raise HTTPException(status_code=403, detail={"error": {
+            "message": "普通 API key 无权访问计费接口", "type": "permission_error", "code": "admin_key_required"}})
     t = _billing_totals()
     limit = t["quota_usd"]
     return {
@@ -3424,9 +3447,13 @@ def billing_subscription(authorization: Optional[str] = Header(default=None),
 @app.get("/v1/dashboard/billing/usage")
 def billing_usage(start_date: Optional[str] = None, end_date: Optional[str] = None,
                   authorization: Optional[str] = Header(default=None),
-                  x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+                  x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+                  request: Request = None):
     """Return estimated usage in cents, with daily model costs for the last 30 days."""
-    _check_auth(authorization, x_api_key)
+    principal = _check_auth(request)
+    if principal is not None and principal.type not in ("admin", "anonymous"):
+        raise HTTPException(status_code=403, detail={"error": {
+            "message": "普通 API key 无权访问计费接口", "type": "permission_error", "code": "admin_key_required"}})
     t = _billing_totals()
     # Convert each region at its own rate before combining daily and total usage.
     cents = {"domestic": t["price_cny"] / t["rate"] * 100, "international": t["price_usd"] * 100}
@@ -3992,15 +4019,17 @@ def guard_model(name: str, *, region=None, resolved=False) -> None:
 
 
 @app.get("/v1/models")
-def list_models(authorization: Optional[str] = Header(default=None),
+def list_models(request: Request, authorization: Optional[str] = Header(default=None),
                 x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    _check_auth(authorization, x_api_key)
+    principal = _check_auth(request)
     data = [{"id": item["id"], "object": "model", "created": 1700000000, "owned_by": "codebuddy",
              "credits": item["credits"], "credits_by_profile": item["credits_by_profile"],
              **{key: item[key] for key in ("credits_estimated", "capabilities", "limits", "metadata_by_profile",
                                   "media_kinds", "media_sources", "media_defaults")
                 if key in item}}
-            for item in model_policy.public_details(sys.modules[__name__])]
+            for item in model_policy.public_details(sys.modules[__name__])
+            if principal is None or principal.models is None
+            or model_policy.source_for(CONFIG, item["id"]) in principal.models]
     return {"object": "list", "data": data}
 
 
@@ -4008,7 +4037,7 @@ def list_models(authorization: Optional[str] = Header(default=None),
 async def chat_completions(request: Request,
                            authorization: Optional[str] = Header(default=None),
                            x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
     # Select sticky credentials while building upstream headers.
 
     try:
@@ -5481,7 +5510,7 @@ async def _media_save(kind: str, data: bytes, *, model, rid: str) -> dict:
         raise MediaDownloadRetryable(f"媒体存储写入失败：{type(error).__name__}") from None
 
 
-async def _media_video_refresh(task_id: str, rid: str) -> dict:
+async def _media_video_refresh(task_id: str, rid: str, *, principal=None) -> dict:
     """Query one upstream video task on its bound account and persist the result.
 
     One refresh lock per task keeps concurrent queries from downloading twice; the
@@ -5497,6 +5526,9 @@ async def _media_video_refresh(task_id: str, rid: str) -> dict:
         return task
 
     task = await load()
+    if principal is not None and principal.type == "standard" and task.get("api_key") != principal.id:
+        raise HTTPException(status_code=404, detail={"error": {
+            "message": "视频任务不存在或已过期", "type": "not_found_error", "code": "task_not_found"}})
     if task["status"] in ("completed", "failed"):
         return task  # Repeated queries keep returning the same resource or error.
     async with _media_task_lock(task_id):
@@ -5725,7 +5757,7 @@ async def create_response(request: Request,
                           authorization: Optional[str] = Header(default=None),
                           x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Serve Responses requests through the shared Chat upstream and event adapter."""
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
 
     try:
         payload = await request.json()
@@ -5992,7 +6024,7 @@ async def create_message(request: Request,
                          authorization: Optional[str] = Header(default=None),
                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Serve Anthropic Messages through the shared Chat upstream and event adapter."""
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
 
     try:
         payload = await request.json()
@@ -6041,7 +6073,7 @@ async def web_search_endpoint(request: Request,
                               authorization: Optional[str] = Header(default=None),
                               x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Serve generic REST web searches; returns the upstream result items unchanged."""
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
     try:
         payload = await request.json()
     except Exception as e:
@@ -6066,7 +6098,7 @@ async def web_fetch_endpoint(request: Request,
                              authorization: Optional[str] = Header(default=None),
                              x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Serve generic REST web fetches; returns the upstream content fields unchanged."""
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
     try:
         payload = await request.json()
     except Exception as e:
@@ -6114,7 +6146,7 @@ async def images_generations(request: Request,
                              authorization: Optional[str] = Header(default=None),
                              x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Generate images through the upstream media endpoints."""
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
     payload = await _media_json(request)
     requested_model = payload.get("model") or media_generation.DEFAULT_IMAGE_MODEL
     model = model_policy.resolve(CONFIG, requested_model)
@@ -6151,7 +6183,7 @@ async def images_edits(request: Request,
                        authorization: Optional[str] = Header(default=None),
                        x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Edit images through the upstream media endpoints; JSON body only, no multipart."""
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
     payload = await _media_json(request)
     requested_model = payload.get("model") or media_generation.DEFAULT_IMAGE_EDIT_MODEL
     model = model_policy.resolve(CONFIG, requested_model)
@@ -6198,7 +6230,7 @@ async def create_video(request: Request,
                        authorization: Optional[str] = Header(default=None),
                        x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Submit one asynchronous video generation task."""
-    _check_auth(authorization, x_api_key)
+    principal = _check_auth(request)
     payload = await _media_json(request)
     requested_model = payload.get("model") or media_generation.DEFAULT_VIDEO_MODEL
     model = model_policy.resolve(CONFIG, requested_model)
@@ -6230,18 +6262,19 @@ async def create_video(request: Request,
     task_id = await _media_call(MEDIA_VIDEO_SUBMIT, body, rid, model=model,
                                 parse=media_generation.parse_video_submit, lease_note=note)
     task = await run_in_threadpool(store.create_task, task_id, note.get("credential"),
-                                   note.get("profile"), model, public_model=requested_model)
+                                   note.get("profile"), model, public_model=requested_model,
+                                   api_key=getattr(principal, "id", None))
     return {"id": task_id, "object": "video", "status": "queued", "model": requested_model,
             "created_at": int((task or {}).get("created") or time.time())}
 
 
 @app.get("/v1/videos/{task_id}")
-async def get_video(task_id: str,
+async def get_video(task_id: str, request: Request,
                     authorization: Optional[str] = Header(default=None),
                     x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Report one video task, refreshing in-flight state from its bound account."""
-    _check_auth(authorization, x_api_key)
-    task = await _media_video_refresh(task_id, _request_id())
+    principal = _check_auth(request)
+    task = await _media_video_refresh(task_id, _request_id(), principal=principal)
     meta = None
     if task["status"] == "completed" and task["media_id"]:
         meta = await run_in_threadpool(_media_store().get_asset, task["media_id"])
@@ -6249,16 +6282,16 @@ async def get_video(task_id: str,
 
 
 @app.get("/v1/videos/{task_id}/content")
-async def get_video_content(task_id: str,
+async def get_video_content(task_id: str, request: Request,
                             authorization: Optional[str] = Header(default=None),
                             x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Redirect to the public media URL of a finished video."""
-    _check_auth(authorization, x_api_key)
+    principal = _check_auth(request)
+    task = await _media_video_refresh(task_id, _request_id(), principal=principal)
     if not _media_base_url():
         raise HTTPException(status_code=409, detail={"error": {
             "message": "未配置资源访问地址（media_public_base_url）：视频已保存到网关本地，配置后即可获取链接",
             "type": "invalid_request_error", "code": "media_base_url_missing"}})
-    task = await _media_video_refresh(task_id, _request_id())
     meta = None
     if task["status"] == "completed" and task["media_id"]:
         meta = await run_in_threadpool(_media_store().get_asset, task["media_id"])
@@ -6302,7 +6335,7 @@ async def mcp_endpoint(request: Request,
                        authorization: Optional[str] = Header(default=None),
                        x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Serve the stateless MCP streamable-HTTP surface exposing the web_search and web_fetch tools."""
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
     origin = request.headers.get("origin")
     if origin:
         # 只有浏览器会带 Origin（CSRF/DNS rebinding 防线）；MCP 客户端从不带。
@@ -6342,7 +6375,7 @@ async def count_tokens(request: Request,
                        authorization: Optional[str] = Header(default=None),
                        x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
     """Return heuristic token estimates for Anthropic request budgeting."""
-    _check_auth(authorization, x_api_key)
+    _check_auth(request)
     try:
         payload = await request.json()
     except Exception as e:
@@ -6614,6 +6647,45 @@ def config_command(args) -> int:
     return 0
 
 
+def admin_reset_password(args) -> int:
+    """Reset the single management account without starting the gateway."""
+    from app.admin_account import load, save, validate_password, with_password, with_username
+    from app.control_store import ControlStore
+    root = Path(args.data_dir) if args.data_dir else managed_auth_dir()
+    control = ControlStore(root / "control.sqlite3")
+    try:
+        account = load(control)
+        if account is None:
+            raise ValueError("管理账户未初始化，请先启动一次服务")
+        try:
+            stdin_is_tty = sys.stdin.isatty()
+        except (AttributeError, OSError):
+            stdin_is_tty = False
+        if not stdin_is_tty:
+            raise ValueError("重置密码需要交互终端")
+        first = getpass.getpass("新管理密码：")
+        second = getpass.getpass("再次输入新管理密码：")
+        if first != second:
+            raise ValueError("两次输入的密码不一致")
+        target_username = args.username or account.username
+        validate_password(first, target_username)
+        updated = with_username(account, target_username) if args.username else account
+        updated = with_password(updated, first)
+        with control._lock:
+            control._db.execute("BEGIN IMMEDIATE")
+            try:
+                save(control, updated)
+                control._db.execute("COMMIT")
+            except BaseException:
+                if control._db.in_transaction:
+                    control._db.execute("ROLLBACK")
+                raise
+        print("管理密码已重置，现有会话将在下一次请求时失效。")
+        return 0
+    finally:
+        control.close()
+
+
 def main():
     launch = capture_launch()  # Before .env loading, so a restart re-reads .env as a fresh start would.
     offline_config = _is_config_invocation(sys.argv[1:])
@@ -6622,9 +6694,9 @@ def main():
     else:
         dotenv_keys = load_startup_env()
     ap = argparse.ArgumentParser(description="CodeBuddy -> OpenAI 兼容转换器（直连后端）")
-    ap.add_argument("command", nargs="?", choices=("serve", "login", "config"), default="serve",
+    ap.add_argument("command", nargs="?", choices=("serve", "login", "config", "admin"), default="serve",
                     help="serve 启动服务（默认）；login 扫码登录；config 离线配置迁移（migrate/status）")
-    ap.add_argument("action", nargs="?", choices=("migrate", "status"),
+    ap.add_argument("action", nargs="?", choices=("migrate", "status", "reset-password"),
                     help="config 子命令：migrate 写入配置库；status 只读查看解析结果")
     ap.add_argument("--env-file", metavar="PATH",
                     help="config 读取的 env 文件；默认当前目录 .env")
@@ -6640,6 +6712,7 @@ def main():
                     help="config migrate 在检测到运行中实例时仍然写入（危险）")
     ap.add_argument("--lang", choices=("auto", "zh", "en"),
                     help="界面与本次 CLI 输出语言；带该参数启动会把语言写入配置库（config status 只读）")
+    ap.add_argument("--username", metavar="NAME", help="admin reset-password 同时设置新的用户名")
     ap.add_argument("--site", choices=tuple(auth_oauth.SITE_HOSTS), default="cn",
                     help="login 站点：cn 国内站（默认）；intl 国际 WorkBuddy；intl-codebuddy 国际 CodeBuddy")
     ap.add_argument("--no-browser", action="store_true",
@@ -6752,6 +6825,13 @@ def main():
         ap.error("CODEBUDDY2API_IMAGE_POLICY 必须为 truncate 或 error")
     if args.command == "config":
         return config_command(args)
+    if args.command == "admin":
+        if args.action != "reset-password":
+            ap.error("admin 子命令只能使用 reset-password")
+        try:
+            return admin_reset_password(args)
+        except (OSError, ValueError) as error:
+            ap.error(str(error))
     if args.command == "login":
         _persist_cli_language(args.lang)
         return login(site=args.site, open_browser=not args.no_browser)
@@ -6778,12 +6858,9 @@ def main():
     # The running-instance lease is claimed with the other background threads, after
     # catalog and usage hydration, so an offline tool never races the first write.
     control_store = CONFIG.get("control_store")
-    # Validate effective binding and authentication before credential scans or background work.
-    if (args.host not in ("127.0.0.1", "::1", "localhost") and not CONFIG.get("api_key")
-            and not allows_open_noauth()):
-        runtime_management.close(CONFIG)
-        ap.error("非回环绑定且未设置 API key 会匿名开放推理额度；"
-                 "请设置 CODEBUDDY2API_KEY，或确知风险后以 CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true 显式放行")
+    # Authentication is enforced per request. A missing key locks inference (or enables the
+    # explicit OPEN_NOAUTH compatibility mode) without preventing the management account from
+    # starting on a remote bind.
     files = [Path(p) for p in args.auth_file]
     if not files:
         seed_credentials()  # Seed missing desktop credentials into managed storage.
@@ -6813,6 +6890,7 @@ def main():
         runtime_management.close(CONFIG)
         ap.error(str(error))
     model_rates.refresh(sys.modules[__name__])  # Audit and control stores are open from here on.
+    runtime_management.start_key_housekeeping(CONFIG)
     if control_store is not None:
         control_store.claim_service_lease()
         _persist_cli_language(args.lang, control_store, CONFIG)

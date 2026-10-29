@@ -1,5 +1,13 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 
+async function login(page: Page, remember = false) {
+  await page.goto("/dashboard/login");
+  await page.getByLabel("用户名", { exact: true }).fill("admin");
+  await page.getByLabel("密码", { exact: true }).fill("synthetic-e2e-key");
+  if (remember) await page.getByLabel("记住我", { exact: true }).check();
+  await page.getByRole("button", { name: "进入工作台" }).click();
+  await expect(page.getByRole("heading", { name: "运行概览" })).toBeVisible();
+}
 test("real management API: session, model alias, audit, clear, and file credentials", async ({
   page,
 }) => {
@@ -7,9 +15,7 @@ test("real management API: session, model alias, audit, clear, and file credenti
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
   await expect(page).toHaveURL(/\/dashboard\/login$/);
-  await page.getByLabel("API key", { exact: true }).fill("synthetic-e2e-key");
-  await page.getByRole("button", { name: "进入工作台" }).click();
-  await expect(page.getByRole("heading", { name: "运行概览" })).toBeVisible();
+  await login(page);
   await expect(page.getByText("125", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: "模型路由" }).click();
   await page
@@ -84,10 +90,7 @@ test("manual trial uses the real admin API and persists success and failed-attem
 }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.goto("/dashboard/login");
-  await page.getByLabel("API key", { exact: true }).fill("synthetic-e2e-key");
-  await page.getByRole("button", { name: "进入工作台" }).click();
-  await expect(page.getByRole("heading", { name: "运行概览" })).toBeVisible();
+  await login(page);
   const session = await (await page.request.get("/admin/session")).json();
   const settings = await (await page.request.get("/admin/settings")).json();
   expect(settings.items.some((item: { key: string }) => item.key === "auto_trial")).toBe(false);
@@ -154,10 +157,7 @@ test("manual trial uses the real admin API and persists success and failed-attem
 test("real management API: media summary, settings round-trip and asset CSP", async ({ page }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.goto("/");
-  await page.getByLabel("API key", { exact: true }).fill("synthetic-e2e-key");
-  await page.getByRole("button", { name: "进入工作台" }).click();
-  await expect(page.getByRole("heading", { name: "运行概览" })).toBeVisible();
+  await login(page);
 
   const summary = await (await page.request.get("/admin/media")).json();
   expect(summary.available).toBe(true);
@@ -198,4 +198,48 @@ test("real management API: media summary, settings round-trip and asset CSP", as
   expect(publicRead.headers()["content-security-policy"]).toBe("sandbox; default-src 'none'");
   expect((await publicRead.body()).length).toBe(asset.size);
   expect(errors).toEqual([]);
+});
+
+test("real management API: cookie modes and API key lifecycle", async ({ page, context }) => {
+  await page.goto("/");
+  await expect(page).toHaveURL(/\/dashboard\/login$/);
+  await login(page);
+  let cookie = (await context.cookies()).find((item) => item.name === "cb_admin_session");
+  expect(cookie?.expires).toBe(-1);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "运行概览" })).toBeVisible();
+  await page.getByRole("button", { name: "退出登录" }).click();
+  await expect(page.getByLabel("密码", { exact: true })).toBeVisible();
+  await login(page, true);
+  cookie = (await context.cookies()).find((item) => item.name === "cb_admin_session");
+  const now = Date.now() / 1000;
+  expect(cookie?.expires).toBeGreaterThan(now + 399 * 86400);
+  expect(cookie?.expires).toBeLessThan(now + 401 * 86400);
+
+  await page.goto("/dashboard/keys");
+  await page.getByRole("button", { name: "新建密钥" }).click();
+  await page.getByLabel("名称", { exact: true }).fill("real-e2e-standard");
+  await page.getByRole("button", { name: "创建", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  const secret = await dialog.locator("code").textContent();
+  if (!secret) throw new Error("The real API did not return a key secret");
+  await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+  const inference = await page.request.get("/v1/models", {
+    headers: { Authorization: `Bearer ${secret}` },
+  });
+  expect(inference.status()).toBe(200);
+  const session = await (await page.request.get("/admin/session")).json();
+  const keys = await (await page.request.get("/admin/keys")).json();
+  const item = keys.items.find(
+    (row: { id: string; name: string }) => row.name === "real-e2e-standard",
+  );
+  const deleted = await page.request.delete(`/admin/keys/${item.id}`, {
+    headers: { Origin: "http://127.0.0.1:5175", "X-CSRF-Token": session.csrf_token },
+    data: { version: item.version },
+  });
+  expect(deleted.status()).toBe(200);
+  const denied = await page.request.get("/v1/models", {
+    headers: { Authorization: `Bearer ${secret}` },
+  });
+  expect(denied.status()).toBe(401);
 });

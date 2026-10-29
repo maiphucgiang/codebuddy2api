@@ -15,10 +15,10 @@ import httpx
 import uvicorn
 
 import converter as gateway
+from app import admin_account
 from app.audit_store import AuditStore
 from app.control_store import ControlStore
 from app.media_store import MediaStore
-from app.runtime_management import install, close
 from app.gateway_management import Management
 from app.runtime_management import install, close
 from app.settings import apply_persisted_settings
@@ -54,6 +54,8 @@ def main():
         gateway.CONFIG.update(api_key="synthetic-e2e-key", log_path=None,
                               control_store=ControlStore(root / "control.sqlite3"),
                               audit_store=AuditStore(root / "logs.sqlite3"))
+        admin_account.save(gateway.CONFIG["control_store"],
+                           admin_account.new("admin", "synthetic-e2e-key", "external"))
         state = gateway.CONFIG["control_store"].state
         state.migrate(root)
         gateway.CONFIG.update(state_store=state, trial_ledger=gateway.trial_rewards.TrialLedger(store=state))

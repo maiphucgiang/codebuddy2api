@@ -4,15 +4,17 @@ import { create } from "zustand";
 import { useCallback, useEffect, useState } from "react";
 
 export type RecordValue = Record<string, unknown>;
-export type Session = { authenticated: true; csrf_token: string };
+export type Session = { authenticated: boolean; csrf_token: string | null; bootstrap?: boolean };
 type AuthState = {
   status: "checking" | "authenticated" | "anonymous" | "error";
   csrf: string | null;
+  bootstrap: boolean;
   error: string | null;
 };
 export const useSession = create<AuthState>(() => ({
   status: "checking",
   csrf: null,
+  bootstrap: false,
   error: null,
 }));
 export const api = axios.create({ baseURL: "/admin", withCredentials: true, timeout: 20000 });
@@ -26,7 +28,7 @@ api.interceptors.response.use(
   (response) => response,
   (error: unknown) => {
     if (axios.isAxiosError(error) && error.response?.status === 401) {
-      useSession.setState({ status: "anonymous", csrf: null, error: null });
+      useSession.setState({ status: "anonymous", csrf: null, bootstrap: false, error: null });
     }
     return Promise.reject(error);
   },
@@ -96,7 +98,7 @@ export function errorMessage(error: unknown): string {
     }
     if (error.response?.status === 401) return "会话已失效，请重新登录。";
     if (error.response?.status === 403)
-      return serverMessage ?? "操作被拒绝：请检查当前 key、管理锁定或重新登录刷新 CSRF。";
+      return serverMessage ?? "操作被拒绝：请检查管理锁定或重新登录刷新 CSRF。";
     if (serverMessage) return serverMessage;
     const data: unknown = error.response?.data;
     if (data && typeof data === "object" && "detail" in data) {
@@ -126,29 +128,46 @@ export function errorMessage(error: unknown): string {
   }
   return error instanceof Error ? error.message : "操作失败，请重试。";
 }
-export async function establishSession(apiKey?: string) {
+export async function establishSession(credentials?: {
+  username: string;
+  password: string;
+  remember: boolean;
+}) {
   try {
     const response =
-      apiKey === undefined
+      credentials === undefined
         ? await api.get<unknown>("/session")
-        : await api.post<unknown>("/session", { api_key: apiKey });
+        : await api.post<unknown>("/session", credentials);
     const data = object(response.data, "会话");
     if (data.authenticated === false) {
-      useSession.setState({ status: "anonymous", csrf: null, error: null });
+      useSession.setState({ status: "anonymous", csrf: null, bootstrap: false, error: null });
       return;
     }
     if (data.authenticated !== true || typeof data.csrf_token !== "string" || !data.csrf_token)
       throw new Error("会话响应缺少认证状态或 CSRF token");
-    useSession.setState({ status: "authenticated", csrf: data.csrf_token, error: null });
+    useSession.setState({
+      status: "authenticated",
+      csrf: data.csrf_token,
+      bootstrap: data.bootstrap === true,
+      error: null,
+    });
   } catch (error) {
     if (axios.isAxiosError(error) && error.response?.status === 401) {
-      useSession.setState({ status: "anonymous", csrf: null, error: null });
-      if (apiKey !== undefined) throw new Error("API key 无效或管理界面未启用。");
+      useSession.setState({ status: "anonymous", csrf: null, bootstrap: false, error: null });
+      if (credentials !== undefined) throw new Error("用户名或密码错误");
       return;
     }
-    useSession.setState({ status: "error", csrf: null, error: errorMessage(error) });
-    if (apiKey !== undefined) throw error;
+    useSession.setState({
+      status: "error",
+      csrf: null,
+      bootstrap: false,
+      error: errorMessage(error),
+    });
+    if (credentials !== undefined) throw error;
   }
+}
+export function updateCsrf(token: string) {
+  useSession.setState({ csrf: token });
 }
 // Session-level response cache for heavy pages (model routing): reopening the
 // page renders the last snapshot instantly while a fresh fetch replaces it.

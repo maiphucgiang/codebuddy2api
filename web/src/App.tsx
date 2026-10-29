@@ -5,6 +5,7 @@ import { ErrorNotice, Icon } from "./components";
 import { Dashboard } from "./pages/Dashboard";
 import { Models } from "./pages/Models";
 import { Credentials } from "./pages/Credentials";
+import { Keys } from "./pages/Keys";
 import { Logs } from "./pages/Logs";
 import { Media } from "./pages/Media";
 import { Settings } from "./pages/Settings";
@@ -17,7 +18,8 @@ import { LanguageProvider, chooseLanguage, serverPreference, useT } from "./i18n
 const navigation = [
   ["", "nav.overview", "grid"],
   ["/models", "nav.models", "model"],
-  ["/credentials", "nav.credentials", "key"],
+  ["/credentials", "nav.credentials", "account"],
+  ["/keys", "nav.keys", "key"],
   ["/logs", "nav.logs", "logs"],
   ["/media", "nav.media", "image"],
   ["/storage", "nav.storage", "database"],
@@ -50,6 +52,8 @@ export function Guard() {
 function Shell() {
   const t = useT();
   const location = useLocation();
+  const bootstrap = useSession((state) => state.bootstrap);
+  const [bootstrapDismissed, setBootstrapDismissed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
@@ -168,6 +172,21 @@ function Shell() {
         </header>
         <main id="main" className={s.main}>
           <ErrorNotice message={error} />
+          {bootstrap && !bootstrapDismissed && (
+            <div className={s.notice} role="status">
+              <span>
+                {t("app.bootstrapBanner")}{" "}
+                <NavLink to="/dashboard/settings?tab=account">{t("app.bootstrapAction")}</NavLink>
+              </span>
+              <button
+                type="button"
+                aria-label={t("common.dismissNotice")}
+                onClick={() => setBootstrapDismissed(true)}
+              >
+                <Icon name="close" />
+              </button>
+            </div>
+          )}
           <Outlet />
         </main>
         <footer className={s.footer}>CodeBuddy2API</footer>
@@ -178,12 +197,22 @@ function Shell() {
 function Login() {
   const t = useT();
   const status = useSession((state) => state.status);
-  const [key, setKey] = useState("");
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
+  const [remember, setRemember] = useState(false);
+  const [visible, setVisible] = useState(false);
+  const [caps, setCaps] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [shake, setShake] = useState(false);
   const [error, setError] = useState<string | null>(null);
   if (status === "authenticated") return <Navigate to="/dashboard" replace />;
   return (
     <div className={s.login}>
+      <div className={s.loginBackdrop} aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </div>
       <div className={s.loginAppearance}>
         <LanguageToggle />
         <Appearance />
@@ -196,41 +225,121 @@ function Login() {
           CodeBuddy
         </div>
         <h1>{t("login.subtitle")}</h1>
-        <div className={s.loginOrbit}>
+        <div className={s.loginOrbit} aria-hidden="true">
           <Icon name="leaf" />
         </div>
       </section>
-      <section className={s.loginCard}>
+      <section className={`${s.loginCard} ${shake ? s.loginShake : ""}`}>
         <Icon name="shield" />
         <h2>{t("login.title")}</h2>
         <form
+          method="post"
+          action="/admin/session"
           onSubmit={(e) => {
             e.preventDefault();
+            const passwordInput = e.currentTarget.elements.namedItem(
+              "password",
+            ) as HTMLInputElement;
             setBusy(true);
+            setShake(false);
             setError(null);
-            const value = key;
-            setKey("");
-            void establishSession(value)
-              .catch((err: unknown) => setError(errorMessage(err)))
+            void establishSession({ username, password, remember })
+              .then(() => {
+                const Credential = (
+                  window as unknown as {
+                    PasswordCredential?: new (options: {
+                      id: string;
+                      password: string;
+                    }) => Credential;
+                  }
+                ).PasswordCredential;
+                if (Credential && navigator.credentials) {
+                  try {
+                    const credential = new Credential({ id: username, password });
+                    void navigator.credentials.store(credential).catch(() => undefined);
+                  } catch {
+                    // Native autocomplete remains available when credential storage is rejected.
+                  }
+                }
+              })
+              .catch((err: unknown) => {
+                setPassword("");
+                setError(errorMessage(err));
+                setShake(true);
+                passwordInput.focus();
+              })
               .finally(() => setBusy(false));
           }}
         >
           <label className={s.field}>
-            API key
+            {t("login.username")}
+            <span className={s.inputGroup}>
+              <Icon name="user" />
+              <input
+                name="username"
+                autoComplete="username"
+                autoCapitalize="none"
+                spellCheck={false}
+                required
+                autoFocus
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="admin"
+              />
+            </span>
+          </label>
+          <label className={s.field}>
+            {t("login.password")}
+            <span className={s.inputGroup}>
+              <Icon name="lock" />
+              <input
+                name="password"
+                type={visible ? "text" : "password"}
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={t("login.passwordPlaceholder")}
+                aria-describedby={caps ? "login-caps" : undefined}
+                aria-invalid={error ? true : undefined}
+                onKeyDown={(e) => setCaps(e.getModifierState("CapsLock"))}
+                onKeyUp={(e) => setCaps(e.getModifierState("CapsLock"))}
+              />
+              <button
+                type="button"
+                className={s.inputAction}
+                onMouseDown={(e) => e.preventDefault()}
+                aria-label={visible ? t("login.hidePassword") : t("login.showPassword")}
+                aria-pressed={visible}
+                onClick={() => setVisible((value) => !value)}
+              >
+                <Icon name={visible ? "eyeOff" : "eye"} />
+              </button>
+            </span>
+          </label>
+          {caps && (
+            <span id="login-caps" className={s.capsHint} role="status">
+              <Icon name="alert" />
+              {t("login.capsLock")}
+            </span>
+          )}
+          <label className={s.check}>
             <input
-              type="password"
-              name="api-key"
-              autoComplete="off"
-              required
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              placeholder={t("login.keyPlaceholder")}
+              type="checkbox"
+              name="remember"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
             />
+            {t("login.remember")}
           </label>
           <ErrorNotice message={error} />
-          <button className={s.primary} disabled={busy || !key.trim()}>
+          <button
+            className={s.primary}
+            disabled={busy || !username.trim() || !password}
+            aria-busy={busy}
+          >
             {busy ? t("login.verifying") : t("login.enter")}
-            <Icon name="arrow" />
+            <Icon name={busy ? "refresh" : "arrow"} />
           </button>
         </form>
       </section>
@@ -246,6 +355,7 @@ export function AppRoutes() {
           <Route index element={<Dashboard />} />
           <Route path="models" element={<Models />} />
           <Route path="credentials" element={<Credentials />} />
+          <Route path="keys" element={<Keys />} />
           <Route path="logs" element={<Logs />} />
           <Route path="media" element={<Media />} />
           <Route path="settings" element={<Settings />} />

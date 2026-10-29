@@ -88,6 +88,40 @@ describe("request client metadata", () => {
   });
 });
 
+describe("request API keys", () => {
+  it("maps key names, marks legacy and deleted keys, and filters by key id", async () => {
+    vi.spyOn(api, "get").mockResolvedValue({
+      data: {
+        external: null,
+        items: [{ id: "k_known", name: "CI key", type: "standard", version: 1 }],
+      },
+    });
+    vi.mocked(useResource).mockReturnValue({
+      data: {
+        items: [
+          { id: "request-a", api_key: "k_known", outcome: "success" },
+          { id: "request-b", api_key: "k_deleted", outcome: "success" },
+          { id: "request-c", api_key: null, outcome: "success" },
+        ],
+        has_more: false,
+        next_cursor: null,
+      },
+      loading: false,
+      refreshing: false,
+      error: null,
+      reload: vi.fn(),
+    });
+    render(<Logs />);
+    expect((await screen.findAllByText("CI key")).length).toBeGreaterThan(0);
+    expect(screen.getByText("k_deleted（已删除）")).toBeTruthy();
+    expect(screen.getByText("—（升级前）")).toBeTruthy();
+    choose(screen.getByLabelText("筛选密钥"), "k_known");
+    fireEvent.click(screen.getByRole("button", { name: "应用筛选" }));
+    const call = vi.mocked(useResource).mock.calls.at(-1)![0] as string;
+    expect(call).toContain("api_key=k_known");
+  });
+});
+
 describe("credit changes tab", () => {
   it("shows signed changes per account and filters by account and type", async () => {
     const account = "a".repeat(64);
@@ -148,13 +182,20 @@ describe("credit changes tab", () => {
 describe("log detail request lifetime", () => {
   it("does not reopen a closed drawer when its response arrives", async () => {
     const request = pending();
-    const get = vi.spyOn(api, "get").mockReturnValue(request.promise);
+    const get = vi
+      .spyOn(api, "get")
+      .mockImplementation((path) =>
+        path === "/keys"
+          ? Promise.resolve({ data: { external: null, items: [] } })
+          : request.promise,
+      );
     render(<Logs />);
     open();
     expect(screen.getByRole("status").textContent).toContain("正在加载详情");
     close();
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(get.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    const detail = get.mock.calls.find(([path]) => path === "/logs/request-a")!;
+    expect(detail[1]?.signal?.aborted).toBe(true);
     await act(async () => request.resolve({ data: { id: "late-a" } }));
     expect(screen.queryByRole("dialog")).toBeNull();
   });
@@ -164,7 +205,12 @@ describe("log detail request lifetime", () => {
     async (outcome) => {
       const first = pending();
       const second = pending();
-      vi.spyOn(api, "get").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      let detailCount = 0;
+      vi.spyOn(api, "get").mockImplementation((path) => {
+        if (path === "/keys") return Promise.resolve({ data: { external: null, items: [] } });
+        detailCount += 1;
+        return detailCount === 1 ? first.promise : second.promise;
+      });
       render(<Logs />);
       open();
       close();
@@ -188,25 +234,39 @@ describe("log detail request lifetime", () => {
 
   it("aborts on unmount and ignores a late rejection", async () => {
     const request = pending();
-    const get = vi.spyOn(api, "get").mockReturnValue(request.promise);
+    const get = vi
+      .spyOn(api, "get")
+      .mockImplementation((path) =>
+        path === "/keys"
+          ? Promise.resolve({ data: { external: null, items: [] } })
+          : request.promise,
+      );
     const view = render(<Logs />);
     open();
     view.unmount();
-    expect(get.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    const detail = get.mock.calls.find(([path]) => path === "/logs/request-a")!;
+    expect(detail[1]?.signal?.aborted).toBe(true);
     await act(async () => request.reject(new Error("late failure")));
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("cancels detail loading when switching log kind", async () => {
     const request = pending();
-    const get = vi.spyOn(api, "get").mockReturnValue(request.promise);
+    const get = vi
+      .spyOn(api, "get")
+      .mockImplementation((path) =>
+        path === "/keys"
+          ? Promise.resolve({ data: { external: null, items: [] } })
+          : request.promise,
+      );
     render(<Logs />);
     open();
     fireEvent.click(screen.getByRole("tab", { name: "运行事件" }));
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(get.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+    const detail = get.mock.calls.find(([path]) => path === "/logs/request-a")!;
+    expect(detail[1]?.signal?.aborted).toBe(true);
     open();
-    expect(get).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls.filter(([path]) => path.startsWith("/logs/"))).toHaveLength(1);
     expect(screen.queryByRole("status")).toBeNull();
     await act(async () => request.resolve({ data: { id: "stale-request" } }));
     expect(screen.queryByText("stale-request")).toBeNull();

@@ -2,7 +2,7 @@
 
 [首页](../README.zh-CN.md) · [English](clients.md)
 
-请先在 [WebUI](webui.zh-CN.md) 添加账号。下文将 `YOUR_GATEWAY_API_KEY` 替换为网关 API key，`MODEL_ID` 替换为对外模型 ID，并按部署调整地址与端口。
+请先在 [WebUI](webui.zh-CN.md) 添加账号，并在「密钥管理」创建客户端密钥。下文将 `YOUR_GATEWAY_API_KEY` 替换为该推理密钥，`MODEL_ID` 替换为对外模型 ID，并按部署调整地址与端口。
 
 ## 通用设置
 
@@ -11,7 +11,7 @@
 | OpenAI Chat / Responses | `http://127.0.0.1:8787/v1` |
 | Anthropic Messages | `http://127.0.0.1:8787` |
 
-国内/国际、CLI/WorkBuddy 账号共用这些地址；后端自动选路，无需 `/cn` 或 `/intl` 前缀。客户端使用 WebUI 登录所用的 key，而非管理 Cookie。
+国内/国际、CLI/WorkBuddy 账号共用这些地址；后端自动选路，无需 `/cn` 或 `/intl` 前缀。客户端使用「密钥管理」创建的推理密钥或外部管理密钥，不能使用 WebUI 管理 Cookie。
 
 列出可用模型：
 
@@ -21,6 +21,20 @@ curl http://127.0.0.1:8787/v1/models \
 ```
 
 使用响应中或 WebUI 里的 ID；各账号支持的模型不一定相同。可在界面中配置对外别名。Anthropic 模型名不会被自动猜测或映射。
+
+## API key 与授权
+
+普通密钥支持命名、再次查看、复制、轮换、启停，以及有效期、IP/CIDR 白名单、每分钟请求数和上游模型 ID 限制。管理密钥不受限制，只在创建或轮换时显示一次，库中仅保存哈希。外部管理密钥在界面中只读。所有密钥都只能调用 `/v1/*`，不能访问 `/admin/*`；普通密钥不能读取 `/v1/dashboard/billing/*`，管理密钥和显式匿名部署可以。
+
+| 状态 / 错误码 | 含义 |
+|---------------|------|
+| 401 `api_key_required` / `invalid_api_key` | 未提供密钥、密钥未知，或数据库管理密钥已被外部密钥覆盖 |
+| 401 `api_key_disabled` / `api_key_expired` | 密钥已停用或过期 |
+| 403 `ip_not_allowed` / `model_not_allowed` | 客户端 IP 或解析后的上游模型不在密钥允许范围内 |
+| 403 `admin_key_required` | 普通密钥尝试读取账号池 billing |
+| 429 `rpm_exceeded` | 超过密钥的 60 秒滑动窗口限制；按 `Retry-After` 等待 |
+
+OpenAI 响应使用 `error.type` 和 `error.code`；Anthropic 使用 `authentication_error`、`permission_error` 或 `rate_limit_error`。没有任何密钥且 `OPEN_NOAUTH=false` 时返回 `api_key_required`；显式开启匿名模式后，缺失或占位 token 都会放行，同时开放 billing。
 
 ## Codex CLI
 
@@ -107,6 +121,7 @@ curl http://127.0.0.1:8787/v1/fetch -H "Authorization: Bearer YOUR_API_KEY" \
 - `POST /v1/images/edits`：OpenAI 风格 JSON：`{"prompt", "images": [{"image_url": "https://… | data:…"}], "model?", "size?", "input_fidelity?"}`；不支持 multipart。图片引用（含视频 `image_url`）最长 20 MiB 文本，可直接传 `data:` URI。
 - `POST /v1/videos`：`{"prompt?", "image_url?", "seconds?"（整数或数字字符串）, "resolution?"（"768P"|"2K"）, "aspect_ratio?", "enable_audio?", "model?"}` → `{"id", "object": "video", "status": "queued", …}`；用 `GET /v1/videos/{id}` 轮询，`GET /v1/videos/{id}/content` 获取完成的视频。
 - 图片默认保存到本地。未配置资源访问地址（`media_public_base_url`，WebUI「媒体生成」页）时返回 `b64_json`，不生成公开链接；显式 `response_format=b64_json` 则不保存图片。视频始终落盘。配置地址后可返回 `url` 和视频链接；资源经 `/v1/media/{images|videos}/{id}` 公开读取，带不可变缓存头。
+- 普通密钥只能轮询和获取自己创建的视频任务，其他密钥的任务 ID 与不存在一样返回 404。公开 `/v1/media/...` 地址依赖不可猜测的资源 ID，停用或删除创建密钥不会撤销资源，直到媒体 TTL 到期。
 - 默认模型按族固定：文生图 `hunyuan-image-v3.0`、图生图 `hunyuan-image-v2.0-general-edit`、视频 `minimax-video-h3`。媒体模型统一进入 `/v1/models` 和 WebUI「模型路由」，共用别名、启停与绑定规则；媒体模型打到聊天端点会被拒绝并指引到本节。
 - 按请求选号，仅限已实测可用的媒体产品（当前为 `cn-cli`），且余额为正。静态媒体模型即使不在账号目录中也由上游裁决权限；动态模型要求目录带对应媒体标签。被明确拒绝（401/403/429）时可按 failover 配置在允许范围内换号重试一次，但上游限制码不会重放，账号限制码会禁用该账号（与聊天接口一致），5xx 与超时一律不重放以避免重复扣费。视频任务始终绑定提交账号查询。
 - 多张图片并发下载，部分失败时返回成功的条目；全部失败才返回 502 且不残留已落盘文件。视频下载仅在签名失效（403/404/410）、类型被拒或超容量时永久失败，重复查询返回同一错误；其余失败（网络、超时、408/429/5xx、本地存储错误）任务保持进行中，进行中响应带 `message` 重试提示，下次查询重试。

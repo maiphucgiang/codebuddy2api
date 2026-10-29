@@ -16,6 +16,7 @@ import converter
 from app import trial_rewards, trial_management, settings
 from app.control_store import ControlStore
 from tests import test_credential_actions as fixtures
+from tests.admin_session import credentials
 from tests.test_trial_rewards import headers, mock_http
 
 
@@ -245,10 +246,11 @@ print(json.dumps({'manual_only': True}))
         self.claim.assert_called_once()
 
     def test_manual_post_requires_auth_and_csrf(self):
-        self.client.headers.pop('Authorization')
+        self.client.headers.pop('Authorization', None)
+        self.client.cookies.clear()
         self.assertEqual(self.client.post(self.url + '/trial').status_code, 401)
         login = self.client.post('/admin/session', headers={'Origin': 'https://testserver'},
-                                 json={'api_key': 'synthetic-management-key'})
+                                 json=credentials('synthetic-management-key'))
         self.assertEqual(login.status_code, 200)
         self.assertEqual(self.client.post(self.url + '/trial').status_code, 403)
         self.claim.assert_not_called()

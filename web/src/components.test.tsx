@@ -95,7 +95,7 @@ describe("model rules and route preview", () => {
   });
 });
 describe("destructive warnings", () => {
-  it("blocks full clear until exact phrase and current key, and clears key after submit", async () => {
+  it("blocks full clear until exact phrase and current password, and clears password after submit", async () => {
     const post = vi.spyOn(api, "post").mockResolvedValue({ data: { ok: true } });
     render(<ClearLogs onClose={vi.fn()} onDone={vi.fn()} />);
     choose(screen.getByLabelText("清理范围"), "all");
@@ -106,17 +106,23 @@ describe("destructive warnings", () => {
       target: { value: CLEAR_CONFIRMATION },
     });
     expect(submit).toHaveProperty("disabled", true);
-    fireEvent.change(screen.getByLabelText("当前 API key"), { target: { value: "test-only-key" } });
+    fireEvent.change(screen.getByLabelText("当前管理密码"), {
+      target: { value: "test-only-password" },
+    });
     expect(submit).toHaveProperty("disabled", false);
     fireEvent.click(submit);
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith("/logs/clear", {
         scope: "all",
         confirmation: CLEAR_CONFIRMATION,
-        api_key: "test-only-key",
+        password: "test-only-password",
       }),
     );
-    expect(screen.getByLabelText("当前 API key")).toHaveProperty("value", "");
+    expect(screen.getByLabelText("当前管理密码")).toHaveProperty("value", "");
+    expect(screen.getByLabelText("当前管理密码")).toHaveProperty(
+      "autocomplete",
+      "current-password",
+    );
   });
   it("ordinary clear preserves statistics and sends no key", async () => {
     const post = vi.spyOn(api, "post").mockResolvedValue({ data: { ok: true } });

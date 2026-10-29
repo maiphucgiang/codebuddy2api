@@ -463,9 +463,11 @@ class AuditMiddleware:
             await self.app(scope, receive, send)
             return
         started, monotonic_start = time.time(), time.monotonic()
+        principal = (scope.get("state") or {}).get("api_principal")
         observation = _Observation({"id": ensure_context(scope, self.config).request_id, "epoch": -1,
                                     "detail_generation": -1, "started_at": started,
                                     "protocol": PATHS[scope["path"]],
+                                    "api_key": getattr(principal, "id", None),
                                     **{key: None for key in METRICS}}, monotonic_start)
         observation.record.update(zip(("client_ip", "user_agent"),
                                       client_meta(scope, self.config.get("trusted_proxies")

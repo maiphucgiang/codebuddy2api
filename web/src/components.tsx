@@ -13,6 +13,12 @@ export function Icon({ name = "grid" }: { name?: string }) {
     grid: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
     model: "m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5",
     key: "M14 4a6 6 0 1 1-3 11l-6 6H2v-3l6-6a6 6 0 0 1 6-8Z M16 8h.01",
+    account: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 9a7 7 0 0 1 14 0",
+    user: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 9a7 7 0 0 1 14 0",
+    lock: "M6 10V7a6 6 0 0 1 12 0v3m-13 0h14v11H5V10Zm7 5v3",
+    eye: "M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7Zm9.5 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z",
+    eyeOff:
+      "m3 3 18 18M10.6 5.4A10.8 10.8 0 0 1 12 5c6 0 9.5 7 9.5 7a18 18 0 0 1-3.1 3.7M6.1 6.1C3.9 7.6 2.5 12 2.5 12s3.5 7 9.5 7c1.4 0 2.7-.4 3.8-.9",
     logs: "M6 3h12v18H6z M9 7h6M9 11h6M9 15h4",
     settings: "M4 7h16M4 17h16M8 4v6M16 14v6",
     arrow: "M5 12h14m-5-5 5 5-5 5",
@@ -288,7 +294,7 @@ export function ClearLogs({ onClose, onDone }: { onClose: () => void; onDone: ()
   const t = useT();
   const [scope, setScope] = useState<"details" | "all">("details");
   const [confirmation, setConfirmation] = useState("");
-  const [key, setKey] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   return (
@@ -298,13 +304,13 @@ export function ClearLogs({ onClose, onDone }: { onClose: () => void; onDone: ()
           e.preventDefault();
           setBusy(true);
           setError(null);
-          const currentKey = key;
-          setKey("");
+          const password = currentPassword;
+          setCurrentPassword("");
           void api
             .post("/logs/clear", {
               scope,
               confirmation: scope === "all" ? confirmation : "",
-              ...(scope === "all" ? { api_key: currentKey } : {}),
+              ...(scope === "all" ? { password } : {}),
             })
             .then((response) => {
               if (object(response.data).ok !== true) throw new Error(t("logs.clear.unconfirmed"));
@@ -322,7 +328,7 @@ export function ClearLogs({ onClose, onDone }: { onClose: () => void; onDone: ()
             onChange={(value) => {
               setScope(value as "details" | "all");
               setConfirmation("");
-              setKey("");
+              setCurrentPassword("");
             }}
           >
             <option value="details">{t("logs.clear.detailsOnly")}</option>
@@ -347,12 +353,12 @@ export function ClearLogs({ onClose, onDone }: { onClose: () => void; onDone: ()
               />
             </label>
             <label className={s.field}>
-              {t("common.currentApiKey")}
+              {t("common.currentPassword")}
               <input
                 type="password"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-                autoComplete="off"
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+                autoComplete="current-password"
                 required
               />
             </label>
@@ -361,7 +367,9 @@ export function ClearLogs({ onClose, onDone }: { onClose: () => void; onDone: ()
         <ErrorNotice message={error} />
         <button
           className={s.danger}
-          disabled={busy || (scope === "all" && (confirmation !== CLEAR_CONFIRMATION || !key))}
+          disabled={
+            busy || (scope === "all" && (confirmation !== CLEAR_CONFIRMATION || !currentPassword))
+          }
         >
           {busy ? t("logs.clear.busy") : t("logs.clear.confirm")}
         </button>

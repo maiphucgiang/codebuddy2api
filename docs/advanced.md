@@ -6,7 +6,7 @@ Use the [WebUI](webui.md) for everyday management. See [deployment](deployment.m
 
 ## Configuration and CLI
 
-Precedence: **explicit CLI flags > process environment > `.env` > saved SQLite settings > defaults**. Hot settings apply immediately; restart-marked settings require a manual restart. Change locked options at their source; the WebUI does not edit `.env` or expose API keys.
+Precedence: **explicit CLI flags > process environment > `.env` > saved SQLite settings > defaults**. Hot settings apply immediately; restart-marked settings require a manual restart. Change locked options at their source; the WebUI does not edit `.env`. Standard keys can be revealed, while admin keys are stored only as hashes.
 
 Compose loads every key in `.env` into the container, so commenting out a line is enough to unlock it; only `CODEBUDDY_AUTH_DIR` and `CODEBUDDY2API_ALLOW_OPEN_NOAUTH` are fixed by the Compose file. Recreate the container after changing these values.
 
@@ -17,7 +17,7 @@ Runtime keys in `.env` stay read-only in the WebUI until they are moved into the
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host` / `--port` | `127.0.0.1` / `8787` | Local listener |
-| `--api-key` | saved default | Shared management/inference key; first local interactive startup generates and saves one if absent; explicit empty locks management |
+| `--api-key` | unset | External admin inference key and initial WebUI password; blank means unset, and database keys are never promoted to it |
 | `--admin-csrf [true/false]` | `true` | Startup-only management Origin/CSRF checks; disabling does not bypass API-key or session authentication |
 | `--admin-allowed-origins` | none | Extra trusted management Origins (comma-separated; bare domains mean HTTPS) for reverse-proxy sign-in; hot and WebUI-editable |
 | `--auth-file` | scan `auth/` | Explicit credential file, repeatable; disables scanning other files |
@@ -181,6 +181,9 @@ Trial credits are manual-only for eligible `intl-work` accounts through the cred
 | `GET /admin/credentials/{id}/growth-tasks` · `POST .../growth-tasks/auto` · `.../auto-all` · `GET /admin/growth-jobs` · `POST /admin/credentials/growth-batch` | Live growth task list; start a background job for one task or every enabled one; current and last job per account; batch task switches for selected accounts |
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | Start/poll login; `site=cn` (default), `intl` (international WorkBuddy) or `intl-codebuddy` (international CodeBuddy) |
 | `GET /admin/credits` · `POST /admin/checkin` | Inspect credits; daily-idempotent check-in followed by domestic travel when enabled |
+| `POST` / `GET` / `DELETE /admin/session` · `DELETE /admin/sessions` | Password login, session inspection/logout and revoke-all; remember-me sessions renew with the same SID |
+| `GET` / `PUT /admin/account` | Read or change the management username/password; account changes rotate the session epoch and CSRF token |
+| `GET` / `POST /admin/keys` · `PATCH` / `DELETE /admin/keys/{id}` · `POST .../rotate` · `POST .../reveal` | Create and manage inference keys; writes use optimistic versions, standard keys support reveal, and admin secrets are one-time only |
 | `POST /admin/sync` | Synchronize all enabled accounts' balances, catalogs and usage; no check-in or trial claims |
 | `POST /admin/credentials/{id}/{action}` | Single-account `refresh`, `checkin`, `sync`, `travel-status` (query only), `travel` (claim then dispatch), `trial` (one-time trial credits), or `reset-cooldown` (local-only) |
 
@@ -190,7 +193,13 @@ Travel results include `phase`, optional safe `error_kind`/`http_status`/`code`,
 
 Pages use `/dashboard/*`, management APIs use `/admin/*`, and clients retain `/v1/*`. `/cn` and `/intl` API prefixes are not registered. Automatic model routing requires no client URL changes.
 
-Management requires an API key. The WebUI exchanges that key for an HttpOnly management Cookie, which only authorizes `/admin/*`, not `/v1/*`. API clients send `Authorization: Bearer <key>` or `X-Api-Key`. An empty key preserves legacy unauthenticated inference only, not management. `/health` never exposes account, path or exception details.
+**`OPEN_NOAUTH` anonymous mode exposes both inference and account-pool billing (`/v1/dashboard/billing/*`).** It applies only when there is no external key and no `api_keys` row, accepts missing or placeholder tokens, and must never be used for public deployments. Any key row, including disabled or expired rows, disables anonymous mode.
+
+Management uses a username and password, never an API key. The HttpOnly Cookie authorizes only `/admin/*`; inference keys authorize only `/v1/*`. A normal login lasts 12 hours; **Remember me** lasts 400 days with sliding renewal. Account changes and **Sign out all sessions** revoke every session.
+
+The external `CODEBUDDY2API_KEY` is the initial password and an unrestricted admin inference key. A legacy default key migrates to the initial password and a database admin key. Changing the password decouples login from later external-key changes. If password recovery is needed, run `converter.py admin reset-password` interactively.
+
+Standard keys support expiry, IP/CIDR allowlists, RPM and source-model restrictions; they can be revealed and are stored in plaintext. Admin keys are unrestricted, limited to one, and stored only as hashes. Standard keys cannot read billing or access another key's video tasks. Public `/v1/media/...` assets remain available until media TTL expiry even after their creating key is revoked.
 
 ### Management Origin / CSRF switch
 
@@ -307,7 +316,9 @@ Readable history is kept in `reasoning_content`, never ordinary answer text. Res
 
 ## Deployment exposure and credential intake
 
-- Compose maps loopback by default. Without a configured or saved key, `CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true` explicitly permits headless/non-loopback inference without generating a key; management stays locked. The shipped image sets this compatibility opt-in, so configure `CODEBUDDY2API_KEY` before exposing it. The opt-in never disables an existing key.
+- Compose maps loopback by default. Configure an external key or create a database key before exposing the port; do not rely on anonymous mode for public access.
+- **With no external or database keys, `CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true` anonymously exposes inference and account-pool billing, with or without a placeholder token.** Any key row forces authentication; with no keys and the option off, every inference request returns 401 `api_key_required`.
+- Run one gateway process per data directory. Other-process key changes become visible within about one second, but RPM counters and `last_used_at` aggregation are process-local. Backups contain standard keys in plaintext and must be protected like credentials.
 - When a key is configured, generation and token-count POSTs verify request headers before buffering bodies or reserving inference capacity; invalid keys return 401 even while generation slots are full. Other routes retain their existing authentication and routing behavior.
 - Credential imports/uploads persist the normalized form (token aliases folded into the canonical fields); strict JSON parsing rejects NaN/Infinity, and `expiresAt`/`lastRefreshTime` must be plausible finite millisecond timestamps.
 
@@ -322,8 +333,8 @@ Readable history is kept in `reasoning_content`, never ordinary answer text. Res
 
 | Symptom | Behavior / action |
 |---------|-------------------|
-| Cannot sign in to WebUI | Configure an API key; sign in and restart unfinished OAuth after changing it. Behind an HTTPS reverse proxy, trust the public origin via `admin_allowed_origins` (see above) |
-| Local 401 | Client key differs from the gateway key |
+| Cannot sign in to WebUI | Use the initial or current admin password, or run `converter.py admin reset-password`. Behind an HTTPS reverse proxy, trust the public origin via `admin_allowed_origins` (see above) |
+| Local 401 / 403 / 429 | Check that the inference key exists and is enabled and unexpired, then inspect its IP/model allowlist and RPM; authentication and permission failures use protocol-specific error envelopes |
 | Upstream 401 / 403 | Credential-level authentication circuit opens; inspect and log in again in the WebUI |
 | 429 | Cool down that upstream model on the credential; later requests rebind automatically. All candidates cooling down still returns 429; with `--failover-max` the in-flight request is replayed on another credential instead |
 | Channel rejection (11128) | One same-account `/console` retry when available; a second channel refusal may move system instructions into a user message and retry once on the same account. A final refusal returns without cooling or replaying any credential. Search/MCP have no console detour and remain usable |
@@ -345,4 +356,4 @@ Readable history is kept in `reasoning_content`, never ordinary answer text. Res
 
 ## Downgrades and rollback
 
-Feature switches hold no hidden state: disabling a guard or mode stops it for new requests, and reverting source restores previous behavior. The exceptions are persisted settings and automation state: `control.sqlite3` stores WebUI settings, model rules and reward reservations, and older code rejects unknown fields. Before downgrading source, remove newly added startup options, stop the service, back up the **current** data directory, and use the narrowly scoped offline `settings.<name>` removal procedure above with a revision increment and integrity check. Do not restore a pre-upgrade database or mix WAL/SHM generations: doing so could roll back newer claims, sessions, revocations and account state. Rollback never undoes completed upstream check-ins, claims or travel dispatches.
+Feature switches hold no hidden state: disabling a guard or mode stops it for new requests, and reverting source restores previous behavior. The exceptions are persisted settings and automation state: `control.sqlite3` stores WebUI settings, model rules and reward reservations, and older code rejects unknown fields. Control schema v3 (with `api_keys`), audit schema v5 and media schema v3 are not readable by 1.4.x; downgrade requires restoring a pre-upgrade backup while stopped. For older schema-only changes, remove newly added startup options and use the narrowly scoped offline `settings.<name>` removal procedure above with a revision increment and integrity check. Do not restore a stale pre-upgrade database or mix WAL/SHM generations: doing so could roll back newer claims, sessions, revocations and account state. Rollback never undoes completed upstream check-ins, claims or travel dispatches.

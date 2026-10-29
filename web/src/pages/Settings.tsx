@@ -13,6 +13,8 @@ import {
 } from "../components";
 import s from "../ui.module.scss";
 import { Select } from "../fields";
+import { AccountPanel } from "./Account";
+import { t } from "../i18n";
 type Setting = {
   key: string;
   value: unknown;
@@ -85,6 +87,43 @@ function normalize(value: unknown): {
     session: object(d.session ?? {}, "会话存储状态"),
   };
 }
+type SettingsGroup = [string, string, Setting[]];
+function SettingsTabs({
+  groups,
+  tab,
+  onChange,
+}: {
+  groups: SettingsGroup[];
+  tab: string;
+  onChange: (tab: string) => void;
+}) {
+  return (
+    <div className={s.tabs} role="tablist" aria-label="配置分组">
+      <SegmentThumb />
+      {groups.map(([key, label, rows]) => (
+        <button
+          key={key}
+          type="button"
+          role="tab"
+          aria-selected={tab === key}
+          className={tab === key ? s.selectedTab : ""}
+          onClick={() => onChange(key)}
+        >
+          {label}（{rows.length}）
+        </button>
+      ))}
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === "account"}
+        className={tab === "account" ? s.selectedTab : ""}
+        onClick={() => onChange("account")}
+      >
+        {t("account.title")}
+      </button>
+    </div>
+  );
+}
 function SettingsForm({
   data,
   reload,
@@ -96,7 +135,7 @@ function SettingsForm({
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
-  const groups: [string, string, Setting[]][] = [
+  const groups: SettingsGroup[] = [
     ["editable", "可修改", []],
     ["external", "外部锁定", []],
     ["system", "系统只读", []],
@@ -107,7 +146,25 @@ function SettingsForm({
     else if (["cli", "environment", "env", "dotenv"].includes(item.source)) groups[1][2].push(item);
     else groups[2][2].push(item);
   }
-  const [tab, setTab] = useState(groups[0][2].length ? "editable" : "external");
+  const [tab, setTab] = useState(() => {
+    const requested = new URLSearchParams(window.location.search).get("tab");
+    if (requested === "account" || groups.some(([key]) => key === requested)) return requested!;
+    return groups[0][2].length ? "editable" : "external";
+  });
+  const changeTab = (next: string) => {
+    setTab(next);
+    const url = new URL(window.location.href);
+    if (next === "account") url.searchParams.set("tab", "account");
+    else url.searchParams.delete("tab");
+    window.history.replaceState({}, "", url);
+  };
+  if (tab === "account")
+    return (
+      <>
+        <SettingsTabs groups={groups} tab={tab} onChange={changeTab} />
+        <AccountPanel />
+      </>
+    );
   const visible = groups.find(([key]) => key === tab)?.[2] ?? [];
   const emptyTitles: Record<string, string> = {
     editable: "当前没有可管理配置",
@@ -141,21 +198,7 @@ function SettingsForm({
           .finally(() => setBusy(false));
       }}
     >
-      <div className={s.tabs} role="tablist" aria-label="配置分组">
-        <SegmentThumb />
-        {groups.map(([key, label, rows]) => (
-          <button
-            key={key}
-            type="button"
-            role="tab"
-            aria-selected={tab === key}
-            className={tab === key ? s.selectedTab : ""}
-            onClick={() => setTab(key)}
-          >
-            {label}（{rows.length}）
-          </button>
-        ))}
-      </div>
+      <SettingsTabs groups={groups} tab={tab} onChange={changeTab} />
       <Panel title="配置项">
         {!visible.length && <Empty title={emptyTitles[tab]} />}
         {visible.map((item) => {

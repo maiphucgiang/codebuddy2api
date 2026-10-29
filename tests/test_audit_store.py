@@ -249,8 +249,8 @@ class AuditStoreTests(unittest.TestCase):
             self.store._db.execute("PRAGMA synchronous=OFF")  # bulk seed only
             self.store._db.execute("BEGIN IMMEDIATE")
             self.store._db.executemany(
-                "INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                [(f"s{i}", now - i, "m", "p", "c", "success", 200, payload, 64, None, 5.0)
+                "INSERT INTO requests(id,started_at,model,profile,credential,outcome,status_code,payload,logical_bytes,client_ip,duration_ms,api_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(f"s{i}", now - i, "m", "p", "c", "success", 200, payload, 64, None, 5.0, None)
                  for i in range(20000)])
             self.store._db.execute("COMMIT")
             self.store._db.execute("PRAGMA synchronous=FULL")
@@ -790,8 +790,8 @@ class AuditStoreTests(unittest.TestCase):
         self.assertEqual(self.store.list_records(client_ip="2001:db8::1")["items"][0]["id"], "meta-1")
         self.assertEqual(self.store.list_records(client_ip="198.51.100.1")["items"], [])
 
-    def test_v2_database_gains_client_ip_without_losing_rows(self):
-        legacy_path = Path(self.temp.name) / "private" / "v2.sqlite3"
+    def test_v4_database_gains_api_key_without_losing_rows(self):
+        legacy_path = Path(self.temp.name) / "private" / "v4.sqlite3"
         raw = sqlite3.connect(legacy_path)
         with raw:
             raw.execute("CREATE TABLE state (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL,"
@@ -804,7 +804,7 @@ class AuditStoreTests(unittest.TestCase):
                 "INSERT INTO requests VALUES('legacy-1', ?, 'm', NULL, NULL, 'success', 200, ?, 128)",
                 (time.time(), json.dumps({"id": "legacy-1", "model": "m", "outcome": "success",
                                           "status_code": 200, "attempts": []})))
-            raw.execute("PRAGMA user_version=2")
+            raw.execute("PRAGMA user_version=4")
         raw.close()
         reopened = AuditStore(legacy_path)
         self.addCleanup(reopened.close)
@@ -812,6 +812,7 @@ class AuditStoreTests(unittest.TestCase):
                       [c[1] for c in reopened._db.execute("PRAGMA table_info(requests)")])
         indexes = [row[1] for row in reopened._db.execute("PRAGMA index_list(requests)")]
         self.assertIn("requests_client", indexes)
+        self.assertIn("api_key", [c[1] for c in reopened._db.execute("PRAGMA table_info(requests)")])
         items = reopened.list_records()["items"]
         self.assertEqual([item["id"] for item in items], ["legacy-1"])
         self.assertIsNone(items[0].get("client_ip"))

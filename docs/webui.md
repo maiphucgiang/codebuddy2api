@@ -4,9 +4,9 @@
 
 ## Open the console
 
-Start the gateway using the [deployment guide](deployment.md), then open `http://127.0.0.1:8787/dashboard` and sign in with the current API key. Source installs need a frontend build; Docker builds include it. Use HTTPS unless connecting locally.
+Start the gateway using the [deployment guide](deployment.md), then open `http://127.0.0.1:8787/dashboard`. Sign in as `admin` with the external key, the password printed at startup, or the legacy default key migrated during upgrade. Source installs need a frontend build; Docker builds include it. Use HTTPS unless connecting locally.
 
-The first unconfigured local startup generates and saves a default key, shown once in the terminal and reused afterward. An explicitly empty key locks management. After changing the effective key, sign in again and restart unfinished OAuth logins.
+Change the username or password in **Settings → Admin account**. A normal session lasts 12 hours; **Remember me** lasts 400 days with sliding renewal. Account changes revoke other sessions and return a fresh CSRF token. API keys cannot access `/admin/*`, and the management Cookie cannot access `/v1/*`.
 
 ## Overview
 
@@ -44,11 +44,19 @@ Add independent mappings with public/upstream IDs and local enablement. Choose e
 - The rate column shows `≈0.037x · 实测计费` for a model declared free that upstream charges, with the sample counts on hover, and `· 手填` for a manual rate. **Edit rule → 消费倍率** takes a manual rate per product and **一键探测倍率** sends one ≈8K-token request per product to tell real 0x from measured billing; **一键检测倍率** in the header does this for every model declared free. See [Measured rates and output limits](advanced.md#measured-rates-and-output-limits).
 - The max output column overlays results from `scripts/probe_max_tokens.py`: red `32K ⚠ 钳制 12×` for silent clamping, green `48K ✓` / `64K ↑` when the claim holds or is exceeded, grey `≥40K` for a lower bound and `?` when nothing was measured.
 
+## API keys
+
+The **Keys** page separates inference credentials from the management account. An external admin key shows only its configuration origin and never a prefix or secret. One database admin key is allowed; it is unrestricted and visible only at creation or rotation, with only its hash stored.
+
+Standard keys support names, enable/disable, expiry, IP/CIDR allowlists, RPM and model restrictions, rotation, reveal, copy and deletion. They remain visible in the UI and are stored in plaintext in `control.sqlite3` and configuration backups, so protect both. Keys authorize only `/v1/*`; standard keys cannot read account-pool billing or access another key's video tasks.
+
+The table shows each key's approximate last-24-hour request count from hourly audit buckets and its last use time. Audit degradation shows `—`; clearing all logs and statistics resets these counters. Deleted keys remain in old audit rows as `<id> (deleted)`, while pre-upgrade rows show `— (pre-upgrade)`.
+
 ## Logs
 
-Filter requests and inspect failed attempts. Closing details or switching log type cancels pending detail loads. Clearing details keeps historical statistics.
+Filter requests by key and inspect failed attempts. The key column shows the current name when available, `<id> (deleted)` after deletion, and `— (pre-upgrade)` for old records. Closing details or switching log type cancels pending detail loads. Clearing details keeps historical statistics.
 
-Clearing **all logs and statistics** is irreversible. Enter the confirmation text shown in the dialog and re-enter the current API key. This does not delete credentials or gateway settings.
+Clearing **all logs and statistics** is irreversible. Enter the confirmation text shown in the dialog and re-enter the current management password. This does not delete credentials, API keys or gateway settings.
 
 ## Media
 
@@ -57,6 +65,7 @@ The **Media** page shows locally stored generation results: usage against the ca
 - **Library** lists assets newest first with model, size and remaining retention; a card opens the preview drawer with metadata, download and a confirmation dialog. **Video tasks** refresh in-flight tasks on their bound account and link finished videos back to the library. Model catalogs and routing are managed under **Model routing**.
 - Images are stored locally by default; without an asset base URL they return base64 without a public link. Explicit `response_format=b64_json` skips image persistence. Videos are always stored locally, and links appear once the base URL is set.
 - **Media settings** (`media_public_base_url`, `media_max_total_mb`, `media_ttl_hours`) set the public link prefix, capacity (64–1048576 MB) and retention (1–8760 hours). Retention is derived from each asset's creation time and the current setting, so shrinking it expires existing assets immediately; the oldest are evicted on the next write or scheduled cleanup. Assets are also served publicly at `/v1/media/…` with immutable caching; see [Media generation](clients.md#media-generation).
+- Standard keys see only video tasks they created; other keys' task IDs return 404 before upstream polling. Public asset URLs rely on unguessable IDs and are not revoked when a key is disabled or deleted; they expire under the media TTL.
 
 ## Settings
 
@@ -65,6 +74,7 @@ Edit unlocked options; hot changes apply immediately, while restart-marked setti
 - "Keep tool descriptions" is off by default and works across all three protocols, independently of prompt compaction; see [tool metadata retention](advanced.md#tool-metadata-retention).
 - "Model capability preflight" defaults to on. Disabling it affects new requests only, not metadata display, international image-run merging or existing security limits; see [model declarations](advanced.md#model-declarations-and-image-compatibility).
 - "Extra trusted management origins" (`admin_allowed_origins`) fixes sign-in behind HTTPS reverse proxies; see [Management Origin checks](advanced.md#management-origin--csrf-switch).
+- **Admin account** changes the username and password after verifying the current password, adopts the returned CSRF token, and can revoke every session including the current browser.
 
 ## Updates
 
@@ -113,7 +123,7 @@ Data defaults to `auth/`, or `/data/auth` inside Docker. Local installs can set 
 | File | Contents |
 |------|----------|
 | `*.info` | Official plaintext credentials; never migrated into SQLite |
-| `control.sqlite3` | Settings, private default key, model rules, sessions, cooldowns, credit/reward state, usage and catalogs |
+| `control.sqlite3` | Settings, scrypt password hashes, standard-key plaintext, admin-key hashes and restrictions, model rules, sessions, cooldowns, credit/reward state, usage and catalogs |
 | `logs.sqlite3` | Request details and independent aggregate statistics |
 | `media/` + `media.sqlite3` | Generated media files and their metadata; kept for the retention period and never included in configuration backups |
 
@@ -121,9 +131,9 @@ Auditing defaults to 30-day detail retention and a 256 MiB logical detail budget
 
 Mount the whole data directory on writable local storage, not just a single database file, and do not share it between gateway instances.
 
-Stop the gateway before copying the entire directory, including databases, WAL/SHM files, credentials and migration backups; do not back up only `.info`. Protect the control database: it contains the default key and management sessions.
+Stop the gateway before copying the entire directory, including databases, WAL/SHM files, credentials and migration backups; do not back up only `.info`. Protect the control database: it contains standard keys in plaintext, password/admin-key hashes and management sessions.
 
-Configuration backups go to `backups/` in the data directory as 0600 tarballs. Each holds only an online `data/control.sqlite3` snapshot and `manifest.json`, which records the kind, the UTC time and the gateway version (plus the target version for a pre-update backup). Credentials (`*.info`), program files and `logs.sqlite3` are never included; the control database still holds the default key and management sessions, so keep backups private.
+Configuration backups go to `backups/` in the data directory as 0600 tarballs. Each holds only an online `data/control.sqlite3` snapshot and `manifest.json`, which records the kind, the UTC time and the gateway version (plus the target version for a pre-update backup). Credentials (`*.info`), program files and `logs.sqlite3` are never included; the control database still holds standard-key plaintext, password/admin-key hashes and management sessions, so keep backups private.
 
 - **Pre-update:** every one-click update first writes `update-<old>-to-<new>-<UTC time>.tar.gz`.
 - **Manual:** **Storage → Configuration backups → Back up now** writes `manual-<version>-<UTC time>.tar.gz`.

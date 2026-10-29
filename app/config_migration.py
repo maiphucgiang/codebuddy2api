@@ -24,8 +24,8 @@ from .settings import SCHEMA, validate_settings
 MAX_ENV_BYTES = 256 * 1024
 LEASE_STALE_S = 90              # Three heartbeat intervals (see converter.LEASE_INTERVAL_S)
 SQLITE_HEADER = b"SQLite format 3\x00"
-CONTROL_TABLES = ("control", "runtime_state", "gateway_secrets")
-SUPPORTED_VERSION = 2
+CONTROL_TABLES = ("control", "runtime_state", "gateway_secrets", "api_keys")
+SUPPORTED_VERSION = 3
 
 
 class MigrationError(ValueError):

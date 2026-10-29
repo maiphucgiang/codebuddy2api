@@ -91,10 +91,11 @@ def _check_document(name, value):
             raise ValueError("Invalid session snapshot")
         for sid, row in value[field].items():
             if (not isinstance(sid, str) or not _TOKEN.fullmatch(sid) or not isinstance(row, dict)
-                    or set(row) != {"csrf_token", "expires"}
+                    or set(row) not in ({"csrf_token", "expires"}, {"csrf_token", "expires", "remember"})
                     or not isinstance(row.get("csrf_token"), str) or not _TOKEN.fullmatch(row["csrf_token"])
                     or type(row.get("expires")) not in (int, float)
-                    or not math.isfinite(row["expires"]) or not 0 < row["expires"] < 1e11):
+                    or not math.isfinite(row["expires"]) or not 0 < row["expires"] < 1e11
+                    or "remember" in row and type(row["remember"]) is not bool):
                 raise ValueError("Invalid persisted session")
     elif name == "trial":
         from .trial_rewards import _key, _timestamp, _safe_result, _result, _RECORD_FIELDS, _RESULT_FIELDS, _MAX_ACCOUNTS

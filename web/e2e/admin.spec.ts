@@ -335,11 +335,11 @@ test("log tabs, cursor, details and guarded destructive clear", async ({ page })
   await choose(page.getByLabel("清理范围"), "all");
   await expect(page.getByRole("button", { name: "确认不可撤销的清理" })).toBeDisabled();
   await page.getByLabel("输入“清空全部日志与统计”").fill("清空全部日志与统计");
-  await page.getByLabel("当前 API key").fill("mock-revalidation-key");
+  await page.getByLabel("当前管理密码").fill("mock-revalidation-key");
   await page.getByRole("button", { name: "确认不可撤销的清理" }).click();
   await expect.poll(() => mock.calls.some((call) => call.path === "/admin/logs/clear")).toBe(true);
 });
-test("anonymous login never persists API key and API failure is not zero-data success", async ({
+test("anonymous login never persists account credentials and API failure is not zero-data success", async ({
   page,
 }) => {
   await mockAPI(page, false);
@@ -347,7 +347,8 @@ test("anonymous login never persists API key and API failure is not zero-data su
   await expect(page).toHaveURL(/\/dashboard\/login$/);
   await expect(page.getByText("不会在浏览器中保存 API key。", { exact: true })).toHaveCount(0);
   await expect(page.locator("p")).toHaveCount(0);
-  await page.getByLabel("API key", { exact: true }).fill("mock-login-key");
+  await page.getByLabel("用户名", { exact: true }).fill("admin");
+  await page.getByLabel("密码", { exact: true }).fill("mock-login-key");
   await page.getByRole("button", { name: "进入工作台" }).click();
   await expect(page).toHaveURL(/\/dashboard$/);
   expect(

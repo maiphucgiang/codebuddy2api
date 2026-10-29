@@ -12,9 +12,15 @@ from unittest.mock import Mock
 from fastapi import FastAPI, Header
 from fastapi.testclient import TestClient
 
+from app import admin_account
 from app.admin_api import CLEAR_CONFIRMATION, install_admin
 from app.admin_auth import COOKIE_NAME, origin_allowlist, same_origin
 from app.control_store import ControlStore
+from tests.admin_session import login as session_login
+
+
+def credentials(password):
+    return {"username": "admin", "password": password, "remember": False}
 
 
 class AdminApiTests(unittest.TestCase):
@@ -22,10 +28,12 @@ class AdminApiTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.store = ControlStore(self.root / "control.sqlite3")
         self.addCleanup(self.store.close)
+        admin_account.save(self.store, admin_account.new("admin", "synthetic-key", "user"))
         self.config = {"api_key": "synthetic-key", "control_store": self.store, "max_images": 16,
                        "session_path": self.root / "admin-sessions.json"}
         self.audit = Mock()
         self.audit.storage.return_value = {"db_bytes": 0}
+        self.audit.api_key_stats.return_value = {"items": {}}
         self.audit.list_records.return_value = {"items": [], "next_cursor": None, "has_more": False}
         self.audit.get_request.return_value = None
         self.audit.dashboard.return_value = {"summary": {}, "series": [], "models": [], "profiles": []}
@@ -79,16 +87,15 @@ class AdminApiTests(unittest.TestCase):
 
         self.auth = install_admin(self.app, self.config, self.gateway)
         self.client = self.enterContext(TestClient(self.app))
-        self.headers = {"Authorization": "Bearer synthetic-key"}
+        self.headers = self.login()
 
     def login(self, client=None):
-        client = client or self.client
-        result = client.post("/admin/session", json={"api_key": "synthetic-key"}, headers={"Origin": "http://testserver"})
-        self.assertEqual(result.status_code, 200, result.text)
-        return {"Origin": "http://testserver", "X-CSRF-Token": result.json()["csrf_token"]}
+        return session_login(client or self.client)
 
     def test_header_cookie_isolation_csrf_and_no_cache(self):
-        self.assertEqual(self.client.post("/admin/legacy").status_code, 401)
+        anonymous = TestClient(self.app)
+        self.assertEqual(anonymous.post("/admin/legacy").status_code, 401)
+        anonymous.close()
         csrf = self.login()
         cookie = self.client.cookies.get(COOKIE_NAME)
         self.assertTrue(cookie)
@@ -96,11 +103,13 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(self.client.post("/admin/legacy", headers={**csrf, "Origin": "https://evil.invalid"}).status_code, 403)
         good = self.client.post("/admin/legacy", headers=csrf)
         self.assertEqual(good.status_code, 200)
-        self.assertEqual(self.legacy_auth, ["Bearer synthetic-key"])
+        self.assertEqual(self.legacy_auth, [""])
         self.assertEqual(good.headers["cache-control"], "no-store")
         # Force the cookie onto an inference request: middleware still never injects key.
         self.assertFalse(self.client.get("/v1/identity", headers={"Cookie": f"{COOKIE_NAME}={cookie}"}).json()["authorization_present"])
-        self.assertEqual(self.client.post("/admin/legacy", headers=self.headers).status_code, 200)
+        anonymous = TestClient(self.app)
+        self.assertEqual(anonymous.post("/admin/legacy", headers={"Authorization": "Bearer synthetic-key"}).status_code, 401)
+        anonymous.close()
 
     def test_same_origin_referer_fallback_is_strict_and_get_only(self):
         from starlette.requests import Request
@@ -163,10 +172,10 @@ class AdminApiTests(unittest.TestCase):
     def test_allowed_origins_permit_foreign_origin_login_and_cookie_writes(self):
         self.config["admin_allowed_origins"] = "https://chat.example.com"
         foreign = {"Origin": "https://chat.example.com"}
-        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"}).status_code, 403)
-        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"},
+        self.assertEqual(self.client.post("/admin/session", json=credentials("synthetic-key")).status_code, 403)
+        self.assertEqual(self.client.post("/admin/session", json=credentials("synthetic-key"),
                                           headers={"Origin": "https://evil.invalid"}).status_code, 403)
-        login = self.client.post("/admin/session", json={"api_key": "synthetic-key"}, headers=foreign)
+        login = self.client.post("/admin/session", json=credentials("synthetic-key"), headers=foreign)
         self.assertEqual(login.status_code, 200, login.text)
         csrf = {**foreign, "X-CSRF-Token": login.json()["csrf_token"]}
         self.assertEqual(self.client.post("/admin/legacy", headers=csrf).status_code, 200)
@@ -179,26 +188,30 @@ class AdminApiTests(unittest.TestCase):
         stored = self.store.snapshot()["settings"]["admin_allowed_origins"]
         self.assertEqual(stored, "https://chat.example.com,http://10.0.0.1:8787,https://dup.example.com")
         self.assertEqual(self.config["admin_allowed_origins"], stored)
-        login = self.client.post("/admin/session", json={"api_key": "synthetic-key"},
+        login = self.client.post("/admin/session", json=credentials("synthetic-key"),
                                  headers={"Origin": "https://chat.example.com"})
         self.assertEqual(login.status_code, 200, login.text)
-        cleared = self.client.patch("/admin/settings", headers=self.headers, json={
-            "revision": 1, "values": {"admin_allowed_origins": ""}})
+        cleared = self.client.patch("/admin/settings",
+                                    headers={**self.headers, "X-CSRF-Token": login.json()["csrf_token"]},
+                                    json={"revision": 1, "values": {"admin_allowed_origins": ""}})
         self.assertEqual(cleared.status_code, 200, cleared.text)
         self.assertEqual(self.config["admin_allowed_origins"], "")
-        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"},
+        self.assertEqual(self.client.post("/admin/session", json=credentials("synthetic-key"),
                                           headers={"Origin": "https://chat.example.com"}).status_code, 403)
         for invalid in ("ftp://chat.example.com", "https://chat.example.com/path", "http://user@chat.example.com",
                         "https://chat.example.com#fragment", "https://chat.example.com:0", "::"):
             with self.subTest(invalid=invalid):
-                rejected = self.client.patch("/admin/settings", headers=self.headers, json={
-                    "revision": self.store.snapshot()["revision"], "values": {"admin_allowed_origins": invalid}})
+                rejected = self.client.patch(
+                    "/admin/settings",
+                    headers={**self.headers, "X-CSRF-Token": login.json()["csrf_token"]},
+                    json={"revision": self.store.snapshot()["revision"],
+                          "values": {"admin_allowed_origins": invalid}})
                 self.assertEqual(rejected.status_code, 400)
         self.assertEqual(self.store.snapshot()["settings"]["admin_allowed_origins"], "")
     def test_lan_oauth_poll_uses_referer_without_disabling_csrf(self):
         origin = "http://192.168.1.10:8787"
         client = self.enterContext(TestClient(self.app, base_url=origin))
-        login = client.post("/admin/session", headers={"Origin": origin}, json={"api_key": "synthetic-key"})
+        login = client.post("/admin/session", headers={"Origin": origin}, json=credentials("synthetic-key"))
         self.assertEqual(login.status_code, 200, login.text)
         token = login.json()["csrf_token"]
         started = client.post("/admin/oauth/start", headers={"Origin": origin, "X-CSRF-Token": token})
@@ -215,7 +228,7 @@ class AdminApiTests(unittest.TestCase):
             with self.subTest(headers=headers):
                 self.assertEqual(client.get("/admin/oauth/poll", params=params, headers=headers).status_code, 403)
         other = self.enterContext(TestClient(self.app, base_url=origin))
-        other_login = other.post("/admin/session", headers={"Origin": origin}, json={"api_key": "synthetic-key"})
+        other_login = other.post("/admin/session", headers={"Origin": origin}, json=credentials("synthetic-key"))
         self.assertEqual(other_login.status_code, 200)
         response = other.get("/admin/oauth/poll", params=params, headers={
             "Referer": referer, "X-CSRF-Token": other_login.json()["csrf_token"]})
@@ -235,13 +248,13 @@ class AdminApiTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.config["admin_csrf"] = value
                 self.assertTrue(self.auth.csrf_enabled())
-                self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"}).status_code, 403)
+                self.assertEqual(self.client.post("/admin/session", json=credentials("synthetic-key")).status_code, 403)
         self.config["admin_csrf"] = False
         self.assertFalse(self.auth.csrf_enabled())
 
     def test_disabled_csrf_allows_cookie_writes_and_oauth_poll(self):
         self.config["admin_csrf"] = False
-        response = self.client.post("/admin/session", json={"api_key": "synthetic-key"})
+        response = self.client.post("/admin/session", json=credentials("synthetic-key"))
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["csrf_token"])
         self.assertIn("HttpOnly", response.headers["set-cookie"])
@@ -262,11 +275,13 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(self.client.delete("/admin/session").status_code, 200)
         self.assertEqual(self.client.post("/admin/legacy").status_code, 401)
 
-    def test_disabled_csrf_keeps_authentication_and_sensitive_action_checks(self):
+    def test_disabled_csrf_keeps_session_and_sensitive_action_checks(self):
         self.config["admin_csrf"] = False
-        self.assertEqual(self.client.post("/admin/legacy").status_code, 401)
-        self.assertEqual(self.client.post("/admin/legacy", headers={"X-Api-Key": "wrong"}).status_code, 401)
-        self.assertEqual(self.client.post("/admin/session", json={"api_key": "wrong"}).status_code, 401)
+        anonymous = TestClient(self.app)
+        self.assertEqual(anonymous.post("/admin/legacy").status_code, 401)
+        self.assertEqual(anonymous.post("/admin/legacy", headers={"X-Api-Key": "wrong"}).status_code, 401)
+        anonymous.close()
+        self.assertEqual(self.client.post("/admin/session", json=credentials("wrong")).status_code, 401)
         self.login()
         cookie = self.client.cookies.get(COOKIE_NAME)
         self.assertFalse(self.client.get("/v1/identity", headers={"Cookie": f"{COOKIE_NAME}={cookie}"}).json()["authorization_present"])
@@ -276,10 +291,10 @@ class AdminApiTests(unittest.TestCase):
         self.gateway.admin_delete_guard.side_effect = ValueError("referenced")
         self.assertEqual(self.client.delete("/admin/credentials/first.info").status_code, 409)
         self.config["api_key"] = "rotated-key"
-        self.assertEqual(self.client.post("/admin/legacy").status_code, 401)
+        self.assertEqual(self.client.post("/admin/legacy").status_code, 200)
         self.config["api_key"] = ""
         for path in ("/admin/session", "/admin/settings", "/admin/credentials"):
-            self.assertEqual(self.client.get(path).status_code, 503)
+            self.assertEqual(self.client.get(path).status_code, 200)
 
     def test_disabled_csrf_keeps_oauth_ownership_and_official_site_checks(self):
         self.config["admin_csrf"] = False
@@ -298,8 +313,8 @@ class AdminApiTests(unittest.TestCase):
     def test_disabled_csrf_keeps_login_throttle(self):
         self.config["admin_csrf"] = False
         for _ in range(10):
-            self.assertEqual(self.client.post("/admin/session", json={"api_key": "wrong"}).status_code, 401)
-        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"}).status_code, 429)
+            self.assertEqual(self.client.post("/admin/session", json=credentials("wrong")).status_code, 401)
+        self.assertEqual(self.client.post("/admin/session", json=credentials("synthetic-key")).status_code, 429)
 
     def test_admin_csrf_cannot_be_changed_through_management_settings(self):
         for enabled in (True, False):
@@ -311,8 +326,8 @@ class AdminApiTests(unittest.TestCase):
                 self.assertIs(self.config["admin_csrf"], enabled)
                 self.assertNotIn("admin_csrf", self.store.snapshot()["settings"])
 
-    def test_session_cookie_flags_logout_and_rotation(self):
-        response = self.client.post("/admin/session", json={"api_key": "synthetic-key"}, headers={"Origin": "http://testserver"})
+    def test_session_cookie_flags_logout_and_account_epoch_rotation(self):
+        response = self.client.post("/admin/session", json=credentials("synthetic-key"), headers={"Origin": "http://testserver"})
         cookie = response.headers["set-cookie"]
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=strict", cookie)
@@ -322,15 +337,18 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(self.client.delete("/admin/session", headers=csrf).status_code, 200)
         self.assertEqual(self.client.get("/admin/settings", headers={"Cookie": f"{COOKIE_NAME}={old}"}).status_code, 401)
         self.login()
-        self.config["api_key"] = "rotated-key"
+        account = admin_account.load(self.store)
+        admin_account.save(self.store, admin_account.with_password(account, "rotated-key"))
         self.assertEqual(self.client.get("/admin/settings").status_code, 401)
         self.assertEqual(self.client.get("/admin/settings", headers=self.headers).status_code, 401)
-        self.assertEqual(self.client.get("/admin/settings", headers={"X-Api-Key": "rotated-key"}).status_code, 200)
+        self.assertEqual(self.client.get("/admin/settings", headers={"X-Api-Key": "rotated-key"}).status_code, 401)
+        renewed = session_login(self.client, password="rotated-key")
+        self.assertEqual(self.client.get("/admin/settings", headers=renewed).status_code, 200)
 
     def test_logout_reports_when_the_session_could_not_be_persistently_revoked(self):
         """A logout that cannot reach durable storage must not answer `authenticated: false`."""
         from unittest.mock import patch
-        response = self.client.post("/admin/session", json={"api_key": "synthetic-key"}, headers={"Origin": "http://testserver"})
+        response = self.client.post("/admin/session", json=credentials("synthetic-key"), headers={"Origin": "http://testserver"})
         csrf = {"Origin": "http://testserver", "X-CSRF-Token": response.json()["csrf_token"]}
         old = self.client.cookies.get(COOKIE_NAME)
         with patch("app.admin_auth.tempfile.mkstemp", side_effect=OSError("read-only")), \
@@ -353,9 +371,10 @@ class AdminApiTests(unittest.TestCase):
         """Mid-process epoch changes must deny with 503, never serve management traffic."""
         from unittest.mock import patch
         self.assertEqual(self.client.get("/admin/settings", headers=self.headers).status_code, 200)
-        self.config["api_key"] = "rotated-synthetic-key"
         with patch.object(type(self.auth), "_persist", return_value=False), \
                 patch.object(type(self.auth), "_revoke", return_value=False):
+            account = admin_account.load(self.store)
+            admin_account.save(self.store, admin_account.with_password(account, "rotated-synthetic-key"))
             denied = self.client.get("/admin/settings", headers=self.headers)
         self.assertEqual(denied.status_code, 503)
         self.assertIn("会话快照", denied.json()["error"]["message"])
@@ -363,23 +382,24 @@ class AdminApiTests(unittest.TestCase):
     def test_https_cookie_and_bounded_sessions(self):
         from starlette.requests import Request
         secure = self.enterContext(TestClient(self.app, base_url="https://testserver"))
-        response = secure.post("/admin/session", headers={"Origin": "https://testserver"}, json={"api_key": "synthetic-key"})
+        response = secure.post("/admin/session", headers={"Origin": "https://testserver"}, json=credentials("synthetic-key"))
         self.assertIn("Secure", response.headers["set-cookie"])
         request = Request({"type": "http", "headers": [], "client": ("synthetic", 1)})
         for _ in range(300):
-            self.auth.login(request, "synthetic-key")
+            self.auth.login(request, "admin", "synthetic-key")
         self.assertEqual(len(self.auth.sessions), 256)
 
-    def test_empty_key_locks_every_management_route(self):
+    def test_empty_external_key_does_not_lock_management_with_an_account(self):
         self.config["api_key"] = ""
-        for path in ("/admin/session", "/admin/settings", "/admin/credentials", "/admin/missing"):
-            self.assertEqual(self.client.get(path, headers=self.headers).status_code, 503)
+        for path in ("/admin/session", "/admin/settings", "/admin/credentials"):
+            self.assertEqual(self.client.get(path, headers=self.headers).status_code, 200)
+        self.assertEqual(self.client.get("/admin/missing", headers=self.headers).status_code, 404)
 
     def test_login_origin_throttle_and_bound(self):
-        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"}).status_code, 403)
+        self.assertEqual(self.client.post("/admin/session", json=credentials("synthetic-key")).status_code, 403)
         for _ in range(10):
-            self.assertEqual(self.client.post("/admin/session", json={"api_key": "wrong"}, headers={"Origin": "http://testserver"}).status_code, 401)
-        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"}, headers={"Origin": "http://testserver"}).status_code, 429)
+            self.assertEqual(self.client.post("/admin/session", json=credentials("wrong"), headers={"Origin": "http://testserver"}).status_code, 401)
+        self.assertEqual(self.client.post("/admin/session", json=credentials("synthetic-key"), headers={"Origin": "http://testserver"}).status_code, 429)
         self.assertLessEqual(len(self.auth.failures), 1024)
 
     def test_storage_read_failures_are_not_empty_successes(self):
@@ -402,7 +422,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(self.store.snapshot()["settings"]["max_images"], 3)
 
 
-    def test_key_rotation_does_not_revive_pending_header_oauth(self):
+    def test_external_key_rotation_does_not_change_pending_session_oauth(self):
         started = self.client.post("/admin/oauth/start?site=cn", headers=self.headers)
         self.assertEqual(started.status_code, 200)
         task = started.json()["login_id"]
@@ -411,9 +431,9 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.config["api_key"] = "synthetic-key"
         response = self.client.get("/admin/oauth/poll", params={"login_id": task}, headers=self.headers)
-        self.assertEqual(response.status_code, 404)
-        self.gateway._OAUTH.poll.assert_not_called()
-        self.gateway._save_oauth_credential.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.gateway._OAUTH.poll.assert_called_once()
+        self.gateway._save_oauth_credential.assert_called_once()
 
 
     def test_tool_metadata_setting_is_hot_persisted_and_respects_locks(self):
@@ -487,8 +507,12 @@ class AdminApiTests(unittest.TestCase):
 
 
     def test_catalog_scan_routes_require_session_and_delegate(self):
-        self.assertEqual(self.client.post("/admin/models/scan").status_code, 401)
-        self.assertEqual(self.client.get("/admin/models/scan").status_code, 401)
+        anonymous = TestClient(self.app)
+        self.assertEqual(anonymous.post("/admin/models/scan").status_code, 401)
+        anonymous.close()
+        anonymous = TestClient(self.app)
+        self.assertEqual(anonymous.get("/admin/models/scan").status_code, 401)
+        anonymous.close()
         csrf = self.login()
         started = self.client.post("/admin/models/scan", headers=csrf)
         self.assertEqual(started.status_code, 200, started.text)
@@ -650,7 +674,9 @@ class AdminApiTests(unittest.TestCase):
             self.assertTrue(self.store.snapshot()["settings"]["config_notice_muted"])
             again = self.client.get("/admin/dashboard", headers=self.headers)
             self.assertNotIn("config_notice", again.json())
-        self.assertEqual(self.client.post("/admin/config-notice/dismiss").status_code, 401)
+        anonymous = TestClient(self.app)
+        self.assertEqual(anonymous.post("/admin/config-notice/dismiss").status_code, 401)
+        anonymous.close()
 
     def test_export_only_selected_info_and_symlink_identity_protection(self):
         content = json.dumps(self.credential())
@@ -733,7 +759,7 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/admin/dashboard?days=7", headers=self.headers).status_code, 200)
         self.assertEqual(self.client.get("/admin/dashboard?days=8", headers=self.headers).status_code, 400)
         self.assertEqual(self.client.post("/admin/logs/clear", headers=self.headers, json={"scope": "all", "confirmation": CLEAR_CONFIRMATION}).status_code, 403)
-        response = self.client.post("/admin/logs/clear", headers=self.headers, json={"scope": "all", "confirmation": CLEAR_CONFIRMATION, "api_key": "synthetic-key"})
+        response = self.client.post("/admin/logs/clear", headers=self.headers, json={"scope": "all", "confirmation": CLEAR_CONFIRMATION, "password": "synthetic-key"})
         self.assertEqual(response.status_code, 200)
         self.audit.clear.assert_called_once_with("all")
         self.assertEqual(self.client.get("/admin/missing", headers=self.headers).status_code, 404)

@@ -109,7 +109,26 @@ def write_credentials(directory, now: float | None = None):
                                 json.dumps(credential(account, now), ensure_ascii=False, indent=2).encode())
 
 
-def write_history(path, now: float | None = None, days: int = 30, seed: int = 7):
+def write_api_keys(directory):
+    """Create three restricted inference keys and return their ids for other seed data."""
+    from app.api_keys import KeyStore
+    from app.control_store import ControlStore
+
+    directory = Path(directory)
+    control = ControlStore(directory / "control.sqlite3")
+    try:
+        keys = KeyStore(control)
+        expired, _ = keys.create(name="expired", kind="standard")
+        ip, _ = keys.create(name="ip", kind="standard", ip_allow=["127.0.0.1"], rpm=60)
+        models, _ = keys.create(name="models", kind="standard", models=["auto"])
+        control._db.execute("UPDATE api_keys SET expires_at=? WHERE id=?", (time.time() - 3600, expired["id"]))
+        control._db.commit()
+        return {"expired": expired["id"], "ip": ip["id"], "models": models["id"]}
+    finally:
+        control.close()
+
+
+def write_history(path, now: float | None = None, days: int = 30, seed: int = 7, key_ids=()):
     """Backfill request records so the dashboard and logs open with a month of traffic."""
     now = time.time() if now is None else now
     rng = random.Random(seed)
@@ -122,12 +141,13 @@ def write_history(path, now: float | None = None, days: int = 30, seed: int = 7)
             for account in ACCOUNTS:
                 for _ in range(round(account.daily_requests * scale * rng.uniform(0.6, 1.4))):
                     started = now - day * DAY - rng.uniform(0, DAY if day else 6 * 3600)
-                    store.record_request(_record(account, started, rng))
+                    store.record_request(_record(account, started, rng,
+                                                 api_key=rng.choice(key_ids) if key_ids else None))
     finally:
         store.close()
 
 
-def _record(account: Account, started: float, rng: random.Random) -> dict:
+def _record(account: Account, started: float, rng: random.Random, *, api_key=None) -> dict:
     model = rng.choice(account.models)
     protocol = rng.choices(("chat", "responses", "messages"), (5, 3, 4))[0]
     failed = rng.random() < 0.04
@@ -138,7 +158,7 @@ def _record(account: Account, started: float, rng: random.Random) -> dict:
     duration = int(rng.lognormvariate(8.3, 0.6))
     status = rng.choice((429, 500, 503)) if failed else 200
     return {
-        "id": uuid.UUID(int=rng.getrandbits(128)).hex, "started_at": started,
+        "id": uuid.UUID(int=rng.getrandbits(128)).hex, "started_at": started, "api_key": api_key,
         "model": model, "upstream_model": model, "profile": account.profile, "credential": identity,
         "protocol": protocol, "streaming": rng.random() < 0.8, "outcome": "error" if failed else "success",
         "status_code": status, "error_code": "upstream_error" if failed else None,
@@ -153,7 +173,7 @@ def _record(account: Account, started: float, rng: random.Random) -> dict:
     }
 
 
-def write_media(directory, now: float | None = None):
+def write_media(directory, now: float | None = None, *, api_key=None):
     """Seed local media assets and video tasks so the dashboard media page opens populated."""
     from app.media_store import MediaStore
 
@@ -168,7 +188,7 @@ def write_media(directory, now: float | None = None):
         store._db.commit()
         video = store.save_asset("video", MP4_BYTES, model="minimax-video-h3", **quota)
         aurora = account_key("cn-cli", "100001", "")
-        store.create_task("seedvideotask-complete", aurora, "cn-cli", "minimax-video-h3")
+        store.create_task("seedvideotask-complete", aurora, "cn-cli", "minimax-video-h3", api_key=api_key)
         store.update_task("seedvideotask-complete", status="completed",
                           media_id=video["id"], credit=12.5)
         # Stays in progress until someone refreshes it; the simulated upstream knows this id.

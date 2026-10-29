@@ -10,7 +10,7 @@
 - 多账号自动选路，兼容国内／国际站，自动刷新凭证。
 - 按账号配置自动任务：国内个人账号默认签到后派 Buddy 旅行，可分别关闭；国际自动签到默认关闭。成长中心仅面向个人账号：已完成任务自动领取积分与能量，行为链按任务开关执行；企业账号不参与。
 
-**在线预览：**[codebuddy2api.elaina-love.com](https://codebuddy2api.elaina-love.com/dashboard)，密钥 `preview`。它让 WebUI 与各个 API 对接模拟上游和合成账号运行，不含任何真实凭证，每 6 小时重置一次；其中已停用凭证导入导出、修改设置和清空日志。在本地运行见[开发预览](docs/development.zh-CN.md)。
+**在线预览：**[codebuddy2api.elaina-love.com](https://codebuddy2api.elaina-love.com/dashboard)，使用账号 `admin`、密码 `preview` 登录，推理密钥也是 `preview`。它让 WebUI 与各个 API 对接模拟上游和合成账号运行，不含任何真实凭证，每 6 小时重置一次；其中已停用凭证导入导出、修改设置和清空日志。在本地运行见[开发预览](docs/development.zh-CN.md)。
 
 ## 快速开始
 
@@ -22,7 +22,7 @@ cd codebuddy2api
 cp .env.example .env
 ```
 
-编辑 `.env`：将 `CODEBUDDY2API_KEY` 设置为自己的随机密钥。Compose 会把整个文件加载进容器，每个键都会生效，无关的键也无影响。升级时保留已有 `.env`。
+编辑 `.env`：将 `CODEBUDDY2API_KEY` 设置为自己的随机密钥。它是外部管理推理密钥，也是修改密码前的初始 WebUI 密码。Compose 会把整个文件加载进容器，每个键都会生效，无关的键也无影响。升级时保留已有 `.env`。
 
 ```bash
 docker compose pull
@@ -33,9 +33,10 @@ Compose 默认拉取 `latest`（`CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebu
 
 首次使用：
 
-1. 打开 **http://127.0.0.1:8787/dashboard**，使用刚设置的 API key 登录。
+1. 打开 **http://127.0.0.1:8787/dashboard**，使用账号 `admin` 和 `CODEBUDDY2API_KEY` 对应的初始密码登录。
 2. 在「凭证管理」扫码添加国内或国际账号，也可导入 `.info` 文件，或按端点粘贴刷新令牌批量导入。
-3. 在「模型路由」查看可用模型，将其对外 ID 填入客户端。
+3. 在「密钥管理」为每个客户端创建推理密钥，按需设置模型、IP、有效期和速率限制。
+4. 在「模型路由」查看可用模型，将其对外 ID 填入客户端。
 
 按模板配置时仅允许本机访问。远程访问前请配置 HTTPS 并限制网络访问；保留并妥善备份 `auth/` 数据目录。如需直接运行源码或在终端登录，见[部署指南](docs/deployment.zh-CN.md)。
 
@@ -51,7 +52,7 @@ Compose 默认拉取 `latest`（`CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebu
 
 - 媒体生成按上游积分计费，只路由到已实测验证的账号产品；见[媒体生成](docs/clients.zh-CN.md#媒体生成)。
 
-- **API Key**：与 WebUI 登录使用同一个密钥。
+- **API Key**：使用「密钥管理」创建的密钥，或外部配置的管理密钥；WebUI 管理 Cookie 不能调用 `/v1/*`。
 - **模型**：使用 WebUI 中的对外 ID，或查询 `GET /v1/models`。
 - 国内、国际账号共用这些地址，无需额外的地域参数。Anthropic SDK 会自行追加 `/v1/messages`，不要把它写入 Base URL。
 - 搜索与抓取端点不调用模型。在请求里声明 Anthropic `web_search_*`／`web_fetch_*` 或 OpenAI `web_search` 服务端工具时，网关会自行执行，见[联网搜索与抓取](docs/clients.zh-CN.md#联网搜索与抓取)。
@@ -90,7 +91,7 @@ Compose 默认拉取 `latest`（`CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebu
 ## 常见问题
 
 - **绑定域名后经 HTTPS 反代无法登录 WebUI？** 将对外来源加入 `admin_allowed_origins` 信任列表——见[管理 Origin 校验](docs/advanced.zh-CN.md#管理-origin--csrf-开关)。
-- **没有 Docker？** 准备依赖和 WebUI 后，直接 `uv run --locked --no-build converter.py` 或 `python3 converter.py`，无需 `.env`；首次本地启动保存默认 key 并仅在终端显示一次——见[本地 Python 运行](docs/deployment.zh-CN.md#本地-python-运行)。
+- **没有 Docker？** 准备依赖和 WebUI 后，直接 `uv run --locked --no-build converter.py` 或 `python3 converter.py`，无需 `.env`；首次启动会输出初始管理账号和随机密码，不会自动创建推理密钥，请登录后在「密钥管理」创建——见[本地 Python 运行](docs/deployment.zh-CN.md#本地-python-运行)。
 - **数据在哪里？** 全部位于 `auth/`（Docker 中为 `/data/auth`）：凭证、设置与日志数据库——见[数据与备份](docs/webui.zh-CN.md#数据与备份)。
 - **镜像标签怎么选？** `latest` 跟随稳定版，`edge` 跟随 main，版本标签固定某一发行版——见[使用已发布镜像](docs/deployment.zh-CN.md#使用已发布镜像)。
 - **Responses 工具输出/参数被压缩或需要完全原样？** 设置 `responses_projection_mode`（默认 `balanced`，设 `passthrough` 可完全关闭投影）及 `responses_projection_max_bytes`（默认 `40000`，`0` 禁用单项裁剪）。balanced 裁剪保留头尾并显示原始 bytes、估算 tokens 与总行数，客户端地址不变——见 [Responses 投影](docs/clients.zh-CN.md#responses-投影)及[详细说明](docs/advanced.zh-CN.md#responses-投影)。

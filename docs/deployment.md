@@ -6,7 +6,7 @@ Prefer the [WebUI](webui.md) for everyday account, model and log management. Run
 
 ## Configuration and data
 
-On first setup, run `cp .env.example .env` and set `CODEBUDDY2API_KEY` to your own random key. Keep an existing `.env` and add only the settings you need.
+On first setup, run `cp .env.example .env` and set `CODEBUDDY2API_KEY` to your own random key. It is the external admin inference key and the initial WebUI password until changed. Keep an existing `.env` and add only the settings you need.
 
 | Setting | Purpose |
 |---------|---------|
@@ -15,7 +15,7 @@ On first setup, run `cp .env.example .env` and set `CODEBUDDY2API_KEY` to your o
 | `CODEBUDDY2API_AUTH_PATH` | Compose host data directory; defaults to `./auth`, mounted at `/data/auth` |
 | `TZ` | Container time zone; daily guards follow it, and an unset value keeps UTC |
 | `CODEBUDDY2API_ENV_FILE` | Optional Compose override for the env file path; defaults to `.env` |
-| `CODEBUDDY2API_ALLOW_OPEN_NOAUTH` | Headless no-auth opt-in for the image and Compose, where it stays `true`; configure `CODEBUDDY2API_KEY` before exposing the port |
+| `CODEBUDDY2API_ALLOW_OPEN_NOAUTH` | Image/Compose compatibility opt-in, fixed `true` there. Only with no external or database keys does it anonymously expose inference **and account-pool billing**, with or without a placeholder token; any key row disables it |
 | `CODEBUDDY2API_TRUSTED_PROXIES` | Trusted proxy IPs/CIDRs (comma separated); when the direct peer matches, the audit log records the client from `X-Forwarded-For`/`X-Real-IP` instead of the proxy address |
 | `CODEBUDDY_AUTH_DIR` | Local Python data directory; defaults to the repository's `auth/`. Compose sets it to `/data/auth` inside the container |
 | `CODEBUDDY_IMPORT_DIR` | Optional import directory; defaults to `imports/` under the data directory. Use container paths with Compose |
@@ -45,7 +45,7 @@ docker compose build
 docker compose up -d
 ```
 
-The build includes the WebUI; Node.js and Python are not required on the host. Open `http://127.0.0.1:8787/dashboard` to add accounts.
+The build includes the WebUI; Node.js and Python are not required on the host. Open `http://127.0.0.1:8787/dashboard` to add accounts. With no external key, get the initial `admin` password from `docker compose logs codebuddy2api`, then change it in **Settings → Admin account** and create inference keys in **Keys**.
 
 ### Upgrades and recreates
 
@@ -59,8 +59,7 @@ The default loopback mapping is the only safe exposure without extra work. When 
 
 - Terminate TLS at the proxy and forward the original Host and scheme (`proxy_set_header Host $host` and `X-Forwarded-Proto $scheme` in nginx).
 - The WebUI compares the browser's `Origin` with the address the gateway actually sees. If the proxy rewrites the forwarded Host/scheme — for example HTTPS on the domain while the container sees HTTP — sign-in fails the Origin check. Trust your public address in **Settings → Extra trusted management origins（管理页额外信任来源）** or with `CODEBUDDY2API_ADMIN_ORIGINS` / `--admin-allowed-origins` instead of disabling CSRF protection; see [Management Origin checks](advanced.md#management-origin--csrf-switch).
-- Keep authentication enabled (`CODEBUDDY2API_KEY`) for any non-loopback exposure.
-
+- Configure an external key or create a database key before non-loopback exposure. Anonymous mode also exposes account-pool billing; never use it for public deployments.
 ## Local Python setup
 
 Requires Python 3.12+ and uv. Build the interface only when the distribution does not include it, using Node.js 24 and the vp CLI pinned by `vite-plus` in `web/package.json`.
@@ -73,11 +72,11 @@ uv run --locked --no-build converter.py --host 127.0.0.1 --port 8787
 
 `--locked` stops instead of re-resolving when `uv.lock` is stale, so a source launch never upgrades packages. `.env` in the working directory is read automatically, so `uv run` needs no `--env-file`. Distribution archives already contain the WebUI; skip the frontend build there.
 
-Local startup does not require `.env`. Without an explicit key, the first loopback startup generates a `cb-…` default key in `auth/control.sqlite3` and displays it once in the interactive terminal after listening succeeds. Restarts reuse it without printing it again. Keep it safe: management and API requests share this key. Configure a key explicitly for first-time headless or non-loopback deployment.
+Local startup does not require `.env`. With `CODEBUDDY2API_KEY` from CLI, environment or `.env`, sign in as `admin` with that value; it remains the external admin inference key until removed. Without an external key, startup prints `admin` and a random initial password to the controlling terminal, or to stdout when no TTY is available. In Docker, use `docker compose logs codebuddy2api`. No inference key is created automatically: sign in and create one in **Keys**.
 
-One-time disclosure goes directly to the controlling terminal (`/dev/tty` or Windows `CONOUT$`), not stdout/stderr; redirecting standard output does not capture the key. Terminal recording remains outside the gateway's control.
+A legacy saved default key is migrated once to the initial admin password and a database admin key; database keys never become `CODEBUDDY2API_KEY`. Changing the account password decouples later logins from external-key changes and revokes existing sessions. Passwords are stored only as scrypt hashes.
 
-A failed terminal write or database commit leaves the same key pending for the next interactive start. A crash between display and commit can therefore repeat the notice; a successfully committed display is not repeated.
+Password output precedes the account commit. An output failure stops startup without writing the account; a commit failure retries initialization on the next start. Terminal or container-log retention remains outside the gateway's control, so change the initial password after first login.
 
 Without uv, keep the same hash-locked set in a virtual environment:
 
@@ -88,9 +87,20 @@ python3 -m pip install --require-hashes --only-binary=:all: -r requirements.txt
 python3 converter.py --host 127.0.0.1 --port 8787
 ```
 
-Both startup paths read `.env` in the current working directory when present, never parent directories. Precedence: explicit CLI > process environment > `.env` > saved SQLite values > defaults. Overrides do not replace the saved default key; an explicitly empty key still locks management. Listener changes require restart; `CODEBUDDY2API_IMAGE/AUTH_PATH` only affect Compose.
+Both startup paths read `.env` in the current working directory when present, never parent directories. Precedence: explicit CLI > process environment > `.env` > saved SQLite values > defaults. Database keys are never promoted to the external key; blank external values are treated as unset. Listener changes require restart; `CODEBUDDY2API_IMAGE/AUTH_PATH` only affect Compose.
 
 ### Configuration migration
+### Admin password recovery
+
+Use the interactive recovery command with the same data directory as the gateway:
+
+```bash
+uv run --locked --no-build converter.py admin reset-password
+uv run --locked --no-build converter.py admin reset-password --username admin
+```
+
+It prompts twice on a TTY and accepts no password argument. It also works while the service is running; the next management request uses the new account epoch and revokes every existing session. In Docker, run `docker compose exec codebuddy2api python3 converter.py admin reset-password`.
+
 
 `.env` values stay authoritative, so any runtime key listed there occupies its WebUI field. To move them into the configuration store, stop the service and run the offline command; it never edits `.env` itself:
 
@@ -100,7 +110,9 @@ python3 converter.py config migrate --env-file /srv/app/.env --data-dir /srv/app
 python3 converter.py config status --db /srv/app/auth/control.sqlite3   # read-only
 ```
 
-Both commands resolve the env file first, then the data directory it declares (`CODEBUDDY_AUTH_DIR`), so `--data-dir`/`--db` only override the resolved target. Before writing, `migrate` verifies the target really is this project's control store (SQLite header, `user_version=2`, `control`/`runtime_state`/`gateway_secrets`, readable payload, `quick_check`) and refuses while a running instance holds the lease or the write lock; `--force` bypasses the lease warning only. Deployment keys (key, listener, data paths) are never migrated. Inside a container there is no `.env` file, so use the process environment:
+Both commands resolve the env file first, then the data directory it declares (`CODEBUDDY_AUTH_DIR`), so `--data-dir`/`--db` only override the resolved target. Before writing, `migrate` verifies the target really is this project's control store (SQLite header, `user_version=3`, `control`/`runtime_state`/`gateway_secrets`/`api_keys`, readable payload, `quick_check`) and refuses while a running instance holds the lease or the write lock; `--force` bypasses the lease warning only. Deployment keys (key, listener, data paths) are never migrated. Inside a container there is no `.env` file, so use the process environment:
+
+A v2 control database must be opened once by the new service to complete its v3 upgrade before `config migrate` can read it.
 
 ```bash
 docker compose stop
@@ -118,10 +130,9 @@ Release-archive installs and git checkouts can update or roll back in one click 
 
 SQLite state read/validation failures stop startup without deleting sessions or replacing state with empty defaults. Repair the control database before retrying; only rebuildable cache write failures may retain the current in-memory data with a warning.
 
-All runtime logs use `logs.sqlite3`; legacy `--log` / `CODEBUDDY2API_LOG` settings warn and no longer write text files. Generated keys enter private configuration, never logs. Restrict access to the data directory; use a private user directory on Windows.
+All runtime logs use `logs.sqlite3`; legacy `--log` / `CODEBUDDY2API_LOG` settings warn and no longer write text files. Initial passwords go only to the terminal/startup output, and audit stores key IDs rather than key secrets. Restrict access to the data directory; use a private user directory on Windows.
 
-Older versions cannot read the upgraded control database. Downgrades require a stopped gateway and matching state migration, not merely old code reading stale JSON. Never overwrite new claims, dispatches or session revocations with an outdated backup.
-
+Startup upgrades control schema v2 to v3 and migrates the legacy default key. Older versions cannot read the v3 control database; downgrade requires restoring a pre-upgrade backup while stopped, not merely old code reading stale JSON. Never overwrite new claims, dispatches or session revocations with an outdated backup.
 ## Dependency locks
 
 `pyproject.toml` owns direct dependencies; `uv.lock` pins all resolved versions. The hash-locked `requirements.txt` is the generated pip input for Docker and CI:

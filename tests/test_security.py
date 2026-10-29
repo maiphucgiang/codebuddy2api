@@ -19,6 +19,7 @@ from app import credential_io
 from app.credential_io import (
     CredentialFileError, MAX_CREDENTIAL_BYTES, atomic_write_credential, read_import_file,
 )
+from tests.admin_session import direct_request
 
 
 def credential(uid="test-user", token="test-only-token"):
@@ -64,7 +65,7 @@ class SecurityTests(unittest.TestCase):
 
     def post(self, path, authorization=None):
         return asyncio.run(converter.admin_add_credential(
-            Request({"path": path}), authorization or "Bearer synthetic-admin-key", None))
+            direct_request({"path": path}), authorization or "Bearer synthetic-admin-key", None))
 
     def assert_http(self, code, call):
         with self.assertRaises(converter.HTTPException) as caught:
@@ -113,8 +114,8 @@ class SecurityTests(unittest.TestCase):
                 self.assert_http(400, lambda: self.post(value))
         for body in [None, [], "path", 123]:
             self.assert_http(400, lambda: asyncio.run(
-                converter.admin_add_credential(Request(body), "Bearer synthetic-admin-key", None)))
-        request = Mock()
+                converter.admin_add_credential(direct_request(body), "Bearer synthetic-admin-key", None)))
+        request = direct_request()
         async def invalid_json():
             raise ValueError("synthetic-secret")
         request.json = invalid_json
@@ -210,17 +211,39 @@ class SecurityTests(unittest.TestCase):
                 self.assertFalse((self.auth / source.name).exists())
 
     def test_oversized_integer_timestamps_return_400_without_writes(self):
+        from fastapi import FastAPI
         from fastapi.testclient import TestClient
+        from app import admin_account
+        from app.admin_api import install_admin
+        from app.audit_store import AuditStore
+        from app.control_store import ControlStore
+        from app.gateway_management import Management
+        from tests.admin_session import login as session_login
 
-        with TestClient(converter.app) as client, patch.object(converter, "_store_credential") as store:
+        control = ControlStore(self.root / "control.sqlite3")
+        self.addCleanup(control.close)
+        audit = AuditStore(self.root / "audit.sqlite3")
+        self.addCleanup(audit.close)
+        admin_account.save(control, admin_account.new("admin", "synthetic-admin-key", "user"))
+        management = Management(converter)
+        config = {"api_key": "synthetic-admin-key", "cred_pool": self.pool, "cred": None,
+                  "log_path": None, "control_store": control, "state_store": control.state,
+                  "audit_store": audit, "session_path": self.root / "sessions.json",
+                  "management": management}
+        app = FastAPI()
+        app.router.routes = list(converter.app.router.routes)
+        install_admin(app, config, management)
+        with patch.dict(converter.CONFIG, config), \
+                TestClient(app, base_url="https://testserver") as client, \
+                patch.object(converter, "_store_credential") as store:
+            headers = session_login(client, origin="https://testserver", password="synthetic-admin-key")
             for field in ("expiresAt", "lastRefreshTime"):
                 for value in (10**1000, -(10**1000)):
                     with self.subTest(field=field, negative=value < 0):
                         data = credential(token="synthetic-secret")
                         data["auth"][field] = value
                         source = self.source("invalid-time.info", data)
-                        response = client.post("/admin/credentials", json={"path": source.name},
-                                               headers={"Authorization": "Bearer synthetic-admin-key"})
+                        response = client.post("/admin/credentials", json={"path": source.name}, headers=headers)
                         self.assertEqual(response.status_code, 400, response.text)
                         self.assertNotIn("synthetic-secret", response.text)
                         self.assertNotIn(str(self.root), response.text)
@@ -279,21 +302,21 @@ class SecurityTests(unittest.TestCase):
 
     def test_auth_before_body_or_filesystem_access(self):
         converter.CONFIG["api_key"] = "test-only-api-key"
-        request = Mock()
+        request = direct_request(identity=None)
         with patch.object(converter, "read_import_file", side_effect=AssertionError("must not read")):
-            self.assert_http(401, lambda: asyncio.run(
+            self.assert_http(503, lambda: asyncio.run(
                 converter.admin_add_credential(request, None, None)))
             request.json.assert_not_called()
         source = self.source()
         self.post(source.name, "Bearer test-only-api-key")
 
     def test_empty_key_locks_legacy_admin_without_management_middleware(self):
-        request = Mock()
+        request = direct_request(identity=None)
         with patch.dict(converter.CONFIG, {"api_key": ""}):
             self.assert_http(503, lambda: asyncio.run(converter.admin_add_credential(request, None, None)))
             self.assert_http(503, lambda: converter.admin_list_credentials(None, None))
             request.json.assert_not_called()
-            self.assertIsNone(converter._check_auth(None, None))
+            self.assertIsNone(converter._check_auth(None))
 
 
     def test_public_health_never_touches_credentials(self):

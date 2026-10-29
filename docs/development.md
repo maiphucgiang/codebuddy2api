@@ -14,13 +14,13 @@ uv run --locked --no-build python -B -m preview --port 8790 --data-dir /tmp/cb-p
 | Option | Default | Purpose |
 |--------|---------|---------|
 | `--host` / `--port` | `127.0.0.1` / `8790` | Listener |
-| `--api-key` | `preview` | Key for the WebUI and the APIs |
+| `--api-key` | `preview` | External admin inference key and initial WebUI password |
 | `--data-dir` | new temporary directory | Keep the preview data across restarts; the directory must be empty or created by the preview |
 | `--public` | off | Refuse actions unsafe on a shared demo; see [Public deployment](#public-deployment) |
 | `--reset-hours` | `0` (never) | Exit after this many hours so a supervisor restarts with fresh data |
 | other options | — | Passed to the gateway unchanged, such as `--admin-allowed-origins` |
 
-Open `http://127.0.0.1:8790/dashboard` and sign in with the key. For hot reload while editing the frontend, keep the preview running and start the dev server against it:
+Open `http://127.0.0.1:8790/dashboard` and sign in as `admin` with password `preview` (or your `--api-key` value). API clients use that value as the external admin key. The preview also seeds standard keys demonstrating expiry, IP and model restrictions. For hot reload while editing the frontend, keep the preview running and start the dev server against it:
 
 ```bash
 cd web
@@ -82,7 +82,7 @@ services:
       - /tmp:size=256m
 ```
 
-Put a TLS reverse proxy in front of `127.0.0.1:8790` and list its public origin in `--admin-allowed-origins`, otherwise the WebUI sign-in fails the Origin check. The key stays public on purpose; share it with the link.
+Put a TLS reverse proxy in front of `127.0.0.1:8790` and list its public origin in `--admin-allowed-origins`, otherwise the WebUI sign-in fails the Origin check. The demo credentials `admin` / `preview` and the inference key `preview` are public on purpose; share them with the link.
 
 ## Isolation
 

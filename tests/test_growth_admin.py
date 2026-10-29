@@ -14,11 +14,13 @@ from fastapi.testclient import TestClient
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from app import admin_account
 from app.admin_api import install_admin
 from app import growth_tasks
 from app.control_store import ControlStore
 from app.gateway_management import GROWTH_JOBS, Management
 
+from tests.admin_session import login as session_login
 
 class GrowthAdminTests(unittest.TestCase):
     def setUp(self):
@@ -45,10 +47,11 @@ class GrowthAdminTests(unittest.TestCase):
             _save_oauth_credential=Mock(return_value=self.root / "cn.info"), _OAUTH=Mock())
         self.config = {"api_key": "synthetic-key", "control_store": self.store, "max_images": 16,
                        "session_path": self.root / "admin-sessions.json", "audit_store": audit}
+        admin_account.save(self.store, admin_account.new("admin", "synthetic-key", "user"))
         app = FastAPI()
         install_admin(app, self.config, self.gateway)
         self.client = TestClient(app)
-        self.headers = {"Authorization": "Bearer synthetic-key"}
+        self.headers = session_login(self.client)
 
     def growth_tasks(self, identity):
         if identity != "acct":

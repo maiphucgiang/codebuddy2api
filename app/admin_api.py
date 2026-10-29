@@ -5,6 +5,7 @@ from collections import OrderedDict
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import threading
 import time
@@ -17,9 +18,11 @@ from starlette.concurrency import run_in_threadpool
 from starlette.responses import FileResponse, JSONResponse, Response
 
 from . import auth_oauth
+from . import admin_account
+from .api_keys import KeyStore
 from . import perf_metrics
 from . import media_store as media_store_module
-from .admin_auth import AdminAuth, AdminMiddleware, COOKIE_NAME, SESSION_TTL, error_response, same_origin
+from .admin_auth import AdminAuth, AdminMiddleware, COOKIE_NAME, error_response, same_origin
 from .control_store import ConflictError, validate_model
 from .credential_io import CredentialFileError, MAX_CREDENTIAL_BYTES, _valid_name, read_import_file
 from .settings import SCHEMA, resolve_settings, validate_settings
@@ -29,6 +32,12 @@ from .updates import UpdateError
 
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 CLEAR_CONFIRMATION = "清空全部日志与统计"
+
+
+class AdminError(Exception):
+    def __init__(self, status: int, message: str):
+        self.status, self.message = status, message
+        super().__init__(message)
 
 
 async def _body(request, maximum=65536, *, allow_empty=False):
@@ -250,6 +259,8 @@ def install_admin(app, config, gateway):
                 try:
                     result = await function(request)
                     return result
+                except AdminError as exc:
+                    return error_response(exc.status, exc.message)
                 except ConflictError:
                     return error_response(409, "配置已更新，请刷新后重试")
                 except (UpdateError, BackupError) as exc:
@@ -271,19 +282,32 @@ def install_admin(app, config, gateway):
         if auth.csrf_enabled() and not same_origin(request, auth.allowed_origins()):
             return error_response(403, "登录请求 Origin 校验失败")
         data = await _body(request, 8192)
-        result, status = auth.login(request, data.get("api_key"))
+        username = data.get("username")
+        password = data.get("password")
+        if (not isinstance(username, str) or not isinstance(password, str)
+                or type(data.get("remember", False)) is not bool):
+            raise AdminError(400, "用户名、密码或记住我字段无效")
+        result, status = await run_in_threadpool(auth.login, request, username, password, data.get("remember", False))
         if not result:
-            return error_response(status, "登录尝试过多，请稍后重试" if status == 429 else "API key 无效")
+            return error_response(status, "登录尝试过多，请稍后重试" if status == 429 else
+                                  "账户正在变更，请稍后重试" if status == 503 else "用户名或密码错误")
         sid, session = result
-        response = JSONResponse({"authenticated": True, "csrf_token": session["csrf_token"]})
-        response.set_cookie(COOKIE_NAME, sid, max_age=SESSION_TTL, httponly=True, secure=request.url.scheme == "https", samesite="strict", path="/admin")
+        account = auth._account()
+        response = JSONResponse({"authenticated": True, "csrf_token": session["csrf_token"],
+                                 "bootstrap": bool(account and account.bootstrap)})
+        response.set_cookie(COOKIE_NAME, sid,
+                            max_age=(400 * 86400 if session.get("remember") else None),
+                            httponly=True, secure=request.url.scheme == "https", samesite="strict", path="/admin")
         return response
 
     @route("GET", "/admin/session")
     async def session_get(request):
         _, session = auth.session(request)
-        return JSONResponse({"authenticated": bool(session or auth.header_identity(request)),
-                             "csrf_token": session["csrf_token"] if session else None})
+        account = auth._account()
+        authenticated = bool(session)
+        return JSONResponse({"authenticated": authenticated,
+                             "csrf_token": session["csrf_token"] if session else None,
+                             **({"bootstrap": bool(account and account.bootstrap)} if authenticated and account else {})})
 
     @route("DELETE", "/admin/session")
     async def session_delete(request):
@@ -294,6 +318,204 @@ def install_admin(app, config, gateway):
         response = JSONResponse({"authenticated": False})
         response.delete_cookie(COOKIE_NAME, path="/admin", httponly=True, samesite="strict", secure=request.url.scheme == "https")
         return response
+
+    @route("DELETE", "/admin/sessions")
+    async def sessions_delete(request):
+        if not auth.revoke_all():
+            return error_response(503, "会话未能持久撤销，请检查管理目录权限后重试")
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(COOKIE_NAME, path="/admin", httponly=True,
+                              samesite="strict", secure=request.url.scheme == "https")
+        event("sessions_revoked", {})
+        return response
+
+    @route("GET", "/admin/account")
+    async def account_get(request):
+        account = admin_account.load(config["control_store"])
+        if account is None:
+            raise AdminError(503, "管理账户未初始化")
+        return JSONResponse({"username": account.username, "password_source": account.password_source,
+                             "bootstrap": account.bootstrap, "changed_at": account.changed_at})
+
+    @route("PUT", "/admin/account")
+    async def account_put(request):
+        body = await _body(request, 8192)
+        account = admin_account.load(config["control_store"])
+        if account is None or not await run_in_threadpool(auth.check_password, account.username, body.get("current_password")):
+            raise AdminError(403, "当前管理密码错误")
+        try:
+            updated = account
+            if not set(body) <= {"current_password", "username", "new_password"} or not any(
+                    field in body for field in ("username", "new_password")):
+                raise ValueError("至少需要修改用户名或密码")
+            if "username" in body:
+                updated = admin_account.with_username(updated, body["username"])
+            if "new_password" in body:
+                updated = await run_in_threadpool(admin_account.with_password, updated, body["new_password"])
+        except ValueError as error:
+            raise AdminError(400, str(error)) from None
+        _, previous_session = auth.session(request)
+        remember = bool((previous_session or {}).get("remember"))
+        with config["control_store"]._lock:
+            config["control_store"]._db.execute("BEGIN IMMEDIATE")
+            try:
+                current = admin_account.load(config["control_store"])
+                if current is None or current.session_epoch != account.session_epoch:
+                    config["control_store"]._db.execute("ROLLBACK")
+                    raise ConflictError()
+                admin_account.save(config["control_store"], updated)
+                config["control_store"]._db.execute("COMMIT")
+            except BaseException:
+                if config["control_store"]._db.in_transaction:
+                    config["control_store"]._db.execute("ROLLBACK")
+                raise
+        auth.revoke_all()
+        sid, session = auth.issue_session(request, remember=remember)
+        response = JSONResponse({"username": updated.username, "bootstrap": updated.bootstrap,
+                                 "csrf_token": session["csrf_token"]})
+        response.set_cookie(COOKIE_NAME, sid, max_age=(400 * 86400 if session.get("remember") else None),
+                            httponly=True, secure=request.url.scheme == "https", samesite="strict", path="/admin")
+        event("account_changed", {"id": updated.username})
+        return response
+
+    key_store = config.get("key_store")
+    if key_store is None and isinstance(getattr(control, "_db", None), sqlite3.Connection):
+        key_store = KeyStore(control)
+    config["key_store"] = key_store
+
+    def key_public(item, *, secret=None, usage=None):
+        result = {key: item[key] for key in ("id", "name", "type", "prefix", "enabled", "expires_at",
+                                              "rpm", "models", "created_at", "last_used_at", "version")}
+        result["ip_allow"] = item.get("ip_allow")
+        if item["type"] == "standard":
+            result["masked"] = item["secret"][:6] + "…" + item["secret"][-4:] if item.get("secret") else None
+        if secret is not None:
+            result["secret"] = secret
+        if usage is not None:
+            result["usage"] = usage
+        return result
+
+    def normalize_key_models(value):
+        if value is None:
+            return None
+        if not isinstance(value, list) or len(value) > 256 or any(not isinstance(item, str) for item in value):
+            raise AdminError(400, "模型列表格式无效")
+        inventory = gateway.admin_model_inventory()
+        known = set()
+        owners = {}
+        for item in inventory:
+            row = item if isinstance(item, dict) else {"id": item}
+            source = row.get("id")
+            if isinstance(source, str):
+                known.add(source)
+                owners[row.get("public_id", source)] = source
+        known.update(("auto", "default-model"))
+        result = []
+        for name in value:
+            source = "auto" if name == "default-model" else owners.get(name, name)
+            if source not in known:
+                raise AdminError(400, f"未知模型：{name}")
+            if source not in result:
+                result.append(source)
+        return result
+
+    @route("GET", "/admin/keys")
+    async def keys_get(request):
+        usage_result = await run_in_threadpool(audit.api_key_stats)
+        usage = usage_result.get("items", {}) if isinstance(usage_result, dict) and not usage_result.get("degraded") else {}
+        external = None
+        if config.get("api_key"):
+            source = config.get("settings_sources", {}).get("api_key")
+            external = {"type": "admin", "source": "external",
+                        "origin": {"cli": "cli", "environment": "environment", "dotenv": "dotenv"}.get(source, source),
+                        "occupied": True}
+        items = []
+        for item in key_store.list():
+            row = key_public(item, usage=usage.get(item["id"]))
+            if item["type"] == "admin" and config.get("api_key"):
+                row["overridden"] = True
+            items.append(row)
+        return JSONResponse({"external": external, "items": items})
+
+    @route("POST", "/admin/keys")
+    async def keys_create(request):
+        body = await _body(request, 16384)
+        kind = body.get("type")
+        if kind == "admin" and (config.get("api_key") or any(item["type"] == "admin" for item in key_store.list())):
+            raise AdminError(422, "管理密钥已被外部配置占用或已存在")
+        if kind == "admin" and any(field in body for field in ("expires_at", "ip_allow", "rpm", "models")):
+            raise AdminError(400, "管理密钥不接受限制字段")
+        try:
+            item, secret = key_store.create(name=body.get("name"), kind=kind,
+                                            expires_at=body.get("expires_at"), ip_allow=body.get("ip_allow"),
+                                            rpm=body.get("rpm"), models=normalize_key_models(body.get("models")))
+        except ValueError as error:
+            raise AdminError(400, str(error)) from None
+        event("key_created", {"id": item["id"]})
+        return JSONResponse(key_public(item, secret=secret))
+
+    def key_item(request):
+        item = key_store.get(request.path_params["id"])
+        if item is None:
+            raise AdminError(404, "密钥不存在")
+        if item["type"] == "admin" and config.get("api_key"):
+            raise AdminError(403, "密钥已被外部配置覆盖")
+        return item
+
+    @route("PATCH", "/admin/keys/{id}")
+    async def keys_update(request):
+        item = key_item(request)
+        body = await _body(request, 16384)
+        try:
+            updated = key_store.update(item["id"], body.get("version"),
+                                       {key: (normalize_key_models(value) if key == "models" else value)
+                                        for key, value in body.items() if key != "version"})
+        except RuntimeError as error:
+            if str(error) == "version_conflict":
+                raise ConflictError() from None
+            raise
+        except ValueError as error:
+            raise AdminError(400, str(error)) from None
+        event("key_updated", {"id": updated["id"]})
+        return JSONResponse(key_public(updated))
+
+    @route("POST", "/admin/keys/{id}/rotate")
+    async def keys_rotate(request):
+        item = key_item(request)
+        body = await _body(request, 4096, allow_empty=True)
+        try:
+            updated, secret = key_store.rotate(item["id"], body.get("version"))
+        except RuntimeError as error:
+            if str(error) == "version_conflict":
+                raise ConflictError() from None
+            raise
+        event("key_rotated", {"id": item["id"]})
+        return JSONResponse(key_public(updated, secret=secret))
+
+    @route("POST", "/admin/keys/{id}/reveal")
+    async def keys_reveal(request):
+        item = key_item(request)
+        try:
+            secret = key_store.reveal(item["id"])
+        except ValueError as error:
+            raise AdminError(400, str(error)) from None
+        event("key_revealed", {"id": item["id"]})
+        return JSONResponse({"secret": secret})
+
+    @route("DELETE", "/admin/keys/{id}")
+    async def keys_delete(request):
+        item = key_store.get(request.path_params["id"])
+        if item is None:
+            raise AdminError(404, "密钥不存在")
+        body = await _body(request, 4096, allow_empty=True)
+        try:
+            key_store.delete(item["id"], body.get("version"))
+        except RuntimeError as error:
+            if str(error) == "version_conflict":
+                raise ConflictError() from None
+            raise
+        event("key_deleted", {"id": item["id"]})
+        return JSONResponse({"ok": True})
 
     @route("GET", "/admin/settings")
     async def settings_get(request):
@@ -737,8 +959,12 @@ def install_admin(app, config, gateway):
         scope = body.get("scope")
         if scope not in ("details", "all"):
             raise ValueError("清理范围必须为 details 或 all")
-        if scope == "all" and (body.get("confirmation") != CLEAR_CONFIRMATION or not auth.check_key(body.get("api_key"))):
-            return error_response(403, "全部清理需要确认文本及当前 API key")
+        if scope == "all":
+            account = auth._account()
+            confirmed = (auth.check_password(account.username, body.get("password"))
+                         if account is not None else auth.check_key(body.get("api_key")))
+            if body.get("confirmation") != CLEAR_CONFIRMATION or not confirmed:
+                return error_response(403, "全部清理需要确认文本及当前管理密码")
         result = await run_in_threadpool(audit.clear, scope)
         if isinstance(result, dict) and result.get("ok") is False:
             return error_response(503, "日志清理未完成，请检查审计存储状态")
@@ -871,10 +1097,21 @@ def install_admin(app, config, gateway):
     @media_route("GET", "/admin/media/tasks")
     async def media_tasks(request):
         status, cursor, limit = media_page_params(request, status=True)
+        key_id = request.query_params.get("api_key") or None
 
         def build():
-            page = media_store().list_tasks(status, cursor, limit)
-            items = [{**item, "created_at": item["created"], "updated_at": item["updated"]}
+            page = media_store().list_tasks(status, cursor, limit, api_key=key_id)
+            names = {item["id"]: item["name"] for item in key_store.list()}
+            def owner_label(value):
+                if value is None:
+                    return "—（升级前）"
+                if value == "admin-external":
+                    return "外部管理密钥"
+                if value == "anonymous":
+                    return "匿名"
+                return names.get(value, f"{value}（已删除）")
+            items = [{**item, "created_at": item["created"], "updated_at": item["updated"],
+                      "api_key_name": owner_label(item.get("api_key"))}
                      for item in page["items"]]
             return JSONResponse({**page, "items": items})
         return await run_in_threadpool(build)

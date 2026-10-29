@@ -103,7 +103,7 @@ def validate_model(source, rule, models=None, known_models=(), *, legacy_scopes=
 
 
 class ControlStore:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path):
         path = Path(path)
@@ -122,7 +122,7 @@ class ControlStore:
                 self._db.execute("CREATE TABLE control (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, payload TEXT NOT NULL)")
                 self._db.execute("INSERT INTO control VALUES (1,0,?)", (json.dumps({"settings": {}, "models": {}, "credentials": {}}),))
                 self._db.execute("PRAGMA user_version=1")
-            elif version not in (1, self.SCHEMA_VERSION):
+            elif version not in (1, 2, self.SCHEMA_VERSION):
                 raise ValueError("管理数据库 schema 不受支持或已有库为空，未执行初始化")
             self._snapshot = self._load()
             self._db.execute("CREATE TABLE IF NOT EXISTS buddy_bootstrap ("
@@ -158,10 +158,21 @@ class ControlStore:
             self._db.execute("CREATE TABLE IF NOT EXISTS runtime_state (name TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS state_imports (name TEXT PRIMARY KEY, imported INTEGER NOT NULL, migrated_at REAL NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS gateway_secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL, announced INTEGER NOT NULL DEFAULT 0 CHECK(announced IN (0,1)))")
+            self._db.execute("CREATE TABLE IF NOT EXISTS api_keys ("
+                             "id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
+                             "type TEXT NOT NULL CHECK(type IN ('admin','standard')), "
+                             "secret TEXT, secret_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL, "
+                             "enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), "
+                             "expires_at REAL, ip_allow TEXT, rpm INTEGER, models TEXT, "
+                             "created_at REAL NOT NULL, last_used_at REAL, "
+                             "version INTEGER NOT NULL DEFAULT 1)")
+            self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS api_keys_single_admin "
+                             "ON api_keys(type) WHERE type='admin'")
+            self._validate_api_keys_schema()
             # Running-instance lease; heartbeat writes bypass the settings revision on purpose.
             self._db.execute("CREATE TABLE IF NOT EXISTS service_lease (id INTEGER PRIMARY KEY CHECK(id=1), "
                              "pid INTEGER NOT NULL, started_at REAL NOT NULL, heartbeat_at REAL NOT NULL)")
-            self._db.execute("PRAGMA user_version=2")
+            self._db.execute("PRAGMA user_version=3")
             self._db.execute("COMMIT")
         except Exception:
             if self._db.in_transaction:
@@ -170,6 +181,17 @@ class ControlStore:
             raise
         from .state_store import StateStore
         self.state = StateStore(self)
+
+    def _validate_api_keys_schema(self):
+        expected = {"id", "name", "type", "secret", "secret_hash", "prefix", "enabled",
+                    "expires_at", "ip_allow", "rpm", "models", "created_at", "last_used_at", "version"}
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(api_keys)")}
+        if columns != expected:
+            raise ValueError("管理数据库 api_keys 表结构不匹配，请从备份恢复")
+        indexes = {row[1]: row for row in self._db.execute("PRAGMA index_list(api_keys)")}
+        index = indexes.get("api_keys_single_admin")
+        if index is None or not index[2]:
+            raise ValueError("管理数据库 api_keys 索引结构不匹配，请从备份恢复")
 
     def _load(self):
         row = self._db.execute("SELECT revision,payload FROM control WHERE id=1").fetchone()
