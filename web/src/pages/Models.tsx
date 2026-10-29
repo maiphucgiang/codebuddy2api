@@ -67,6 +67,24 @@ export function validateRule(rule: ModelRule, models: ModelRule[]): string | nul
     return "对外 ID 不能包含空白字符";
   if (!validId(rule.public_id)) return "对外 ID 只允许 1–160 位字母、数字及 _ . : / @ -";
   if (!validId(rule.upstream_id ?? rule.id)) return "上游 ID 不能为空，且须为有效模型标识";
+  if (rule.routes) {
+    if (!rule.routes.length) return "路由列表不能为空，删除全部候选请停用模型";
+    const routeIds = new Set<string>();
+    let hasWeight = false;
+    let hasPositive = false;
+    for (const route of rule.routes) {
+      if (!validId(route.upstream_id) || routeIds.has(route.upstream_id))
+        return "路由上游 ID 必须非空且不重复";
+      routeIds.add(route.upstream_id);
+      if (route.weight !== null) {
+        hasWeight = true;
+        if (!Number.isFinite(route.weight) || route.weight < 0 || route.weight > 1000)
+          return "路由权重必须是 0–1000 的有限数字";
+        if (route.weight > 0) hasPositive = true;
+      }
+    }
+    if (hasWeight && !hasPositive) return "加权路由至少需要一条正权重路线";
+  }
   if (
     models.some(
       (m) => m.id !== rule.id && (m.id === rule.public_id || m.public_id === rule.public_id),
@@ -225,6 +243,7 @@ export function ModelEditor({
   const [rule, setRule] = useState({
     ...model,
     upstream_id: model.upstream_id ?? model.id,
+    routes: model.routes?.map((route) => ({ ...route })) ?? [],
     region:
       model.region ||
       (!model.credential_ids.length && profiles.includes(model.profile)
@@ -270,6 +289,7 @@ export function ModelEditor({
       revision,
       public_id: rule.public_id,
       upstream_id: rule.upstream_id,
+      ...(rule.routes?.length ? { routes: rule.routes } : {}),
       enabled: rule.enabled,
       keep_original: rule.keep_original,
       region: rule.region || null,
@@ -353,6 +373,108 @@ export function ModelEditor({
               ))}
             </datalist>
           </div>
+          <fieldset className={s.fieldset}>
+            <legend>多模型路由</legend>
+            <p>
+              可按顺序或权重选择多个上游模型。留空权重时按列表从上到下尝试；关闭路线不会参与派发。
+            </p>
+            {rule.routes.length > 0 && (
+              <div className={s.routePreview}>
+                {rule.routes.map((route, index) => (
+                  <div className={s.routeCandidate} key={`${route.upstream_id}-${index}`}>
+                    <input
+                      value={route.upstream_id}
+                      list={suggestions}
+                      placeholder="上游模型 ID"
+                      onChange={(e) =>
+                        update(
+                          "routes",
+                          rule.routes.map((item, i) =>
+                            i === index ? { ...item, upstream_id: e.target.value } : item,
+                          ),
+                        )
+                      }
+                    />
+                    <input
+                      type="number"
+                      min="0"
+                      max="1000"
+                      step="any"
+                      value={route.weight ?? ""}
+                      placeholder="权重"
+                      onChange={(e) =>
+                        update(
+                          "routes",
+                          rule.routes.map((item, i) =>
+                            i === index
+                              ? {
+                                  ...item,
+                                  weight: e.target.value === "" ? null : Number(e.target.value),
+                                }
+                              : item,
+                          ),
+                        )
+                      }
+                    />
+                    <label className={s.check}>
+                      <input
+                        type="checkbox"
+                        checked={route.enabled}
+                        onChange={(e) =>
+                          update(
+                            "routes",
+                            rule.routes.map((item, i) =>
+                              i === index ? { ...item, enabled: e.target.checked } : item,
+                            ),
+                          )
+                        }
+                      />
+                      启用
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        update(
+                          "routes",
+                          rule.routes.filter((_, i) => i !== index),
+                        )
+                      }
+                    >
+                      删除
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() =>
+                update(
+                  "routes",
+                  rule.routes.length
+                    ? [
+                        ...rule.routes,
+                        {
+                          upstream_id: rule.upstream_id,
+                          weight: null,
+                          enabled: true,
+                          source: "manual",
+                        },
+                      ]
+                    : [
+                        {
+                          upstream_id: rule.upstream_id,
+                          weight: null,
+                          enabled: true,
+                          source: "manual",
+                        },
+                      ],
+                )
+              }
+            >
+              添加路由候选
+            </button>
+          </fieldset>
           <div className={s.actions}>
             <label className={s.check}>
               <input

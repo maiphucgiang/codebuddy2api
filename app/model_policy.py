@@ -1,5 +1,6 @@
 """Local model policies layered over account-owned upstream capabilities."""
 from contextvars import ContextVar
+import threading
 
 from fastapi import HTTPException
 
@@ -7,6 +8,8 @@ from app import growth_tasks, perf_metrics, travel, embeddings
 from app.model_capabilities import route_metadata
 from app.api_keys import api_principal
 _request_policy = ContextVar("gateway_model_policy", default=None)
+_route_counter_lock = threading.Lock()
+_route_counter = 0
 
 
 def _principal():
@@ -126,12 +129,76 @@ def rule_for(config, source, policy=None):
     return {**default_rule(source), **_policy(config, policy)["models"].get(source, {})}
 
 
+def _route_candidates_for_rule(rule: dict, auto_routes=None) -> list[str]:
+    routes = rule.get("routes")
+    if not isinstance(routes, list) and isinstance(auto_routes, list):
+        routes = auto_routes
+    if not isinstance(routes, list):
+        return [rule["upstream_id"]]
+    enabled = [route for route in routes if route.get("enabled", True)]
+    if not enabled:
+        return []
+    weighted = any(route.get("weight") is not None for route in enabled)
+    if not weighted:
+        return [route["upstream_id"] for route in enabled]
+    weights = [route.get("weight") if route.get("weight") is not None else 1.0 for route in enabled]
+    total = sum(weights)
+    if total <= 0:
+        return []
+    global _route_counter
+    with _route_counter_lock:
+        offset = (_route_counter * 1000) % max(1, int(round(total * 1000)))
+        _route_counter += 1
+    cursor = 0
+    selected = 0
+    for index, weight in enumerate(weights):
+        cursor += int(round(weight * 1000))
+        if offset < cursor:
+            selected = index
+            break
+    return [enabled[selected]["upstream_id"]] + [route["upstream_id"] for i, route in enumerate(enabled) if i != selected]
+
+
+def route_candidates(config, public_model: str, policy=None) -> list[str]:
+    """Return enabled upstream candidates, preserving order or applying route weights."""
+    state = _request_policy.get()
+    if state and public_model in (state.get("public_model"), state.get("upstream")):
+        return list(state.get("route_candidates") or ())
+    source = source_for(config, public_model)
+    return _route_candidates_for_rule(rule_for(config, source, policy),
+                                      (config.get("model_route_groups") or {}).get(source))
+
+
+def route_ids(config, public_model: str, policy=None) -> list[str]:
+    """Return all enabled route IDs without applying weighted selection."""
+    source = source_for(config, public_model)
+    rule = rule_for(config, source, policy)
+    routes = rule.get("routes")
+    if not isinstance(routes, list):
+        routes = (config.get("model_route_groups") or {}).get(source)
+    if not isinstance(routes, list):
+        return [rule["upstream_id"]]
+    return [route["upstream_id"] for route in routes if route.get("enabled", True)]
+
+
+def bind_route(config, upstream: str, index: int | None = None) -> None:
+    """Bind a retry attempt to one upstream while retaining the aggregate policy rule."""
+    state = _request_policy.get()
+    if state is not None:
+        state["upstream"] = upstream
+        if index is not None:
+            state["route_index"] = index
+
+
 def source_for(config, name):
     """Resolve a public model name or automatic alias to its policy source."""
     if name == "default-model":
         return "auto"
     if name in (embeddings.MODEL_ID, embeddings.PUBLIC_MODEL_ID):
         return embeddings.MODEL_ID
+    aliases = config.get("model_route_aliases") or {}
+    if name in aliases and name not in snapshot(config).get("models", {}):
+        return aliases[name]
     data = snapshot(config)
     for source, rule in data.get("models", {}).items():
         if rule.get("public_id", source) == name:
@@ -192,12 +259,16 @@ def resolve(config, public_model):
         _deny("模型已停用")
     if source == public_model and (rule["custom"] or (rule["public_id"] != source and not rule["keep_original"])):
         _deny("原模型 ID 已停用，请使用已配置的对外 ID", "model_renamed")
-    if state is None and rule["upstream_id"] != source:
+    candidates = _route_candidates_for_rule(rule, (config.get("model_route_groups") or {}).get(source))
+    if state is None and (not candidates or candidates[0] != source) and rule["upstream_id"] != source:
         raise HTTPException(status_code=503, detail={"error": {"message": "模型路由上下文未初始化",
                             "type": "server_error", "code": "model_policy_context_missing"}})
+    if not candidates:
+        _deny("模型路由已全部停用")
     if state is not None:
-        state.update(source=source, public_model=public_model, upstream=rule["upstream_id"], rule=rule)
-    return rule["upstream_id"]
+        state.update(source=source, public_model=public_model, upstream=candidates[0],
+                     route_candidates=candidates, route_index=0, rule=rule)
+    return candidates[0]
 
 
 def check_resolved(config, upstream):
@@ -257,10 +328,15 @@ def public_details(gateway, region=None):
     entries = pool.entries() if pool is not None else []
     out = []
     for source in dict.fromkeys([*known, *policies]):
+        if source in (config.get("model_route_aliases") or {}) and source not in policies:
+            continue
         rule = rule_for(config, source, policy)
         upstream = rule["upstream_id"]
-        item = known.get(upstream)
+        route_names = route_ids(config, source, policy)
+        item = next((known.get(route) for route in route_names if known.get(route) is not None), None)
         if not rule["enabled"] or item is None:
+            continue
+        if not route_names:
             continue
         media = bool(item.get("media_kinds"))
         embedding = bool(item.get("embedding"))
@@ -337,6 +413,8 @@ def public_details(gateway, region=None):
             best = min(prices.values(), default=None)
             row = {"id": name, "credits": best, "credits_by_profile": prices,
                    **route_metadata(gateway, upstream, entries=candidates, rule=rule, region=region)}
+            if source in (config.get("model_route_groups") or {}) and "routes" not in rule:
+                row["routes"] = config["model_route_groups"][source]
             for key in ("media_kinds", "media_sources", "media_defaults", "embedding", "rerank"):
                 if key in item:
                     row[key] = item[key]

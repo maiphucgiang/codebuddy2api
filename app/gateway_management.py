@@ -372,9 +372,12 @@ class Management:
             rates = model_rates.details(self.gateway, upstream, sorted(served.get(upstream, ())))
             for profile, value in (declared.get(upstream) or {}).items():
                 rates[profile]["declared"] = value
-            result.append({**target, **metadata, **prices, **rule, "id": source, "rate_details": rates,
-                           "available_credentials": len(preview["candidates"]),
-                           "available": bool(preview["candidates"])})
+            row = {**target, **metadata, **prices, **rule, "id": source, "rate_details": rates,
+                   "available_credentials": len(preview["candidates"]),
+                   "available": bool(preview["candidates"])}
+            if "routes" not in rule and source in (self.CONFIG.get("model_route_groups") or {}):
+                row["routes"] = self.CONFIG["model_route_groups"][source]
+            result.append(row)
         return sorted(result, key=lambda row: row["id"])
 
     def admin_rate_probe_model(self, source):

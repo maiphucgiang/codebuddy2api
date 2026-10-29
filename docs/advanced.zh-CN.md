@@ -239,6 +239,10 @@ WebUI 可以直接上传文件；以下限制针对 `POST /admin/credentials` �
 
 标准模型字段之外，`credits` 是各来源最低倍率：`0.0` 表示该来源零倍率，`null` 表示未声明可解析倍率。`credits_by_profile` 提供来源明细，例如 `{"intl-work":0.0,"cn-cli":0.03}`；兼容客户端可忽略这些扩展字段，倍率不保证永久不变。
 
+模型规则可以增加有序的 `routes` 列表。每项包含 `upstream_id`、可选 `weight`、`enabled` 和 `source`（`builtin`、`cloud` 或 `manual`）。权重都留空时按列表顺序故障切换；填写权重时先按权重选路，再进入原有账号调度。关闭的路线会跳过，全部关闭时公开模型不可用。没有 `routes` 的旧规则继续使用单个 `upstream_id`。
+
+云端目录变体只有在区域、声明倍率、上下文、输出、图片/思考/工具能力及思考元数据都一致时才会自动合并。已保存的手工 `routes` 列表优先于自动分组。
+
 凭据 domain / token issuer 决定产品身份，聊天与刷新使用各自固定入口及独立产品头：
 
 | Profile | 聊天 / 刷新入口 |
