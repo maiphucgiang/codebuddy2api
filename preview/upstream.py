@@ -20,7 +20,7 @@ import zlib
 
 import httpx
 
-from app import media_generation
+from app import embeddings as embedding_contract, media_generation, rerank as rerank_contract
 from app.site_routing import DOMAIN_PROFILES, PROFILE_DOMAINS
 from preview.seed import (ACCOUNTS, CN_MODELS, COS_HOST, DAY, INTL_MODELS, MP4_BYTES, PNG_BYTES,
                           SEED_VIDEO_TASK_ID, Account)
@@ -163,6 +163,10 @@ class Upstream:
             "/v2/billing/meter/daily-checkin": self.checkin,
             "/billing/ide/trial": self.trial,
             "/v2/chat/completions": self.chat,
+            "/v2/embeddings": self.embeddings,
+            "/codebase/openai/v1/models": self.codebase_models,
+            "/codebase/openai/v1/embeddings": self.codebase_embeddings,
+            "/codebase/openai/v1/rerank": self.codebase_rerank,
             "/console/chat/completions": self.chat,
             "/agenttool/v1/search": self.search,
             "/agenttool/v1/webfetch": self.webfetch,
@@ -446,6 +450,61 @@ class Upstream:
                               "content": f"# 预览环境为 {url} 生成的抓取内容。\n\n正文摘要。",
                               "content_type": "text/markdown", "content_length": 64,
                               "truncated": False, "status_code": 200})
+
+    def codebase_models(self, request, body, state):
+        return Reply(payload={"object": "list", "data": [
+            {"id": name, "object": "model"} for name in (
+                "model1", "model2", embedding_contract.QWEN_MODEL_ID)]})
+
+    def codebase_embeddings(self, request, body, state):
+        if body.get("model") not in ("model1", "model2", embedding_contract.QWEN_MODEL_ID):
+            return fail(400, "route config not found")
+        raw = body.get("input")
+        items = [raw] if isinstance(raw, str) or (isinstance(raw, list) and all(type(v) is int for v in raw)) else raw
+        if not isinstance(items, list) or not items:
+            return fail(400, "invalid embedding input")
+        data = []
+        for index, item in enumerate(items):
+            vector = [0.0] * embedding_contract.DIMENSIONS
+            vector[0], vector[1] = float(index), float(len(item) % 997) / 997
+            data.append({"object": "embedding", "index": index, "embedding": vector})
+        return Reply(payload={"object": "list", "data": data, "model": body["model"],
+                              "usage": {"prompt_tokens": 0, "total_tokens": 0, "credit": 0}})
+
+    def codebase_rerank(self, request, body, state):
+        query = body.get("query")
+        documents = body.get("documents")
+        if not isinstance(query, str) or not query.strip():
+            return fail(400, "invalid query", code=10001)
+        if (not isinstance(documents, list) or not 1 <= len(documents) <= rerank_contract.MAX_DOCUMENTS
+                or any(not isinstance(document, str) for document in documents)):
+            return fail(400, "documents exceeds maximum allowed (100)", code=10001)
+        top_n = body.get("top_n", len(documents))
+        if type(top_n) is not int or not 1 <= top_n <= len(documents):
+            return fail(400, "invalid top_n", code=10001)
+        terms = set(query.lower().split())
+        ranked = sorted(range(len(documents)),
+                        key=lambda index: (-len(terms.intersection(documents[index].lower().split())), index))
+        return Reply(payload={"output": {"results": [{"index": index} for index in ranked[:top_n]]},
+                              "request_id": "0" * 32, "usage": {"total_tokens": 0}})
+
+    def embeddings(self, request, body, state):
+        if body.get("model") != embedding_contract.MODEL_ID:
+            return fail(400, "route config not found")
+        raw = body.get("input")
+        items = [raw] if isinstance(raw, str) or (isinstance(raw, list) and all(type(v) is int for v in raw)) else raw
+        if not isinstance(items, list) or not items:
+            return fail(400, "invalid embedding input")
+        tokens = sum(max(1, len(item) // 4) if isinstance(item, str) else len(item) for item in items)
+        credit = round(tokens / 1000 * 0.01, 6)
+        self._charge(state, credit)
+        data = []
+        for index, item in enumerate(items):
+            vector = [0.0] * embedding_contract.DIMENSIONS
+            vector[0], vector[1] = float(index), float(len(item) % 997) / 997
+            data.append({"object": "embedding", "index": index, "embedding": vector})
+        return Reply(payload={"object": "list", "data": data, "model": embedding_contract.MODEL_ID,
+                              "usage": {"prompt_tokens": tokens, "total_tokens": tokens, "credit": credit}})
 
     # -- media generation ----------------------------------------------------------------
 

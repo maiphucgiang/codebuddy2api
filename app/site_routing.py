@@ -16,6 +16,8 @@ PROFILE_ENDPOINTS = {
     "intl-cli": INTERNATIONAL_ENDPOINT,
     "intl-work": "https://www.workbuddy.ai",
 }
+# The paid bge-m3 endpoint is verified on WorkBuddy CN for both domestic products.
+EMBEDDING_ENDPOINTS = {"cn-cli": "https://www.workbuddy.cn", "cn-work": "https://www.workbuddy.cn"}
 DOMAIN_PROFILES = {
     "www.codebuddy.cn": "cn-cli",
     "www.workbuddy.cn": "cn-work",
@@ -153,6 +155,27 @@ def media_url_for_headers(headers: dict, path: str) -> str:
     """Map one media endpoint path onto the credential's fixed product endpoint."""
     return PROFILE_ENDPOINTS[profile_for_headers(headers)] + path
 
+
+def codebase_url_for_headers(headers: dict, operation: str) -> str:
+    profile = profile_for_headers(headers)
+    if profile not in EMBEDDING_ENDPOINTS:
+        raise ValueError("Unsupported codebase profile")
+    return PROFILE_ENDPOINTS[profile] + "/codebase/openai/v1/" + operation
+
+
+def embedding_url_for_headers(headers: dict) -> str:
+    return codebase_url_for_headers(headers, "embeddings")
+
+
+def paid_embedding_url_for_headers(headers: dict) -> str:
+    profile = profile_for_headers(headers)
+    if profile not in EMBEDDING_ENDPOINTS:
+        raise ValueError("Unsupported embedding profile")
+    return EMBEDDING_ENDPOINTS[profile] + "/v2/embeddings"
+
+
+def rerank_url_for_headers(headers: dict) -> str:
+    return codebase_url_for_headers(headers, "rerank")
 
 def refresh_url_for_auth(auth: dict) -> str:
     return PROFILE_ENDPOINTS[profile_for_auth(auth)] + _REFRESH_PATH

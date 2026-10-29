@@ -109,8 +109,9 @@ from app.startup import capture_launch, load_startup_env, restart_process, run_s
 from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
                               profile_for_auth, profile_for_headers, profile_region, profile_product,
                               profile_site, chat_url_for_headers, search_url_for_headers, fetch_url_for_headers,
-                              refresh_url_for_auth, media_url_for_headers)
-from app import dsml, mcp_server, server_tools, web_fetch, web_search, media_generation, media_store
+                              refresh_url_for_auth, media_url_for_headers, embedding_url_for_headers,
+                              paid_embedding_url_for_headers, rerank_url_for_headers)
+from app import dsml, mcp_server, server_tools, web_fetch, web_search, media_generation, media_store, embeddings, rerank
 from app.inbound_limits import anthropic_path
 from app.client_profiles import (CLI_VERSION, CLI_USER_AGENT, credential_headers, credential_refresh_headers,
                                  catalog_cache_key, account_key, canonical_uid, enterprise_id_of, identity_email,
@@ -4008,6 +4009,15 @@ def guard_model(name: str, *, region=None, resolved=False) -> None:
     if not resolved:
         name = model_policy.resolve(CONFIG, name)
     model_policy.check_resolved(CONFIG, name)
+    if embeddings.is_embedding_model(name):
+        public = model_policy.default_rule(name)["public_id"]
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": f"{public} 是向量模型，请使用 /v1/embeddings",
+            "type": "invalid_request_error", "code": "embedding_model_not_chat", "param": "model"}})
+    if rerank.is_rerank_model(name):
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "reranker 是重排序模型，请使用 /v1/rerank",
+            "type": "invalid_request_error", "code": "rerank_model_not_chat", "param": "model"}})
     if not CONFIG.get("model_guard"):
         return
     if _model_profiles(name, region):
@@ -4028,13 +4038,350 @@ def list_models(request: Request, authorization: Optional[str] = Header(default=
     data = [{"id": item["id"], "object": "model", "created": 1700000000, "owned_by": "codebuddy",
              "credits": item["credits"], "credits_by_profile": item["credits_by_profile"],
              **{key: item[key] for key in ("credits_estimated", "capabilities", "limits", "metadata_by_profile",
-                                  "media_kinds", "media_sources", "media_defaults")
+                                  "media_kinds", "media_sources", "media_defaults", "embedding", "rerank")
                 if key in item}}
             for item in model_policy.public_details(sys.modules[__name__])
             if principal is None or principal.models is None
             or model_policy.source_for(CONFIG, item["id"]) in principal.models]
     return {"object": "list", "data": data}
 
+
+
+EMBEDDING_TIMEOUT = 60.0
+EMBEDDING_MAX_INFLIGHT_PER_ACCOUNT = 16
+_EMBEDDING_ROUTE_REFUSED = re.compile(r"route config not found|model .{0,80}(?:not found|not supported|not served)", re.I)
+
+
+def embedding_model_details() -> list:
+    return embeddings.model_details()
+
+
+def rerank_model_details() -> list:
+    return [rerank.model_details()]
+
+
+def _codebase_account_reason(entry, model, *, rule=None, policy=None, region=None):
+    pool = CONFIG.get("cred_pool")
+    profile = CredentialPool._entry_profile(entry)
+    if not model_policy.credential_enabled(CONFIG, entry, policy):
+        return "人工停用"
+    rule = rule or model_policy.active_rule(CONFIG, model, policy)
+    if not rule.get("enabled", True):
+        return "模型已停用"
+    if not model_policy.route_allowed(CONFIG, entry, model, rule=rule, policy=policy):
+        return "不在绑定范围"
+    if profile not in embeddings.PROFILES:
+        return "产品不支持 codebase 服务"
+    if region and not _in_region(profile, region):
+        return "不在区域范围"
+    if pool is not None:
+        if not pool._healthy(entry, policy):
+            return "认证熔断"
+        if not pool._model_healthy(entry, model):
+            return "模型额度冷却"
+        if not pool._model_servable(entry, model):
+            return "后端模型暂时不可用"
+        if not pool._has_credit(entry, profile):
+            return "额度不足或未知"
+    return None
+
+
+def _embedding_cred_for(model, tried=(), *, kind="embedding"):
+    pool = CONFIG.get("cred_pool")
+    if pool is None:
+        cm = CONFIG.get("cred")
+        if cm is None or cm in {_cred_manager(item) for item in tried}:
+            raise HTTPException(status_code=503, detail={"error": {
+                "message": f"未找到可用的 {kind} 凭证", "type": "auth_error"}})
+        with cm._lock:
+            headers = cm.get_headers()
+        profile = profile_for_headers(headers)
+        if profile not in embeddings.PROFILES:
+            raise HTTPException(status_code=503, detail={"error": {
+                "message": f"当前凭证产品不支持 {kind}", "type": "auth_error"}})
+        identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
+        entry = {"profile": profile, "account_key": identity}
+        if not model_policy.route_allowed(CONFIG, entry, model):
+            raise HTTPException(status_code=503, detail={"error": {
+                "message": f"当前凭证不在 {kind} 模型路由范围内", "type": "service_unavailable",
+                "code": f"no_{kind}_account"}})
+        _apply_session_headers(headers, profile, None, current_context())
+        return cm, headers
+
+    policy = model_policy.view(CONFIG)
+    excluded = {_cred_manager(item) for item in tried}
+    with pool._lock:
+        candidates = [entry for entry in pool._entries
+                      if entry["cm"] not in excluded
+                      and _codebase_account_reason(entry, model, policy=policy) is None]
+    if not candidates:
+        raise HTTPException(status_code=503, detail={"error": {
+            "message": f"没有符合 {kind} 路由条件的国内账号", "type": "service_unavailable",
+            "code": f"no_{kind}_account"}})
+    busy = False
+    for entry in candidates:
+        cm = entry["cm"]
+        try:
+            with cm._lock:
+                headers = cm.get_headers()
+                generation = cm._generation
+        except Exception as error:
+            pool.cooldown(cm, reason=str(error), generation=cm._generation)
+            continue
+        profile = profile_for_headers(headers)
+        lease = pool._capacity.acquire(pool._capacity_key(entry),
+                                       EMBEDDING_MAX_INFLIGHT_PER_ACCOUNT, cm, generation)
+        if lease is None:
+            busy = True
+            continue
+        resources = request_resources.get()
+        if resources is not None:
+            resources.add(lease)
+        _apply_session_headers(headers, profile, None, current_context())
+        return lease, headers
+    if busy:
+        raise HTTPException(status_code=503, headers={"Retry-After": "3"}, detail={"error": {
+            "message": f"{kind} 账号在途名额已满，请稍后重试", "type": "service_unavailable",
+            "code": "credential_concurrency_limit"}})
+    raise HTTPException(status_code=503, detail={"error": {
+        "message": f"{kind} 账号暂时不可用，请稍后重试", "type": "service_unavailable"}})
+
+
+def _embedding_replayable(error) -> bool:
+    if isinstance(error, UpstreamHTTPError):
+        code = _upstream_diagnostic(error.raw)[0]
+        if error.status in (400, 404):
+            raw = error.raw.decode("utf-8", "replace") if error.raw else ""
+            return (_parse_not_servable(error.raw, error.status) is not None
+                    or bool(_EMBEDDING_ROUTE_REFUSED.search(raw)))
+        return error.status in (401, 403, 429) and code not in NO_FAILOVER_UPSTREAM_CODES
+    return isinstance(error, REPLAYABLE_TRANSPORT)
+
+
+async def _embedding_call(body, rid, *, model, public_model, encoding, expected_count,
+                          use_codebase=True):
+    """Run codebase embeddings with a bounded paid fallback for bge-m3."""
+    tried = []
+    recovered = None
+    owned = True
+    cred = headers = None
+    while True:
+        if owned and cred is None:
+            cred, headers = await run_in_threadpool(_embedding_cred_for, model, tried)
+        profile = profile_for_headers(headers)
+        upstream_body = {**body, "model": embeddings.codebase_model(model)} if use_codebase else body
+        url = embedding_url_for_headers(headers) if use_codebase else paid_embedding_url_for_headers(headers)
+        observe_route(public_model=model_policy.public_name(public_model),
+                      upstream_model=upstream_body["model"],
+                      profile=profile, credential=account_key(
+                          profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")))
+        t0 = time.time()
+        released = False
+        try:
+            async with _backend_stream(url, headers, upstream_body, timeout=EMBEDDING_TIMEOUT,
+                                       rid=rid, model_name="embeddings") as response:
+                if response.status_code != 200:
+                    raw = await read_bounded_error(response)
+                    code, message, error_body = _upstream_diagnostic(raw)
+                    observe_attempt("upstream_error", status_code=response.status_code,
+                                    upstream_code=code, upstream_msg=message)
+                    if response.status_code in (401, 403, 429) or (response.status_code == 404 and not use_codebase):
+                        _note_cred_status(cred, response.status_code, model=model, raw=raw,
+                                          retry_after=parse_retry_after(response.headers.get("Retry-After")))
+                    raise UpstreamHTTPError(
+                        response.status_code, raw,
+                        retry_after=parse_retry_after(response.headers.get("Retry-After")))
+                raw = await response.aread()
+            try:
+                result = embeddings.parse_reply(
+                    json.loads(raw.decode("utf-8", "replace")), public_model, encoding, expected_count)
+            except embeddings.EmbeddingUpstreamError as error:
+                observe_failure("embedding_upstream_refused")
+                _media_note_restriction(cred, error.upstream_code, _upstream_diagnostic(raw)[2])
+                raise HTTPException(status_code=502, detail={"error": {
+                    "message": f"上游 embedding 接口返回错误 {error.upstream_code}：{error.message}",
+                    "type": "upstream_error", "upstream_code": error.upstream_code}}) from None
+            except ValueError as error:
+                observe_failure("bad_embedding_response")
+                raise HTTPException(status_code=502, detail={"error": {
+                    "message": str(error), "type": "upstream_error"}}) from None
+        except (httpx.HTTPError, UpstreamResponseError) as error:
+            status, raw = _upstream_failure(error, "embeddings", t0, rid)
+            if use_codebase and model == embeddings.MODEL_ID and (
+                    isinstance(error, httpx.ConnectError)
+                    or (isinstance(error, UpstreamHTTPError) and error.status in (404, 501))):
+                release_credential(cred)
+                released = True
+                _log(f"[{rid}] ↻ codebase embedding 路由不可用，回退 /v2/embeddings")
+                return await _embedding_call(body, rid, model=model, public_model=public_model,
+                                             encoding=encoding, expected_count=expected_count,
+                                             use_codebase=False)
+            recovered = observe_failure_seq()
+            tried.append(cred)
+            surface = HTTPException(
+                status_code=status,
+                headers={"Retry-After": str(error.retry_after)} if getattr(error, "retry_after", None) else None,
+                detail=_safe_err_raw(raw, status))
+            limit = _failover_limit()
+            if limit <= 0 or len(tried) > limit or not _embedding_replayable(error):
+                raise surface from None
+            _log(f"[{rid}] ↻ embedding 换号重放 {len(tried)}/{limit} | 上游 HTTP {status}")
+            release_credential(cred)
+            released = True
+            try:
+                cred, headers = await run_in_threadpool(_embedding_cred_for, model, tried)
+            except HTTPException:
+                raise surface from None
+            owned = True
+            continue
+        finally:
+            if owned and not released:
+                release_credential(cred)
+        if tried:
+            observe_recovery(recovered)
+        _note_cred_model_ok(cred, model)
+        _log(f"[{rid}] ✔ EMBEDDINGS | {profile} | {model} | {time.time() - t0:.1f}s")
+        return result
+
+
+@app.post("/v1/embeddings")
+async def create_embeddings(request: Request,
+                            authorization: Optional[str] = Header(default=None),
+                            x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    _check_auth(request)
+    try:
+        payload = await request.json()
+    except Exception as error:
+        raise _bad_json(error) from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}})
+    requested_model = payload.get("model")
+    model = model_policy.resolve(CONFIG, requested_model)
+    model_policy.check_resolved(CONFIG, model)
+    if not embeddings.is_embedding_model(model):
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": f"模型 {model} 不是 embedding 模型，请选择 /v1/models 中的向量模型",
+            "type": "invalid_request_error", "code": "model_not_embedding", "param": "model"}})
+    try:
+        body, encoding, expected_count = embeddings.request_body(payload, model)
+    except embeddings.EmbeddingRequestError as error:
+        detail = {"message": str(error), "type": "invalid_request_error"}
+        if error.param:
+            detail["param"] = error.param
+        raise HTTPException(status_code=400, detail={"error": detail}) from None
+    rid = _request_id()
+    _log(f"[{rid}] ▶ EMBEDDINGS | {requested_model} | inputs={expected_count} | encoding={encoding}")
+    result = await _embedding_call(body, rid, model=model, public_model=requested_model,
+                                   encoding=encoding, expected_count=expected_count)
+    return JSONResponse(content=result)
+
+
+async def _rerank_call(body, rid, *, model, public_model, documents, top_n, return_documents):
+    tried = []
+    recovered = None
+    owned = True
+    cred = headers = None
+    while True:
+        if owned and cred is None:
+            cred, headers = await run_in_threadpool(_embedding_cred_for, model, tried, kind="rerank")
+        profile = profile_for_headers(headers)
+        url = rerank_url_for_headers(headers)
+        observe_route(public_model=model_policy.public_name(public_model), upstream_model=model,
+                      profile=profile, credential=account_key(
+                          profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")))
+        t0 = time.time()
+        released = False
+        try:
+            async with _backend_stream(url, headers, body, timeout=EMBEDDING_TIMEOUT,
+                                       rid=rid, model_name="rerank") as response:
+                if response.status_code != 200:
+                    raw = await read_bounded_error(response)
+                    code, message, error_body = _upstream_diagnostic(raw)
+                    observe_attempt("upstream_error", status_code=response.status_code,
+                                    upstream_code=code, upstream_msg=message)
+                    if response.status_code in (401, 403, 404, 429):
+                        _note_cred_status(cred, response.status_code, model=model, raw=raw,
+                                          retry_after=parse_retry_after(response.headers.get("Retry-After")))
+                    raise UpstreamHTTPError(
+                        response.status_code, raw,
+                        retry_after=parse_retry_after(response.headers.get("Retry-After")))
+                raw = await response.aread()
+            try:
+                result = rerank.parse_reply(
+                    json.loads(raw.decode("utf-8", "replace")), documents, top_n, return_documents)
+                result["model"] = public_model
+            except rerank.RerankUpstreamError as error:
+                observe_failure("rerank_upstream_refused")
+                _media_note_restriction(cred, error.upstream_code, _upstream_diagnostic(raw)[2])
+                raise HTTPException(status_code=502, detail={"error": {
+                    "message": f"上游 rerank 接口返回错误 {error.upstream_code}：{error.message}",
+                    "type": "upstream_error", "upstream_code": error.upstream_code}}) from None
+            except ValueError as error:
+                observe_failure("bad_rerank_response")
+                raise HTTPException(status_code=502, detail={"error": {
+                    "message": str(error), "type": "upstream_error"}}) from None
+        except (httpx.HTTPError, UpstreamResponseError) as error:
+            status, raw = _upstream_failure(error, "rerank", t0, rid)
+            recovered = observe_failure_seq()
+            tried.append(cred)
+            surface = HTTPException(
+                status_code=status,
+                headers={"Retry-After": str(error.retry_after)} if getattr(error, "retry_after", None) else None,
+                detail=_safe_err_raw(raw, status))
+            limit = _failover_limit()
+            if limit <= 0 or len(tried) > limit or not _embedding_replayable(error):
+                raise surface from None
+            _log(f"[{rid}] ↻ rerank 换号重放 {len(tried)}/{limit} | 上游 HTTP {status}")
+            release_credential(cred)
+            released = True
+            try:
+                cred, headers = await run_in_threadpool(_embedding_cred_for, model, tried, kind="rerank")
+            except HTTPException:
+                raise surface from None
+            owned = True
+            continue
+        finally:
+            if owned and not released:
+                release_credential(cred)
+        if tried:
+            observe_recovery(recovered)
+        _note_cred_model_ok(cred, model)
+        _log(f"[{rid}] ✔ RERANK | {profile} | {model} | {time.time() - t0:.1f}s")
+        return result
+
+
+@app.post("/v1/rerank")
+async def create_rerank(request: Request,
+                        authorization: Optional[str] = Header(default=None),
+                        x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    _check_auth(request)
+    try:
+        payload = await request.json()
+    except Exception as error:
+        raise _bad_json(error) from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}})
+    requested_model = payload.get("model") or rerank.MODEL_ID
+    model = model_policy.resolve(CONFIG, requested_model)
+    model_policy.check_resolved(CONFIG, model)
+    if not rerank.is_rerank_model(model):
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": f"模型 {model} 不是重排序模型，请使用 reranker",
+            "type": "invalid_request_error", "code": "model_not_rerank", "param": "model"}})
+    try:
+        body, documents, top_n, return_documents = rerank.request_body(payload)
+    except rerank.RerankRequestError as error:
+        detail = {"message": str(error), "type": "invalid_request_error"}
+        if error.param:
+            detail["param"] = error.param
+        raise HTTPException(status_code=400, detail={"error": detail}) from None
+    rid = _request_id()
+    _log(f"[{rid}] ▶ RERANK | {requested_model} | documents={len(documents)} | top_n={top_n}")
+    result = await _rerank_call(body, rid, model=model, public_model=requested_model,
+                                documents=documents, top_n=top_n, return_documents=return_documents)
+    return JSONResponse(content=result)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request,

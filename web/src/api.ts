@@ -267,6 +267,8 @@ export type ModelRule = {
   media_kinds?: string[];
   media_sources?: string[];
   media_defaults?: string[];
+  embedding?: boolean;
+  rerank?: boolean;
 };
 function rateOverride(value: unknown): Record<string, number> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;

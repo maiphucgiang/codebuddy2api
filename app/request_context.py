@@ -12,7 +12,8 @@ import uuid
 # performs token estimation only and must not claim an upstream session.
 PATHS = {"/v1/chat/completions": "chat", "/v1/responses": "responses", "/v1/messages": "messages",
          "/v1/search": "search", "/v1/fetch": "fetch", "/v1/mcp": "mcp",
-         "/v1/images/generations": "images", "/v1/images/edits": "images", "/v1/videos": "videos"}
+         "/v1/images/generations": "images", "/v1/images/edits": "images", "/v1/videos": "videos",
+         "/v1/embeddings": "embeddings", "/v1/rerank": "rerank"}
 _SCOPE_KEY = "codebuddy.request_context"
 _current = ContextVar("request_context", default=None)
 
