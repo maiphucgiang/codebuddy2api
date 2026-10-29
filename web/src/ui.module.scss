@@ -2972,6 +2972,31 @@ $white: var(--page);
   color: $ink;
   overflow-wrap: anywhere;
 }
+.routeSummary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 5px;
+}
+.routeSummaryLabel {
+  color: $muted;
+  font-size: 11px;
+}
+.routePill {
+  max-width: 100%;
+  padding: 2px 6px;
+  border: 1px solid #9fbc9a;
+  border-radius: 999px;
+  color: $ink;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.routeDisabled {
+  border-color: #d2b4a7;
+  color: $muted;
+  text-decoration: line-through;
+}
 .modelMetadata {
   padding: 0 22px 18px;
   min-width: 0;

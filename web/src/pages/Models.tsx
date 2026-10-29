@@ -1057,6 +1057,21 @@ export function Models() {
                           </div>
                           <small className={s.mono}>{m.upstream_id ?? m.id}</small>
                           {modelDisplayName(m) && <small>{modelDisplayName(m)}</small>}
+                          {m.routes && m.routes.length > 1 && (
+                            <div className={s.routeSummary} aria-label="模型路由">
+                              <span className={s.routeSummaryLabel}>路由</span>
+                              {m.routes.map((route) => (
+                                <span
+                                  className={`${s.routePill} ${route.enabled ? "" : s.routeDisabled}`}
+                                  key={`${route.source}-${route.upstream_id}`}
+                                  title={`${route.source} · ${route.enabled ? "启用" : "已关闭"}`}
+                                >
+                                  {route.upstream_id}
+                                  {route.weight !== null ? ` · ${route.weight}` : ""}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                           {m.keep_original && <small>同时保留 {m.id}</small>}
                         </div>
                       </td>
