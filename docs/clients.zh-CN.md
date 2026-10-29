@@ -84,6 +84,30 @@ Cherry Studio、ZCode、LobeChat、NextChat、Open WebUI 或自研 SDK 客户端
 
 流式策略是服务端设置，不是客户端请求字段。默认 `compatible` 保持 Responses 及带工具 Chat/Messages 的聚合行为；`realtime` 让三个协议都增量发送。两种模式的非流式请求均为经过校验的 JSON。配置、部分输出错误及不再自动重生成工具参数等限制见[流式模式](advanced.zh-CN.md#流式模式)。
 
+## 向量嵌入
+
+`POST /v1/embeddings` 通过 `/codebase/openai/v1/embeddings` 提供 `baai/bge-m3` 和 `Qwen/Qwen3-Embedding-0.6B`。支持文本、文本数组和 token ID 数组，返回 1024 维 `float` 或 `base64` 向量。`baai/bge-m3` 对应上游 `model2`；仅在 codebase 路由不存在或连接失败时回退 `/v2/embeddings` 的 `bge-m3`，Qwen 无付费回退。
+
+codebase 的 usage 实测可能恒为 0，但这不构成免费保证。仅选择已启用且有余额的国内账号，共用别名、启停和绑定规则；每账号允许 16 路并发，超时与 5xx 不切换端点。
+
+```bash
+curl http://127.0.0.1:8787/v1/embeddings \
+  -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"baai/bge-m3","input":["第一段文本","第二段文本"],"encoding_format":"float"}'
+```
+
+## 重排序
+
+`POST /v1/rerank` 将固定的 codebase 重排序服务暴露为 `reranker`。请求包含 `query`、1–100 个字符串 `documents`，可选 `top_n` 和 `return_documents`；结果只含排序后的索引及可选原文，不含相关度分数。上游会把每篇文档截断到约 600 字符。真实权重未公开，`bge-reranker-v2-m3` 和 `Qwen3-Reranker` 仅为未证实候选。
+
+```bash
+curl http://127.0.0.1:8787/v1/rerank \
+  -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"reranker","query":"法国首都","documents":["柏林","巴黎"],"top_n":1}'
+```
+
 ## 联网搜索与抓取
 
 搜索与抓取端点，上游为 agenttool 的 `/v1/search` 与 `/v1/webfetch`：不调用模型，不产生 token 计费。

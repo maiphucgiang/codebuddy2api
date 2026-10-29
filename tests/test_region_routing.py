@@ -66,7 +66,8 @@ def success_sse():
 
 def chat_model_ids(response):
     """Exclude media routes when asserting the legacy chat catalog."""
-    return {item["id"] for item in response.json()["data"] if not item.get("media_kinds")}
+    return {item["id"] for item in response.json()["data"]
+            if not item.get("media_kinds") and not item.get("embedding") and not item.get("rerank")}
 
 
 class RegionRoutingTests(unittest.TestCase):

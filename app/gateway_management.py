@@ -355,6 +355,11 @@ class Management:
         for media in self.gateway.media_model_details():
             row = facts.get(media["id"])
             facts[media["id"]] = {**media, **(row or {})}
+        for embedding in self.gateway.embedding_model_details():
+            row = facts.get(embedding["id"])
+            facts[embedding["id"]] = {**embedding, **(row or {})}
+        for reranker in self.gateway.rerank_model_details():
+            facts[reranker["id"]] = {**reranker, **(facts.get(reranker["id"]) or {})}
         result = []
         for source, row in facts.items():
             rule = model_policy.rule_for(self.CONFIG, source)
@@ -375,6 +380,8 @@ class Management:
     def admin_rate_probe_model(self, source):
         """Probe one rule's upstream model on every product that serves it, in the background."""
         upstream = model_policy.rule_for(self.CONFIG, source)["upstream_id"]
+        if self.gateway.embeddings.is_embedding_model(upstream) or self.gateway.rerank.is_rerank_model(upstream):
+            raise ValueError("向量与重排序模型不支持聊天倍率探测")
         return model_rates.start_probe(self.gateway, upstream, scope=source)
 
     def admin_rate_probe_all(self):
@@ -394,6 +401,8 @@ class Management:
         if pool is None:
             return {"candidates": [], "excluded": []}
         media = bool(self.gateway._media_all_kinds(upstream))
+        embedding = self.gateway.embeddings.is_embedding_model(upstream)
+        reranking = self.gateway.rerank.is_rerank_model(upstream)
         policy = model_policy.view(self.CONFIG)
         with pool._lock:
             for entry in pool.entries():
@@ -404,6 +413,8 @@ class Management:
                     reason = self.gateway._media_account_reason(entry, upstream, rule=rule, policy=policy)
                 elif not model_policy.credential_enabled(self.CONFIG, entry):
                     reason = "人工停用"
+                elif embedding or reranking:
+                    reason = self.gateway._codebase_account_reason(entry, upstream, rule=rule, policy=policy)
                 elif not rule.get("enabled", True):
                     reason = "模型已停用"
                 elif not model_policy.route_allowed(self.CONFIG, entry, source, rule=rule):

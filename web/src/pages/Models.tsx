@@ -927,6 +927,8 @@ export function Models() {
                                 {mediaKindLabels[kind] ?? kind}
                               </Badge>
                             ))}
+                            {m.embedding && <Badge tone="neutral">向量</Badge>}
+                            {m.rerank && <Badge tone="neutral">重排序</Badge>}
                             {m.available === false && m.enabled && (
                               <Badge tone="warn">暂无候选</Badge>
                             )}

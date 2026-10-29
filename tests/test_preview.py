@@ -159,6 +159,34 @@ class UpstreamTests(Isolated):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("data: [DONE]", response.text)
 
+
+    def test_embeddings_return_vectors_and_billed_usage(self):
+        token, _, _ = login("aurora")
+        response = httpx.post("https://www.workbuddy.cn/v2/embeddings",
+                              headers={"Authorization": f"Bearer {token}"},
+                              json={"model": "bge-m3", "input": ["hello", "world"], "encoding_format": "float"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["data"]), 2)
+        self.assertEqual(len(response.json()["data"][0]["embedding"]), 1024)
+        self.assertGreater(response.json()["usage"]["credit"], 0)
+
+    def test_codebase_embeddings_and_rerank_have_no_simulated_charge(self):
+        token, uid, domain = login("aurora")
+        before = credits.fetch_credits(token, uid, domain)["credits"]
+        embedded = httpx.post("https://copilot.tencent.com/codebase/openai/v1/embeddings",
+                              headers={"Authorization": f"Bearer {token}"},
+                              json={"model": "model2", "input": ["hello"], "encoding_format": "float"})
+        self.assertEqual(embedded.status_code, 200, embedded.text)
+        self.assertEqual(embedded.json()["usage"]["total_tokens"], 0)
+        self.assertEqual(credits.fetch_credits(token, uid, domain)["credits"], before)
+
+        ranked = httpx.post("https://copilot.tencent.com/codebase/openai/v1/rerank",
+                            headers={"Authorization": f"Bearer {token}"},
+                            json={"query": "capital France", "documents": ["Berlin", "Paris capital France"],
+                                  "top_n": 1})
+        self.assertEqual(ranked.status_code, 200, ranked.text)
+        self.assertEqual(ranked.json()["output"]["results"], [{"index": 1}])
+        self.assertNotIn("relevance_score", ranked.text)
     def test_console_chat_uses_the_same_simulated_upstream(self):
         token, _, _ = login("aurora")
         response = httpx.post("https://copilot.tencent.com/console/chat/completions",

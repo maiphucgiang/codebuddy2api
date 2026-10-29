@@ -3,7 +3,7 @@ from contextvars import ContextVar
 
 from fastapi import HTTPException
 
-from app import growth_tasks, perf_metrics, travel
+from app import growth_tasks, perf_metrics, travel, embeddings
 from app.model_capabilities import route_metadata
 from app.api_keys import api_principal
 _request_policy = ContextVar("gateway_model_policy", default=None)
@@ -113,12 +113,14 @@ def growth_auto_tasks(config, entry, policy=None):
     mapping = _policy(config, policy)["credentials"].get(entry.get("account_key"), {}).get("growth_auto") or {}
     return frozenset(code for code, enabled in mapping.items() if enabled is True)
 
-
 def default_rule(source):
+    if source in (embeddings.MODEL_ID, embeddings.PUBLIC_MODEL_ID):
+        return {"public_id": embeddings.PUBLIC_MODEL_ID, "upstream_id": embeddings.MODEL_ID,
+                "custom": False, "enabled": True, "keep_original": False,
+                "region": None, "profile": None, "credential_ids": []}
     return {"public_id": source, "upstream_id": source, "custom": False,
             "enabled": True, "keep_original": False,
             "region": None, "profile": None, "credential_ids": []}
-
 
 def rule_for(config, source, policy=None):
     return {**default_rule(source), **_policy(config, policy)["models"].get(source, {})}
@@ -128,6 +130,8 @@ def source_for(config, name):
     """Resolve a public model name or automatic alias to its policy source."""
     if name == "default-model":
         return "auto"
+    if name in (embeddings.MODEL_ID, embeddings.PUBLIC_MODEL_ID):
+        return embeddings.MODEL_ID
     data = snapshot(config)
     for source, rule in data.get("models", {}).items():
         if rule.get("public_id", source) == name:
@@ -135,7 +139,6 @@ def source_for(config, name):
         if rule.get("keep_original") and source == name:
             return source
     return name
-
 
 
 def _restriction_source(source):
@@ -177,7 +180,9 @@ def resolve(config, public_model):
         return state["upstream"]
     data = snapshot(config)
     source = next((key for key, value in data["models"].items()
-                   if value.get("public_id", key) == public_model), public_model)
+                   if value.get("public_id", key) == public_model),
+                  embeddings.MODEL_ID if public_model in (embeddings.MODEL_ID, embeddings.PUBLIC_MODEL_ID)
+                  else public_model)
     rule = {**default_rule(source), **data["models"].get(source, {})}
     if principal is not None and principal.models is not None and _restriction_source(source) not in principal.models:
         raise HTTPException(status_code=403, detail={"error": {
@@ -234,12 +239,17 @@ def public_name(fallback):
 
 
 def public_details(gateway, region=None):
-    """Publish chat and media routes using their own account eligibility checks."""
+    """Publish chat, media and embedding routes using their own eligibility checks."""
     config = gateway.CONFIG
     known = {item["id"]: item for item in gateway.current_model_details(region)}
     for media in gateway.media_model_details():
         row = known.get(media["id"])
         known[media["id"]] = {**media, **(row or {})}
+    for embedding in gateway.embedding_model_details():
+        row = known.get(embedding["id"])
+        known[embedding["id"]] = {**embedding, **(row or {})}
+    for reranker in gateway.rerank_model_details():
+        known[reranker["id"]] = {**reranker, **(known.get(reranker["id"]) or {})}
     policy = view(config)
     policies = policy.data["models"]
     owners = {rule.get("public_id", source): source for source, rule in policies.items()}
@@ -253,6 +263,8 @@ def public_details(gateway, region=None):
         if not rule["enabled"] or item is None:
             continue
         media = bool(item.get("media_kinds"))
+        embedding = bool(item.get("embedding"))
+        reranking = bool(item.get("rerank"))
         token = _request_policy.set({"source": source, "upstream": upstream,
                                      "public_model": rule["public_id"], "rule": rule})
         try:
@@ -272,13 +284,29 @@ def public_details(gateway, region=None):
                         if (profile in gateway.media_generation.MEDIA_PROFILES
                                 and route_allowed(config, entry, upstream, rule=rule, policy=policy)):
                             candidates = [entry]
+            elif embedding or reranking:
+                candidates = [entry for entry in entries if gateway._codebase_account_reason(
+                    entry, upstream, rule=rule, policy=policy, region=region) is None]
+                if pool is None:
+                    cm = config.get("cred")
+                    candidates = []
+                    if cm is not None:
+                        with cm._lock:
+                            headers = cm.get_headers()
+                        profile = gateway.profile_for_headers(headers)
+                        identity = gateway.account_key(profile, headers.get("X-User-Id"),
+                                                       headers.get("X-Enterprise-Id"))
+                        entry = {"profile": profile, "account_key": identity}
+                        if (profile in gateway.embeddings.PROFILES
+                                and route_allowed(config, entry, upstream, rule=rule, policy=policy)):
+                            candidates = [entry]
             else:
                 candidates = [entry for entry in entries if route_allowed(
                     config, entry, upstream, rule=rule, policy=policy)
                     and pool._eligible(entry, upstream, region=region)]
         finally:
             _request_policy.reset(token)
-        if not candidates and (pool is not None or media):
+        if not candidates and (pool is not None or media or embedding or reranking):
             continue
         prices, measured = {}, set()
         accounts = config.get("account_catalogs")
@@ -309,7 +337,7 @@ def public_details(gateway, region=None):
             best = min(prices.values(), default=None)
             row = {"id": name, "credits": best, "credits_by_profile": prices,
                    **route_metadata(gateway, upstream, entries=candidates, rule=rule, region=region)}
-            for key in ("media_kinds", "media_sources", "media_defaults"):
+            for key in ("media_kinds", "media_sources", "media_defaults", "embedding", "rerank"):
                 if key in item:
                     row[key] = item[key]
             if any(prices[profile] == best for profile in measured):

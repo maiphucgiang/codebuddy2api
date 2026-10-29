@@ -83,6 +83,30 @@ The generation endpoints are `POST /v1/chat/completions`, `POST /v1/responses` a
 
 Streaming policy is a server setting, not a client request field. The default `compatible` mode aggregates Responses and tool-bearing Chat/Messages as before; `realtime` sends all three protocols incrementally. Non-streaming requests remain validated JSON in either mode. See [Streaming modes](advanced.md#streaming-modes) for configuration, partial-output errors and the loss of automatic tool-argument regeneration.
 
+
+## Embeddings
+
+`POST /v1/embeddings` exposes `baai/bge-m3` and `Qwen/Qwen3-Embedding-0.6B` through `/codebase/openai/v1/embeddings`. It accepts text, text arrays and token-ID arrays, and returns 1024-dimensional `float` or `base64` vectors. `baai/bge-m3` maps to upstream `model2`; only a missing codebase route or connection failure falls back to `/v2/embeddings` as `bge-m3`. Qwen has no paid fallback.
+
+Codebase usage has been observed as zero, but that is not a billing guarantee. Routing uses enabled domestic accounts with positive balances, shared alias/binding rules and 16 in-flight requests per account; timeouts and 5xx responses do not switch endpoints.
+
+```bash
+curl http://127.0.0.1:8787/v1/embeddings \
+  -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"baai/bge-m3","input":["first document","second document"],"encoding_format":"float"}'
+```
+
+## Reranking
+
+`POST /v1/rerank` exposes the fixed codebase reranker as `reranker`. Send `query`, 1–100 string `documents`, optional `top_n` and `return_documents`; results contain ordered indices and optional source documents, never relevance scores. The service truncates each document at roughly 600 characters. Its weights are not exposed: `bge-reranker-v2-m3` and `Qwen3-Reranker` are unverified candidates, not confirmed identities.
+
+```bash
+curl http://127.0.0.1:8787/v1/rerank \
+  -H "Authorization: Bearer YOUR_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"reranker","query":"capital of France","documents":["Berlin","Paris"],"top_n":1}'
+```
 ## Web search and fetch
 
 Search and fetch endpoints backed by the upstream agenttool `/v1/search` and `/v1/webfetch`; no model is called and no tokens are billed.

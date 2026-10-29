@@ -77,6 +77,41 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private", json.dumps(record))
         self.assertNotIn("sk-synthetic", json.dumps(record))
 
+    async def test_embeddings_protocol_and_usage(self):
+        body = json.dumps({"object": "list", "model": "baai/bge-m3", "data": [],
+                           "usage": {"prompt_tokens": 9, "total_tokens": 9, "credit": 0.01}}).encode()
+        messages = [{"type": "http.response.start", "status": 200,
+                     "headers": [(b"content-type", b"application/json")]},
+                    {"type": "http.response.body", "body": body}]
+
+        async def app(scope, receive, send):
+            for message in messages:
+                await send(message)
+
+        await self.invoke(app, path="/v1/embeddings")
+        record = self.only_record()
+        self.assertEqual(record["protocol"], "embeddings")
+        self.assertEqual(record["public_model"], "baai/bge-m3")
+        self.assertEqual(record["input_tokens"], 9)
+        self.assertEqual(record["total_tokens"], 9)
+        self.assertEqual(record["credit"], 0.01)
+
+    async def test_rerank_protocol(self):
+        body = json.dumps({"model": "reranker", "results": [], "usage": {"total_tokens": 0}}).encode()
+        messages = [{"type": "http.response.start", "status": 200,
+                     "headers": [(b"content-type", b"application/json")]},
+                    {"type": "http.response.body", "body": body}]
+
+        async def app(scope, receive, send):
+            for message in messages:
+                await send(message)
+
+        await self.invoke(app, path="/v1/rerank")
+        record = self.only_record()
+        self.assertEqual(record["protocol"], "rerank")
+        self.assertEqual(record["public_model"], "reranker")
+        self.assertEqual(record["total_tokens"], 0)
+
     async def test_non_responses_audit_omits_projection_fields(self):
         body = json.dumps({"model": "public-model", "choices": [{"message": {"content": "ok"}}]}).encode()
         messages = [{"type": "http.response.start", "status": 200,
