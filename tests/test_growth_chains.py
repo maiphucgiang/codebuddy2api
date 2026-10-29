@@ -220,6 +220,54 @@ class OrchestrationTests(ChainHarness):
         self.assertTrue(growth_events.SERVER_ID_RE.match("a" * 32))
 
 
+class NamedExpertTests(ChainHarness):
+    def exercise(self, code, expert):
+        reports, seen = [], {}
+
+        def real_chat(_ctx, expert_id="", model=growth_chains.DEFAULT_CHAT_MODEL):
+            seen["expert_id"] = expert_id
+            return "wb2api-conv-x", "cmb-" + "a" * 32
+
+        # Same-name market entries must never replace the task-specific expert id.
+        wrong = {"expert_id": "ex_wrong", "display_name_zh": expert["display_name_zh"]}
+        ctx = growth_chains.Context(base="https://www.workbuddy.cn", token="tok", uid="u1")
+        with patch.object(growth_events, "market_expert_list", return_value=[wrong]), \
+                patch.object(growth_chains, "_real_chat", side_effect=real_chat), \
+                patch.object(growth_chains, "_report_desktop",
+                             side_effect=lambda _ctx, events: reports.append(events)):
+            message = growth_chains.RUNNERS[code](ctx, raw_task(code))
+        return message, reports, seen
+
+    def test_cloud_expert_tasks_keep_their_verified_ids(self):
+        for code, expert in growth_chains.NAMED_EXPERT_TASKS.items():
+            with self.subTest(code=code):
+                message, reports, seen = self.exercise(code, expert)
+                self.assertEqual(seen["expert_id"], expert["expert_id"])
+                self.assertEqual(growth_tasks.GROUPS[code], "chat")
+                self.assertIn(expert["display_name_zh"], message)
+                summoned = next(event for report in reports for event in report
+                                if event["eventCode"] == "expert_summoned")
+                actual = next(event for report in reports for event in report
+                              if event["eventCode"] == "expert_actual_use")
+                self.assertEqual(summoned["id"], expert["expert_id"])
+                self.assertEqual(actual["id"], expert["expert_id"])
+                self.assertEqual(actual["name"], expert["display_name_zh"])
+                self.assertEqual(actual["version"], expert["version"])
+                self.assertEqual(actual["type"], expert["categories"][0])
+                self.assertEqual(actual["mode"], "craft")
+
+    def test_lighthouse_keeps_its_local_event_shape(self):
+        expert = {"expert_id": growth_chains.LIGHTHOUSE_EXPERT_ID,
+                  "display_name_zh": "腾讯轻量云专家"}
+        _message, reports, seen = self.exercise("Expert_lighthouse", expert)
+        self.assertEqual(seen["expert_id"], growth_chains.LIGHTHOUSE_EXPERT_ID)
+        actual = next(event for report in reports for event in report
+                      if event["eventCode"] == "expert_actual_use")
+        self.assertEqual(actual["mode"], "LOCAL")
+        self.assertEqual(actual["type"], "")
+        self.assertEqual(actual["cost"], 0)
+
+
 class NightWindowTests(ChainHarness):
     def test_window_boundaries(self):
         for hour, expected in ((22, False), (23, True), (0, True), (7, True), (8, False)):
