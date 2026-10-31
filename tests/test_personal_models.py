@@ -106,6 +106,19 @@ class PersonalModelTableTests(TestCase):
         self.assertEqual(client.get.call_count, 2)
 
 
+    def test_personal_table_survives_supplemental_v3_auth_failure(self):
+        client = self._client(self.response(200, personal_payload()), self.response(401, {"code": 401}))
+        scopes = credits.fetch_model_scopes(
+            jwt("https://www.codebuddy.cn/auth/realms/copilot"), prefer_personal=True)
+        # A supplemental rejection must not discard a catalog the personal endpoint already returned.
+        self.assertEqual([item["id"] for item in scopes["picker"]], ["auto", "hy4-preview"])
+        self.assertEqual([item["id"] for item in scopes["account"]],
+                         ["auto", "hy4-preview", "hunyuan-image-alpha"])
+        self.assertFalse(scopes.complete)
+        self.assertIsInstance(scopes.error, credits.AuthExpiredError)
+        self.assertEqual(client.get.call_count, 2)
+
+
     def test_enterprise_preferred_fetch_uses_v3_without_personal_path(self):
         client = self._client(self.response(200, personal_payload()))
         scopes = credits.fetch_model_scopes(
