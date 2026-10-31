@@ -7,7 +7,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
-from app import credits
 from app.credits import CreditLedger, aggregate_credits, dedupe_by_identity
 
 IDENTITY = "a" * 64

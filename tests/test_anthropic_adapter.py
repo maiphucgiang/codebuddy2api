@@ -251,12 +251,9 @@ def test_stream_converter_text():
                 if not evt_block:
                     continue
                 lines = evt_block.strip().split("\n")
-                event_type = None
                 data_json = None
                 for evt_line in lines:
-                    if evt_line.startswith("event: "):
-                        event_type = evt_line[7:]
-                    elif evt_line.startswith("data: "):
+                    if evt_line.startswith("data: "):
                         data_json = json.loads(evt_line[6:])
                 if data_json:
                     all_events.append(data_json)

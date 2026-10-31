@@ -7,7 +7,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-import json
 import os
 import threading
 from types import SimpleNamespace

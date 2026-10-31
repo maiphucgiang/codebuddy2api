@@ -113,7 +113,8 @@ class EndpointTests(unittest.TestCase):
     def test_tool_arguments_must_be_objects_of_declared_tools(self):
         """Reject non-object tool arguments and unknown declared-tool names."""
         body = {"tools": TOOLS}
-        call = lambda name, args: [{"id": "c1", "function": {"name": name, "arguments": args}}]
+        def call(name, args):
+            return [{"id": "c1", "function": {"name": name, "arguments": args}}]
         healthy = converter._tool_calls_healthy
         self.assertTrue(healthy(None, body))
         self.assertTrue(healthy(call("synthetic_tool", "{}"), body))
@@ -895,7 +896,6 @@ class StartupUsageHydrationTests(unittest.TestCase):
             stack.enter_context(patch.object(converter, "seed_credentials"))
             stack.enter_context(patch.object(converter, "preflight", return_value=True))
             stack.enter_context(patch.object(runtime_management, "install"))
-            real_thread = converter.threading.Thread
 
             def note_thread(*args, **kwargs):
                 events.append(("thread", converter.CONFIG.get("usage_daily") is not None))

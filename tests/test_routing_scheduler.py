@@ -37,7 +37,8 @@ class SchedulerUnitTests(unittest.TestCase):
     def test_legacy_never_reuses_a_shard(self):
         scheduler = RoutingScheduler()
         calls = []
-        evaluate = lambda entry: calls.append(entry) or entry["id"] != "/cred-0"
+        def evaluate(entry):
+            return calls.append(entry) or entry["id"] != "/cred-0"
         first = scheduler.candidates(mode="legacy", revisions=(1,), model="m", region=None,
                                      entries=self.entries, evaluate=evaluate)
         second = scheduler.candidates(mode="legacy", revisions=(1,), model="m", region=None,
@@ -50,7 +51,8 @@ class SchedulerUnitTests(unittest.TestCase):
     def test_indexed_builds_once_per_revision_set(self):
         scheduler = RoutingScheduler()
         calls = []
-        evaluate = lambda entry: calls.append(entry) or True
+        def evaluate(entry):
+            return calls.append(entry) or True
         for revision in ((1, 2, 3, 4), (1, 2, 3, 4), (1, 2, 3, 5)):
             scheduler.candidates(mode="indexed", revisions=revision, model="m", region=None,
                                  entries=self.entries, evaluate=evaluate)
@@ -60,7 +62,8 @@ class SchedulerUnitTests(unittest.TestCase):
 
     def test_shard_cache_evicts_least_recently_used(self):
         scheduler = RoutingScheduler(limit=2)
-        evaluate = lambda entry: True
+        def evaluate(entry):
+            return True
         for model in ("m1", "m2"):
             scheduler.candidates(mode="indexed", revisions=(1,), model=model, region=None,
                                  entries=self.entries, evaluate=evaluate)
@@ -78,7 +81,8 @@ class SchedulerUnitTests(unittest.TestCase):
     def test_shadow_returns_legacy_and_records_mismatches(self):
         scheduler = RoutingScheduler()
         allowed = {"value": 0}
-        evaluate = lambda entry: allowed["value"] == 0
+        def evaluate(entry):
+            return allowed["value"] == 0
         scheduler.candidates(mode="indexed", revisions=(1,), model="m", region=None,
                              entries=self.entries, evaluate=evaluate)
         allowed["value"] = 1  # The index now disagrees with a live scan.
@@ -135,7 +139,8 @@ class SchedulerPoolTests(unittest.TestCase):
     def script(self, pool, ledger):
         """Deterministic routing script exercising sticky, cooldown, tried and capacity paths."""
         observed = []
-        pick = lambda skey=None, **kw: (pool.pick(skey, "glm-5.3-flash", **kw) or None)
+        def pick(skey=None, **kw):
+            return (pool.pick(skey, "glm-5.3-flash", **kw) or None)
         for _ in range(6):
             manager = pick()
             observed.append(Path(manager.path).name)

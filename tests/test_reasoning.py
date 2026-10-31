@@ -78,8 +78,8 @@ class TestChatAggregation(unittest.TestCase):
         self.assertIn("正文", content)
         self.assertEqual(sum("reasoning_content" in line for line in lines), 1)
         # Reasoning deltas precede text deltas.
-        first_reasoning = next(i for i, l in enumerate(lines) if "reasoning_content" in l)
-        first_content = next(i for i, l in enumerate(lines) if '"content": "正' in l or '"content":"正' in l)
+        first_reasoning = next(i for i, line in enumerate(lines) if "reasoning_content" in line)
+        first_content = next(i for i, line in enumerate(lines) if '"content": "正' in line or '"content":"正' in line)
         self.assertLess(first_reasoning, first_content)
 
     def test_reasoning_coalescer_preserves_multiple_choices(self):
@@ -115,7 +115,7 @@ class TestReplayEnvelope(unittest.TestCase):
     def test_replayed_chunks_share_stable_envelope(self):
         merged = _merge_chat_sse_text(_SSE)
         lines = _chat_result_to_sse_lines(merged)
-        chunks = [json.loads(l[6:]) for l in lines if l.startswith("data: ") and l != "data: [DONE]"]
+        chunks = [json.loads(line[6:]) for line in lines if line.startswith("data: ") and line != "data: [DONE]"]
         self.assertTrue(chunks)
         ids = {c["id"] for c in chunks}
         self.assertEqual(len(ids), 1) and next(iter(ids)).startswith("chatcmpl-")

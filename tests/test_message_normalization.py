@@ -1,6 +1,5 @@
 """Verify international image-run normalization without changing domestic requests or replay policy."""
 from copy import deepcopy
-import json
 from pathlib import Path
 import sys
 import unittest

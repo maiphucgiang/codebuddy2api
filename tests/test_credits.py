@@ -699,9 +699,10 @@ def test_fetch_credits_tolerates_unrelated_shape_noise():
 def test_fetch_credits_paginates_until_short_page():
     """Aggregate credit pages, stop on short pages and mark capped results partial."""
     token = _jwt("https://www.codebuddy.cn/x")
-    account = lambda i: {"PackageName": f"p{i}", "PackageCode": f"c{i}",
-                         "SlicePeriodUsageDetails": [{"SlicePeriodCapacityRemainPrecise": "1",
-                                                      "DeductionEndTime": None}]}
+    def account(i):
+        return {"PackageName": f"p{i}", "PackageCode": f"c{i}",
+                "SlicePeriodUsageDetails": [{"SlicePeriodCapacityRemainPrecise": "1",
+                                             "DeductionEndTime": None}]}
     full_page = {"code": 0, "data": {"Response": {"Data": {"Accounts": [account(i) for i in range(100)]}}}}
     short_page = {"code": 0, "data": {"Response": {"Data": {"Accounts": [account(1000)]}}}}
     seen = []

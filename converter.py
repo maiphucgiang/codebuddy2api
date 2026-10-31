@@ -67,13 +67,14 @@ from app.adapters.anthropic_adapter import (
 
 from app import auth_oauth
 from app.settings import SCHEMA
-from app import trial_rewards
+# Re-exported for app.runtime_management and the tests, which reach it as ``gateway.trial_rewards``.
+from app import trial_rewards  # noqa: F401
 from app import buddy, daily_chat, growth_chains, growth_tasks, checkin as checkin_service, model_policy, travel
 from app.credential_cooldowns import CredentialCooldowns
 from app.model_blocks import ModelBlocks
 from app.usage_snapshots import UsageSnapshots
 from app.client_hangup import ClientHungUp, await_or_hangup
-from app.observability import (AuditMiddleware, observe_recovery, observe_route, observe_stream_mode,
+from app.observability import (observe_recovery, observe_route, observe_stream_mode,
                                observe_responses_projection, observe_usage, observe_attempt,
                                observe_failure, observe_failure_seq, observe_discard,
                                observe_nested)
@@ -106,7 +107,7 @@ from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
 from app import perf_metrics
 from app.startup import capture_launch, load_startup_env, restart_process, run_server
-from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
+from app.site_routing import (INTERNATIONAL, PROFILE_ENDPOINTS, site_for_headers,
                               profile_for_auth, profile_for_headers, profile_region, profile_product,
                               profile_site, chat_url_for_headers, search_url_for_headers, fetch_url_for_headers,
                               refresh_url_for_auth, media_url_for_headers, embedding_url_for_headers,
@@ -114,8 +115,8 @@ from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_f
 from app import dsml, mcp_server, server_tools, web_fetch, web_search, media_generation, media_store, embeddings, rerank
 from app.inbound_limits import anthropic_path
 from app.client_profiles import (CLI_VERSION, CLI_USER_AGENT, credential_headers, credential_refresh_headers,
-                                 catalog_cache_key, account_key, canonical_uid, enterprise_id_of, identity_email,
-                                 is_enterprise_account, normalize_uid)
+                                 catalog_cache_key, account_key, canonical_uid, enterprise_id_of,
+                                 is_enterprise_account)
 try:
     from app import credits as credits_mod
 except ImportError:  # Disable credit maintenance when its module is unavailable.
@@ -4125,7 +4126,7 @@ def _guard_request_size(body: dict) -> int:
                 raise HTTPException(status_code=413, detail={"error": {
                     "message": f"处理后的请求体超过网关上限 {limit} 字节，请缩短历史或压缩图片",
                     "type": "invalid_request_error", "code": "request_too_large", "max_bytes": limit}})
-    except (ValueError, UnicodeError) as error:
+    except (ValueError, UnicodeError):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "请求体包含无法序列化的 JSON 值", "type": "invalid_request_error"}}) from None
     return size
@@ -7489,7 +7490,7 @@ def main():
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
 
     # Record service startup.
-    _log(f"==== converter 启动 ====")
+    _log("==== converter 启动 ====")
 
     CONFIG["launch"] = launch
     try:

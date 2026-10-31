@@ -583,7 +583,7 @@ if __name__ == "__main__":
         print(f"{changed} | 原文: {s}")
         if d != s:
             print(f"     | 脱敏: {d}")
-            print(f"     | 可见字符相同，差异为零宽空格 U+200B")
+            print("     | 可见字符相同，差异为零宽空格 U+200B")
     print()
     print("=== messages 脱敏（只处理 system）===")
     msgs = [
