@@ -10,14 +10,12 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import json
 import time
 import unittest
 from unittest.mock import patch
 
 import converter
 from app import acp_client, daily_chat
-from app.control_store import ControlStore
 from tests import test_credential_actions as fixtures
 
 

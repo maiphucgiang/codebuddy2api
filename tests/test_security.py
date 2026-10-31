@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 import converter
 from app import credential_io
 from app.credential_io import (
-    CredentialFileError, MAX_CREDENTIAL_BYTES, atomic_write_credential, read_import_file,
+    CredentialFileError, MAX_CREDENTIAL_BYTES, atomic_write_credential,
 )
 from tests.admin_session import direct_request
 

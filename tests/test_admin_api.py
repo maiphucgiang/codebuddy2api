@@ -609,7 +609,8 @@ class AdminApiTests(unittest.TestCase):
         return f"header.{claims}.signature"
 
     def test_refresh_import_rejects_bad_endpoint_and_batches(self):
-        post = lambda body: self.client.post("/admin/credentials/refresh-import", headers=self.headers, json=body)
+        def post(body):
+            return self.client.post("/admin/credentials/refresh-import", headers=self.headers, json=body)
         self.assertEqual(post({"profile": "unknown", "refresh_tokens": ["a"]}).status_code, 400)
         for tokens in ([], [""], [1], ["x" * 8193], ["a"] * 51):
             with self.subTest(count=len(tokens)):

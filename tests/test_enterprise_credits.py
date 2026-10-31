@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct exe
 from app import credits
 import converter
 from app.client_profiles import (
-    CLI_USER_AGENT, enterprise_id_of, is_enterprise_account,
+    enterprise_id_of, is_enterprise_account,
 )
 from app.credits import (
     UNLIMITED_ALLOWANCE,
@@ -166,7 +166,7 @@ class EnterpriseFetchTests(TestCase):
 
     def test_remaining_is_limit_minus_used(self):
         seen, handler = self._capture(ENTERPRISE_PAYLOAD)
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 result = fetch_enterprise_credits(CN_TOKEN, uid="uid-1",
                                                   domain="www.codebuddy.cn",
@@ -186,7 +186,7 @@ class EnterpriseFetchTests(TestCase):
         """limitNum == -1 means unlimited: never report a fabricated balance."""
         payload = {"code": 0, "data": {"limitNum": UNLIMITED_ALLOWANCE, "credit": 12.0}}
         _seen, handler = self._capture(payload)
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 result = fetch_enterprise_credits(CN_TOKEN, uid="u", domain="www.codebuddy.cn",
                                                   enterprise_id="t")
@@ -197,7 +197,7 @@ class EnterpriseFetchTests(TestCase):
     def test_exhausted_allowance_yields_no_segments(self):
         payload = {"code": 0, "data": {"limitNum": 100, "credit": 100}}
         _seen, handler = self._capture(payload)
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 result = fetch_enterprise_credits(CN_TOKEN, uid="u", domain="www.codebuddy.cn",
                                                   enterprise_id="t")
@@ -207,7 +207,7 @@ class EnterpriseFetchTests(TestCase):
     def test_api_error_raises_readable_failure(self):
         payload = {"code": 40001, "msg": "tenant not found"}
         _seen, handler = self._capture(payload)
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 with self.assertRaises(RuntimeError) as caught:
                     fetch_enterprise_credits(CN_TOKEN, uid="u", domain="www.codebuddy.cn",
@@ -216,7 +216,7 @@ class EnterpriseFetchTests(TestCase):
 
     def test_unparsable_payload_raises_instead_of_reporting_zero(self):
         _seen, handler = self._capture({"code": 0, "data": {"unexpected": True}})
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 with self.assertRaises(RuntimeError):
                     fetch_enterprise_credits(CN_TOKEN, uid="u", domain="www.codebuddy.cn",
@@ -233,7 +233,7 @@ class BillingDispatchTests(TestCase):
             seen["url"] = str(request.url)
             return httpx.Response(200, json=ENTERPRISE_PAYLOAD)
 
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 fetch_credits(CN_TOKEN, uid="u", domain="www.codebuddy.cn", enterprise_id="tenant-a")
 
@@ -249,7 +249,7 @@ class BillingDispatchTests(TestCase):
             # The personal list answers with an empty Accounts array.
             return httpx.Response(200, json={"code": 0, "data": {"Response": {"Data": {"Accounts": []}}}})
 
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 result = fetch_credits(CN_TOKEN, uid="u", domain="www.codebuddy.cn")
 
@@ -266,7 +266,7 @@ class BillingDispatchTests(TestCase):
             seen["urls"].append(str(request.url))
             return httpx.Response(200, json={"code": 0, "data": {"Response": {"Data": {"Accounts": []}}}})
 
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 fetch_credits(CN_TOKEN, uid="u", domain="www.codebuddy.cn", enterprise_id="")
 
@@ -300,7 +300,7 @@ class EnterpriseIdResolutionTests(TestCase):
         def handler(request):
             return httpx.Response(200, json=payload)
 
-        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with httpx.Client(transport=httpx.MockTransport(handler)):
             with _patch_client(handler):
                 resolved = credits.resolve_enterprise_id(CN_TOKEN, uid="u", domain="www.codebuddy.cn")
         self.assertEqual(resolved, "t-resolved")
@@ -308,7 +308,7 @@ class EnterpriseIdResolutionTests(TestCase):
         def failing(_request):
             raise httpx.ConnectError("offline")
 
-        with httpx.Client(transport=httpx.MockTransport(failing)) as client:
+        with httpx.Client(transport=httpx.MockTransport(failing)):
             with _patch_client(failing):
                 self.assertIsNone(credits.resolve_enterprise_id(CN_TOKEN, uid="u",
                                                                 domain="www.codebuddy.cn"))

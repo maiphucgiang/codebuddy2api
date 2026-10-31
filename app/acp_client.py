@@ -16,7 +16,7 @@ style of the other automation modules.
 import json
 import select
 import time
-from http.client import HTTPConnection, HTTPSConnection, HTTPSConnection as _HTTPS
+from http.client import HTTPConnection, HTTPSConnection as _HTTPS
 from urllib.parse import urlsplit
 
 from .credits import BROWSER_UA

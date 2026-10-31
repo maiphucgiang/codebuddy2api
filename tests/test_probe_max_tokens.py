@@ -14,7 +14,7 @@ spec = importlib.util.spec_from_file_location("probe_max_tokens", ROOT / "script
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
 
-from app import output_probes
+from app import output_probes  # noqa: E402 - the script path is prepared above
 
 
 def run(replies, claimed=None, tiers=(40000, 100000), retries=2, budget=600):

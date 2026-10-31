@@ -371,7 +371,7 @@ class TravelTests(unittest.TestCase):
         result, calls = self.run_trip([IDLE, CONFIG], buddy_context=context, on_request=other_process)
         self.assertTrue(result['departure_pending'])
         self.assertFalse(any(r.method == 'POST' for r in calls))
-        attempt = self.store.reserve_travel_write('reserved', 'depart', 21)
+        self.store.reserve_travel_write('reserved', 'depart', 21)
         result, calls = self.run_trip([TRAVELING], buddy_context={'store': self.store, 'identity': 'reserved'}, read_only=True)
         self.assertTrue(result['departure_pending'])
         self.assertEqual(self.store.travel_write_record('reserved')['phase'], 'reserved')

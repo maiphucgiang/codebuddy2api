@@ -67,13 +67,14 @@ from app.adapters.anthropic_adapter import (
 
 from app import auth_oauth
 from app.settings import SCHEMA
-from app import trial_rewards
+# Re-exported for app.runtime_management and the tests, which reach it as ``gateway.trial_rewards``.
+from app import trial_rewards  # noqa: F401
 from app import buddy, daily_chat, growth_chains, growth_tasks, checkin as checkin_service, model_policy, travel
 from app.credential_cooldowns import CredentialCooldowns
 from app.model_blocks import ModelBlocks
 from app.usage_snapshots import UsageSnapshots
 from app.client_hangup import ClientHungUp, await_or_hangup
-from app.observability import (AuditMiddleware, observe_recovery, observe_route, observe_stream_mode,
+from app.observability import (observe_recovery, observe_route, observe_stream_mode,
                                observe_responses_projection, observe_usage, observe_attempt,
                                observe_failure, observe_failure_seq, observe_discard,
                                observe_nested)
@@ -106,7 +107,7 @@ from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
 from app import perf_metrics
 from app.startup import capture_launch, load_startup_env, restart_process, run_server
-from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
+from app.site_routing import (INTERNATIONAL, PROFILE_ENDPOINTS, site_for_headers,
                               profile_for_auth, profile_for_headers, profile_region, profile_product,
                               profile_site, chat_url_for_headers, search_url_for_headers, fetch_url_for_headers,
                               refresh_url_for_auth, media_url_for_headers, embedding_url_for_headers,
@@ -114,8 +115,8 @@ from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_f
 from app import dsml, mcp_server, server_tools, web_fetch, web_search, media_generation, media_store, embeddings, rerank
 from app.inbound_limits import anthropic_path
 from app.client_profiles import (CLI_VERSION, CLI_USER_AGENT, credential_headers, credential_refresh_headers,
-                                 catalog_cache_key, account_key, canonical_uid, enterprise_id_of, identity_email,
-                                 is_enterprise_account, normalize_uid)
+                                 catalog_cache_key, account_key, canonical_uid, enterprise_id_of,
+                                 is_enterprise_account)
 try:
     from app import credits as credits_mod
 except ImportError:  # Disable credit maintenance when its module is unavailable.
@@ -1924,6 +1925,8 @@ _ENDPOINT_KINDS = ("credits", "models", "usage")
 _endpoint_limits: dict = {}
 _ENDPOINT_LIMIT_LOCK = threading.Lock()  # Workers initialize semaphores concurrently.
 _published_catalog_signature: str | None = None  # Last published catalog content; skips no-op bumps.
+_catalog_sequence_lock = threading.Lock()
+_catalog_sequences: dict[str, int] = {}
 
 
 def _housekeep_concurrency() -> int:
@@ -2270,6 +2273,13 @@ def _account_catalog_key(profile, headers):
                                                   headers.get("X-Enterprise-Id")))
 
 
+def _next_catalog_sequence(key: str) -> int:
+    with _catalog_sequence_lock:
+        sequence = _catalog_sequences.get(key, 0) + 1
+        _catalog_sequences[key] = sequence
+        return sequence
+
+
 def _catalog_model_signature(model: dict, region: str):
     """Return the conservative signature used for automatic same-cost variant grouping."""
     if not isinstance(model, dict) or model.get("supportsToolCall") is not True:
@@ -2331,23 +2341,28 @@ def _build_catalog_route_groups(accounts: dict) -> tuple[dict, dict]:
 
 
 def _fetch_catalog(headers):
-    """Fetch both catalog scopes for one account token; the only upstream call involved."""
+    """Fetch both catalog scopes and report whether personal/v3 supplementation completed."""
     with _endpoint_semaphore("models"):
         scopes = credits_mod.fetch_model_scopes(
             _bearer_token(headers), domain=headers.get("X-Domain", ""),
             uid=headers.get("X-User-Id", ""), enterprise_id=headers.get("X-Enterprise-Id", ""),
             prefer_personal=True)
-    return scopes["picker"], scopes["account"]
+    return scopes["picker"], scopes["account"], getattr(scopes, "complete", True), getattr(scopes, "error", None)
 
 
-def _store_catalog(pool, cache, entry, generation, key, models, serves):
-    """Publish one fetched catalog only while the credential lease is still current."""
+def _store_catalog(pool, cache, entry, generation, key, models, serves, *, complete=True, sequence=None):
+    """Publish a catalog only while the credential lease and fetch sequence are current."""
+    stored = False
     def publish():
-        cache.put(key, models, serves=serves)
-        for current in pool._entries:
-            if current["cm"] is entry["cm"]:
-                current["catalog_dirty"] = False
-    return pool.apply_if_current(entry["cm"], generation, publish)
+        nonlocal stored
+        stored = cache.put(key, models, serves=serves, complete=complete, sequence=sequence)
+        if stored:
+            for current in pool._entries:
+                if current["cm"] is entry["cm"]:
+                    current["catalog_dirty"] = not complete
+    if not pool.apply_if_current(entry["cm"], generation, publish):
+        return False
+    return stored
 
 
 def _sync_one_account_catalog(pool, ledger, entry, generation, headers, profile, failed, cache):
@@ -2357,13 +2372,19 @@ def _sync_one_account_catalog(pool, ledger, entry, generation, headers, profile,
     key = _account_catalog_key(profile, headers)
     if cache.fresh(key) and not entry.get("catalog_dirty"):
         return None
+    sequence = _next_catalog_sequence(key)
     perf_metrics.inc("catalog_fetch_count")
     try:
-        models, serves = _fetch_catalog(headers)
-        if _store_catalog(pool, cache, entry, generation, key, models, serves):
+        models, serves, complete, supplemental_error = _fetch_catalog(headers)
+        if supplemental_error is not None:
+            _log(f"[models] {profile} 补充目录失败（保留个人目录）：{_network_error_text(supplemental_error)}")
+        if _store_catalog(pool, cache, entry, generation, key, models, serves,
+                          complete=complete, sequence=sequence):
             _log(f"[models] {profile} 模型表已刷新: 选择器 {len(models)} 个，"
-                 f"账号根表 {len(serves)} 个")
-            return True
+                 f"账号根表 {len(serves)} 个" + ("（待补充 v3）" if not complete else ""))
+            if not complete:
+                failed.add(entry["id"])
+            return complete
         failed.add(entry["id"])
     except Exception as error:
         perf_metrics.inc("catalog_fetch_failures")
@@ -2463,10 +2484,18 @@ def _probe_profile_catalog(pool, ledger, refs, failed, cache, aggregate, profile
         return
     entry, generation, headers = target["entry"], target["generation"], target["headers"]
     key = _account_catalog_key(profile, headers)
+    sequence = _next_catalog_sequence(key)
     perf_metrics.inc("catalog_fetch_count")
     try:
-        models, serves = _fetch_catalog(headers)
-        if not _store_catalog(pool, cache, entry, generation, key, models, serves):
+        models, serves, complete, supplemental_error = _fetch_catalog(headers)
+        if supplemental_error is not None:
+            _log(f"[models] {profile} 补充目录失败（保留个人目录）：{_network_error_text(supplemental_error)}")
+        if not _store_catalog(pool, cache, entry, generation, key, models, serves,
+                              complete=complete, sequence=sequence):
+            aggregate.failure(profile, source=entry.get("account_key"))
+            failed.add(entry["id"])
+            return
+        if not complete:
             aggregate.failure(profile, source=entry.get("account_key"))
             failed.add(entry["id"])
             return
@@ -2538,10 +2567,17 @@ def _scan_one_catalog(pool, cache, entry):
         generation = cm._generation
         profile = profile_for_headers(headers)
     key = _account_catalog_key(profile, headers)
+    sequence = _next_catalog_sequence(key)
     previous = {item.get("id") for item in (cache.models(key) or [])}
-    models, serves = _fetch_catalog(headers)
-    if not _store_catalog(pool, cache, entry, generation, key, models, serves):
+    models, serves, complete, supplemental_error = _fetch_catalog(headers)
+    if supplemental_error is not None:
+        _log(f"[models] {profile} 补充目录失败（保留个人目录）：{_network_error_text(supplemental_error)}")
+    if not _store_catalog(pool, cache, entry, generation, key, models, serves,
+                          complete=complete, sequence=sequence):
         raise RuntimeError("扫描期间凭证已变化，已跳过该账号")
+    if not complete:
+        # The personal catalog is stored, but the scan must report the missing v3 supplement.
+        raise RuntimeError(f"补充目录失败: {_network_error_text(supplemental_error)}")
     current = {item.get("id") for item in models}
     # A first fetch has no baseline to diff against; only a change to a known catalog counts.
     differences = len(previous ^ current) if previous else 0
@@ -4090,7 +4126,7 @@ def _guard_request_size(body: dict) -> int:
                 raise HTTPException(status_code=413, detail={"error": {
                     "message": f"处理后的请求体超过网关上限 {limit} 字节，请缩短历史或压缩图片",
                     "type": "invalid_request_error", "code": "request_too_large", "max_bytes": limit}})
-    except (ValueError, UnicodeError) as error:
+    except (ValueError, UnicodeError):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "请求体包含无法序列化的 JSON 值", "type": "invalid_request_error"}}) from None
     return size
@@ -7454,7 +7490,7 @@ def main():
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
 
     # Record service startup.
-    _log(f"==== converter 启动 ====")
+    _log("==== converter 启动 ====")
 
     CONFIG["launch"] = launch
     try:

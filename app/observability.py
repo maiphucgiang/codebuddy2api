@@ -13,7 +13,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import time
-from typing import Any
 
 from app.audit_store import AuditStore, METRICS, number, safe_agent, safe_attempt, safe_label
 from app.request_context import PATHS, current_context, ensure_context

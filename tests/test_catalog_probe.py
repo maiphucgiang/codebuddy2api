@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 import converter
-from app import model_policy, perf_metrics
+from app import perf_metrics
 from app.catalog_probe import AggregateCatalog, valid_row
 from app.control_store import ControlStore
 from app.credits import CreditLedger, ModelCatalogCache
@@ -58,7 +58,8 @@ class AggregateCatalogTests(unittest.TestCase):
         aggregate = AggregateCatalog(ttl=100, clock=lambda: 1000.0)
         accounts = [{"account_key": "a"}, {"account_key": "b"}, {"account_key": "c"}]
         ages = {"a": 500.0, "b": 1000.0, "c": None}
-        age_of = lambda candidate: ages[candidate["account_key"]]
+        def age_of(candidate):
+            return ages[candidate["account_key"]]
         aggregate.success("cn-cli", source="a", generation=1, models=["hy3"])
         aggregate._data["profiles"]["cn-cli"]["retry_at"] = 0.0
         self.assertEqual(aggregate.choose("cn-cli", accounts, age_of=age_of)["account_key"], "c")  # Unknown first.

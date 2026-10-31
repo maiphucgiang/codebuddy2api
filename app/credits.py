@@ -59,6 +59,15 @@ class _PersonalCatalogUnavailable(RuntimeError):
     """Signal that an older or non-SaaS product has no personal model route."""
 
 
+class ModelScopes(dict):
+    """Carry catalog completeness without changing the mapping contract."""
+
+    def __init__(self, values, *, complete=True, error=None):
+        super().__init__(values)
+        self.complete = bool(complete)
+        self.error = error
+
+
 # ---------------------------------------------------------------------------
 # Billing host selection
 # ---------------------------------------------------------------------------
@@ -749,21 +758,28 @@ def fetch_personal_model_scopes(access_token: str, user_agent: str = "", *, doma
     return _parse_model_scopes(payload, profile_product(profile), "个人模型表接口")
 
 
-def fetch_model_scopes(access_token: str, user_agent: str = "", *, domain: str = "",
-                       uid: str = "", enterprise_id: str = "", prefer_personal: bool = False) -> dict[str, list[dict]]:
-    """Fetch selector and account-root catalogs without assuming every candidate is servable."""
+def _merge_model_scopes(primary: dict[str, list[dict]], supplemental: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Append models absent from the primary catalog while preserving its declarations."""
+    merged = {}
+    for scope in ("picker", "account"):
+        rows = list(primary.get(scope) or [])
+        seen = {item.get("id") for item in rows if isinstance(item, dict) and item.get("id")}
+        rows.extend(item for item in supplemental.get(scope) or []
+                    if isinstance(item, dict) and item.get("id") not in seen)
+        merged[scope] = rows
+    return merged
+
+
+def _fetch_config_model_scopes(access_token: str, user_agent: str = "", *, domain: str = "",
+                               uid: str = "", enterprise_id: str = "") -> dict[str, list[dict]]:
+    """Fetch the legacy v3 model catalog and split its picker/root scopes."""
     auth = {"accessToken": access_token, "domain": domain}
     profile = profile_for_auth(auth)
-    if prefer_personal and not enterprise_id:
-        try:
-            return fetch_personal_model_scopes(access_token, user_agent, domain=domain, uid=uid)
-        except _PersonalCatalogUnavailable:
-            # Older deployments and private endpoints retain the established /v3/config path.
-            pass
     headers = catalog_headers(auth, {"uid": uid, "enterpriseId": enterprise_id}, user_agent=user_agent)
     try:
         with httpx.Client() as client:
-            response = client.get(PROFILE_ENDPOINTS[profile] + CONFIG_PATH, headers=headers, timeout=REQUEST_TIMEOUT)
+            response = client.get(PROFILE_ENDPOINTS[profile] + CONFIG_PATH, headers=headers,
+                                  timeout=REQUEST_TIMEOUT)
     except httpx.HTTPError:
         raise RuntimeError("模型配置接口网络错误") from None
     if response.status_code == 401:
@@ -775,6 +791,27 @@ def fetch_model_scopes(access_token: str, user_agent: str = "", *, domain: str =
     except ValueError:
         raise ValueError("模型配置接口返回无法解析") from None
     return _parse_model_scopes(payload, profile_product(profile), "模型配置接口")
+
+
+def fetch_model_scopes(access_token: str, user_agent: str = "", *, domain: str = "",
+                       uid: str = "", enterprise_id: str = "", prefer_personal: bool = False) -> dict[str, list[dict]]:
+    """Fetch selector and account-root catalogs, supplementing personal data with v3."""
+    if prefer_personal and not enterprise_id:
+        try:
+            personal = fetch_personal_model_scopes(access_token, user_agent, domain=domain, uid=uid)
+        except _PersonalCatalogUnavailable:
+            # Older deployments and private endpoints retain the established /v3/config path.
+            personal = None
+        if personal is not None:
+            try:
+                legacy = _fetch_config_model_scopes(access_token, user_agent, domain=domain,
+                                                    uid=uid, enterprise_id=enterprise_id)
+            except (AuthExpiredError, RuntimeError, ValueError) as error:
+                # Personal data remains usable, but the caller must not mark this refresh complete.
+                return ModelScopes(personal, complete=False, error=error)
+            return ModelScopes(_merge_model_scopes(personal, legacy))
+    return _fetch_config_model_scopes(access_token, user_agent, domain=domain,
+                                      uid=uid, enterprise_id=enterprise_id)
 
 
 def fetch_model_catalog(access_token: str, user_agent: str = "", *, domain: str = "",
@@ -1139,6 +1176,7 @@ class ModelCatalogCache:
         self.path = Path(store.path if store is not None else path)
         self.ttl = max(60.0, float(ttl or 0))
         self._lock = threading.Lock()
+        self._write_sequences: dict[str, int] = {}
         self._data: dict = {"version": self.SCHEMA_VERSION, "groups": {}}
         self._load()
 
@@ -1160,6 +1198,7 @@ class ModelCatalogCache:
                     if not isinstance(ts, (int, float)) or not math.isfinite(ts):
                         ts = 0
                     groups[group] = {"models": entry["models"], "fetched_at": ts,
+                                     "complete": entry.get("complete", True) is True,
                                      "version": (self.SCHEMA_VERSION
                                                  if d["version"] == self.SCHEMA_VERSION
                                                  and entry.get("version") == self.SCHEMA_VERSION
@@ -1196,7 +1235,8 @@ class ModelCatalogCache:
         with self._lock:
             g = self._data["groups"].get(group) or {}
             age = time.time() - float(g.get("fetched_at") or 0)
-            return g.get("version") == self.SCHEMA_VERSION and 0 <= age < self.ttl
+            return (g.get("version") == self.SCHEMA_VERSION and g.get("complete", True) is True
+                    and 0 <= age < self.ttl)
 
     def models(self, group: str) -> list[dict]:
         with self._lock:
@@ -1208,14 +1248,24 @@ class ModelCatalogCache:
             g = self._data["groups"].get(group)
             return time.time() - float(g.get("fetched_at") or 0) if g is not None else None
 
-    def put(self, group: str, models: list[dict], serves: list[dict] | None = None):
+    def put(self, group: str, models: list[dict], serves: list[dict] | None = None, *, complete=True, sequence=None):
         with self._lock:
+            current = self._data["groups"].get(group) or {}
+            current_sequence = self._write_sequences.get(group, 0)
+            if sequence is not None and sequence < current_sequence:
+                return False
+            if sequence is not None:
+                self._write_sequences[group] = sequence
+            if complete is not True and current.get("complete", True) is True and current.get("models") is not None:
+                return False
             entry = {"models": deepcopy(models), "fetched_at": time.time(),
+                     "complete": complete is True,
                      "version": self.SCHEMA_VERSION}
             if serves is not None:
                 entry["serves"] = deepcopy(serves)
             self._data["groups"][group] = entry
             self._save()
+            return True
 
     def serves(self, group: str) -> list[dict]:
         """Return root catalog candidates, or an empty list when legacy caches omit them."""

@@ -594,7 +594,7 @@ class Upstream:
             return Reply(payload={"code": 400, "msg": "already traveling"})
         if _departed_today(state) >= DAILY_TRIPS:
             return Reply(payload={"code": 400, "msg": "daily limit reached"})
-        location = next((l for l in LOCATIONS if l["id"] == body.get("location_id")), LOCATIONS[0])
+        location = next((item for item in LOCATIONS if item["id"] == body.get("location_id")), LOCATIONS[0])
         today = time.strftime("%Y-%m-%d")
         state.departures = {today: _departed_today(state) + 1}
         state.trip = {"state": "traveling", "location": location, "arrive_at": time.time() + TRAVEL_SECONDS,

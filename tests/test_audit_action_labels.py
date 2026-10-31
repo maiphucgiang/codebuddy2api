@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))  # Allow direct execution.
 
-from app.audit_store import CREDIT_CHANGES
+from app.audit_store import CREDIT_CHANGES  # noqa: E402 - sys.path is prepared above
 
 SOURCES = sorted([*(ROOT / "app").glob("*.py"), ROOT / "converter.py"])
 # Local helpers whose first stage argument becomes "buddy." + stage, and admin_api's

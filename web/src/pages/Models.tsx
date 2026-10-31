@@ -681,6 +681,15 @@ function sortModels(list: ModelRule[], key: SortKey): ModelRule[] {
   else out.sort((a, b) => a.public_id.localeCompare(b.public_id));
   return out;
 }
+function modelHasRegion(model: ModelRule, region: "cn" | "intl"): boolean {
+  if (model.region) return model.region === region;
+  if (model.profile) return model.profile.startsWith(`${region}-`);
+  const declarations = model.metadata_by_profile;
+  if (!declarations || typeof declarations !== "object" || Array.isArray(declarations))
+    return false;
+  return Object.keys(declarations).some((profile) => profile.startsWith(`${region}-`));
+}
+
 function matchesCatalog(model: ModelRule, query: string, filter: CatalogFilter): boolean {
   if (query) {
     const text = modelSearchText(model);
@@ -690,7 +699,7 @@ function matchesCatalog(model: ModelRule, query: string, filter: CatalogFilter):
   if (filter.region) {
     if (filter.region === "auto") {
       if (bindingMode(model) !== "auto") return false;
-    } else if (model.region !== filter.region) return false;
+    } else if (!modelHasRegion(model, filter.region as "cn" | "intl")) return false;
   }
   if (filter.capability === "media_image") {
     if (!model.media_kinds?.some((kind) => kind === "image" || kind === "edit")) return false;

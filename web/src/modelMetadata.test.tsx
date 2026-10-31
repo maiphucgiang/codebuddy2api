@@ -152,6 +152,24 @@ describe("model declarations", () => {
                     model,
                     {
                       ...model,
+                      id: "intl-only",
+                      public_id: "intl-only",
+                      upstream_id: "intl-only",
+                      capabilities: {},
+                      limits: {},
+                      metadata_by_profile: { "intl-work": [{ id: "intl-only" }] },
+                    },
+                    {
+                      ...model,
+                      id: "cn-only",
+                      public_id: "cn-only",
+                      upstream_id: "cn-only",
+                      capabilities: {},
+                      limits: {},
+                      metadata_by_profile: { "cn-cli": [{ id: "cn-only" }] },
+                    },
+                    {
+                      ...model,
                       id: "hy-image-3.5",
                       public_id: "hy-image-3.5",
                       upstream_id: "hy-image-3.5",
@@ -189,6 +207,14 @@ describe("model declarations", () => {
     expect(screen.getByText("minimax-video-h3", { selector: "strong" })).toBeTruthy();
     expect(screen.queryByText("hy-image-3.5", { selector: "strong" })).toBeNull();
     choose(capability, "");
+    const region = screen.getByRole("combobox", { name: "筛选区域" });
+    choose(region, "intl");
+    expect(screen.getByText("intl-only", { selector: "strong" })).toBeTruthy();
+    expect(screen.queryByText("cn-only", { selector: "strong" })).toBeNull();
+    choose(region, "cn");
+    expect(screen.getByText("cn-only", { selector: "strong" })).toBeTruthy();
+    expect(screen.queryByText("intl-only", { selector: "strong" })).toBeNull();
+    choose(region, "");
     fireEvent.change(screen.getByRole("textbox", { name: "搜索模型" }), {
       target: { value: "Display" },
     });
