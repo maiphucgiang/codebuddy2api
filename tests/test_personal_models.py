@@ -80,6 +80,31 @@ class PersonalModelTableTests(TestCase):
                          "https://www.codebuddy.cn/v2/enterprises/personal/models")
         self.assertEqual(client.get.call_args_list[1].args[0],
                          "https://copilot.tencent.com/v3/config")
+    def test_preferred_personal_table_is_supplemented_by_v3(self):
+        v3 = {"code": 0, "data": {
+            "models": [
+                {"id": "hy4-preview", "name": "Legacy Hy4", "credits": "x9.9", "supportsToolCall": True},
+                {"id": "v3-only", "name": "V3 only", "supportsToolCall": True},
+            ],
+            "agents": [{"name": "cli", "models": ["hy4-preview", "v3-only"]}],
+        }}
+        client = self._client(self.response(200, personal_payload()), self.response(200, v3))
+        scopes = credits.fetch_model_scopes(
+            jwt("https://www.codebuddy.cn/auth/realms/copilot"), prefer_personal=True)
+        self.assertEqual([item["id"] for item in scopes["picker"]], ["auto", "hy4-preview", "v3-only"])
+        self.assertEqual([item["id"] for item in scopes["account"]],
+                         ["auto", "hy4-preview", "hunyuan-image-alpha", "v3-only"])
+        self.assertEqual(scopes["picker"][1]["name"], "Hy4 preview")
+        self.assertEqual(client.get.call_count, 2)
+        self.assertEqual(client.get.call_args_list[1].args[0], "https://copilot.tencent.com/v3/config")
+
+    def test_personal_table_survives_supplemental_v3_failure(self):
+        client = self._client(self.response(200, personal_payload()), self.response(503, {"code": 503}))
+        scopes = credits.fetch_model_scopes(
+            jwt("https://www.codebuddy.cn/auth/realms/copilot"), prefer_personal=True)
+        self.assertEqual([item["id"] for item in scopes["picker"]], ["auto", "hy4-preview"])
+        self.assertEqual(client.get.call_count, 2)
+
 
     def test_enterprise_preferred_fetch_uses_v3_without_personal_path(self):
         client = self._client(self.response(200, personal_payload()))
