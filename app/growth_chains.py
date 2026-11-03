@@ -456,6 +456,10 @@ def run(code, ctx):
             return {"ok": True, "skipped": True, "message": "该任务已领取过奖励"}
         message = runner(ctx, task)
         after = _task_with_poll(ctx, code, attempts=3)
+        if after is not None and not after["target"]:
+            # 上游故障签名（2026-11-03 实证）：任务在列但 progress/target 缺失，同窗口上报不落账。
+            return {"ok": False,
+                    "message": f"{message}；上游任务进度数据缺失，疑似上游故障，请稍后重试"}
         result = {"ok": True, "message": message,
                   "progress_after": (f"{after['current']}/{after['target']}"
                                      if after and after["target"] else None)}

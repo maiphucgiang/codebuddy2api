@@ -191,6 +191,12 @@ class OrchestrationTests(ChainHarness):
         claims = [post for post in self.posts if post["path"].endswith("/automation_1/claim")]
         self.assertEqual(len(claims), 1)
         self.assertEqual(claims[0]["headers"]["x-client-platform"], "web")
+
+    def test_missing_upstream_progress_reports_failure(self):
+        self.tasks_table = [raw_task("automation_1", current=0, target=0)]
+        result = self.run_chain("automation_1")
+        self.assertFalse(result["ok"])
+        self.assertIn("上游任务进度数据缺失", result["message"])
     def test_busy_account_is_skipped(self):
         self.assertTrue(growth_chains.try_lock("acct"))
         try:
