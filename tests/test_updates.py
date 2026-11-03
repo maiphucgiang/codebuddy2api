@@ -86,6 +86,7 @@ class UpdaterFixture(unittest.TestCase):
         self.sums = None
         self.api_status = 200
         self.requests = []
+        self.api_headers = []
         self.audit = Mock()
         self.config = {"server": fake_server(), "launch": {"argv": ["python3", "converter.py"], "env": {}, "cwd": "/"},
                        "audit_store": self.audit}
@@ -115,6 +116,7 @@ class UpdaterFixture(unittest.TestCase):
         self.requests.append(str(request.url))
         url = str(request.url)
         if url.startswith("https://api.github.com/"):
+            self.api_headers.append(dict(request.headers))
             if self.api_status != 200:
                 return httpx.Response(self.api_status, json={"message": "rate limited"})
             return httpx.Response(200, json=self.releases())
@@ -692,7 +694,31 @@ class AdminRouteTests(UpdaterFixture):
         locked = self.client.post("/admin/update/mirror", json={"mirror": ""}, headers=self.headers)
         self.assertEqual(locked.status_code, 422)
         self.assertIn("锁定", locked.json()["error"]["message"])
+        tokened = self.client.post("/admin/update/mirror", json={"github_token": "github_pat_x1"},
+                                   headers=self.headers)
+        self.assertEqual(tokened.status_code, 200)
+        self.assertTrue(tokened.json()["github_token"])
+        self.assertNotIn("github_pat_x1", str(self.client.get("/admin/update", headers=self.headers).json()))
+        cleared = self.client.post("/admin/update/mirror", json={"github_token": "  "}, headers=self.headers)
+        self.assertEqual(cleared.status_code, 200)
+        self.assertFalse(cleared.json()["github_token"])
+        bad = self.client.post("/admin/update/mirror", json={"github_token": 7}, headers=self.headers)
+        self.assertEqual(bad.status_code, 422)
         self.assertTrue(self.client.get("/admin/update", headers=self.headers).json()["mirror_locked"])
+
+    def test_the_github_token_reaches_the_api_but_never_downloads_or_mirrors(self):
+        self.config["update_github_token"] = "github_pat_x1"
+        self.config["update_mirror"] = self.prefix = "https://mirror.example/"
+        updater = self.updater()
+        updater.check()
+        self.assertTrue(self.api_headers)
+        self.assertTrue(all(h.get("authorization") == "Bearer github_pat_x1" for h in self.api_headers))
+        for url in self.requests:
+            if "api.github.com" not in url:
+                self.assertIn("mirror.example/", url)
+        view = updater.view()
+        self.assertTrue(view["github_token"])
+        self.assertNotIn("github_pat_x1", str(view))
 
     def test_mirror_route_remembers_the_custom_slot(self):
         saved = self.client.post("/admin/update/mirror", json={"mirror": "https://slot.example",

@@ -53,6 +53,7 @@ export function MirrorDrawer({
   mirrors,
   custom,
   locked,
+  githubToken,
   onSaved,
   onClose,
 }: {
@@ -60,12 +61,15 @@ export function MirrorDrawer({
   mirrors: string[];
   custom: string;
   locked: boolean;
+  githubToken: boolean;
   onSaved: () => void;
   onClose: () => void;
 }) {
   const t = useT();
   const [draft, setDraft] = useState(custom);
   const [results, setResults] = useState<Record<string, Probe>>({});
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [tokenSaving, setTokenSaving] = useState(false);
   // Sources under test; "*" while every source is being tested at once.
   const [testing, setTesting] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
@@ -107,6 +111,18 @@ export function MirrorDrawer({
       .then(onSaved)
       .catch((err: unknown) => setError(errorMessage(err)))
       .finally(() => setSaving(false));
+  };
+  const saveToken = () => {
+    setTokenSaving(true);
+    setError(null);
+    void api
+      .post("/update/mirror", { github_token: tokenDraft.trim() })
+      .then(() => {
+        setTokenDraft("");
+        onSaved();
+      })
+      .catch((err: unknown) => setError(errorMessage(err)))
+      .finally(() => setTokenSaving(false));
   };
   const everything = testing.includes("*");
   const fastest = Object.values(results)
@@ -185,6 +201,22 @@ export function MirrorDrawer({
             true,
           )}
         </ul>
+        <div className={s.confirmActions}>
+          <input
+            aria-label={t("updates.mirrorToken")}
+            autoComplete="off"
+            placeholder={
+              githubToken ? t("updates.mirrorTokenSet") : t("updates.mirrorTokenPlaceholder")
+            }
+            type="password"
+            value={tokenDraft}
+            onChange={(e) => setTokenDraft(e.target.value)}
+          />
+          <button type="button" disabled={tokenSaving || !tokenDraft.trim()} onClick={saveToken}>
+            {t("updates.mirrorTokenSave")}
+          </button>
+        </div>
+        <small className={s.storageSubtle}>{t("updates.mirrorTokenHint")}</small>
       </div>
     </Drawer>
   );

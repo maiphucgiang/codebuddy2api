@@ -1194,8 +1194,16 @@ def install_admin(app, config, gateway):
     async def update_mirror(request):
         body = await _body(request, 4096)
         # "custom" also refills the WebUI's remembered custom slot.
-        requested = {"update_mirror": body.get("mirror"),
+        # "custom" also refills the WebUI's remembered custom slot.
+        requested = {**({"update_mirror": body["mirror"]} if "mirror" in body else {}),
                      **({"update_mirror_custom": body["custom"]} if "custom" in body else {})}
+        if "github_token" in body:
+            token = body["github_token"]
+            if not isinstance(token, str) or len(token) > 255 or any(ord(char) < 32 for char in token):
+                raise UpdateError("github_token: 类型或值无效")
+            requested["update_github_token"] = token.strip()
+        if not requested:
+            raise UpdateError("请提供要保存的下载源配置")
         try:
             values = validate_settings(requested)
         except ValueError as exc:
@@ -1203,11 +1211,12 @@ def install_admin(app, config, gateway):
 
         def apply():
             with mutation_lock:
-                if any(item["key"] == "update_mirror" and item["locked"] for item in resolve_settings(config)):
+                if "update_mirror" in values and any(item["key"] == "update_mirror" and item["locked"]
+                                                     for item in resolve_settings(config)):
                     raise UpdateError("下载镜像由 CLI 或环境变量锁定，请修改启动配置")
                 control.update_settings(values, control.snapshot()["revision"])
                 config.update(values)
-                config.setdefault("settings_sources", {})["update_mirror"] = "management"
+                config.setdefault("settings_sources", {}).update({key: "management" for key in values})
             event("settings.updated", {"code": "update_mirror"})
             return JSONResponse(updater().view())
         return await run_in_threadpool(apply)

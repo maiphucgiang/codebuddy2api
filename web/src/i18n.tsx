@@ -133,7 +133,7 @@ const zh = {
   "updates.mirror": "下载源",
   "updates.mirrorCardHint": "点击切换下载源并测速",
   "updates.mirrorDesc":
-    "镜像只用于下载发布包；版本列表仍直连 GitHub API，安装前用 GitHub 提供的摘要校验镜像内容。",
+    "镜像只用于下载发布包；版本列表仍直连 GitHub API。安装按所选源优先并自动回退其余下载源，全部用 GitHub 提供的摘要校验。",
   "updates.mirrorDirect": "直连 GitHub",
   "updates.mirrorCustomSlot": "自定义下载源",
   "updates.mirrorCustomPlaceholder": "填写镜像前缀，例如 https://example.com/",
@@ -146,6 +146,12 @@ const zh = {
   "updates.mirrorInUse": "使用中",
   "updates.mirrorUse": "使用",
   "updates.mirrorLocked": "下载源由 CLI 或环境变量 CODEBUDDY2API_UPDATE_MIRROR 锁定。",
+  "updates.mirrorToken": "GitHub Token（可选）",
+  "updates.mirrorTokenPlaceholder": "粘贴 Token，留空并保存即清除",
+  "updates.mirrorTokenSet": "已设置，粘贴新值可更换",
+  "updates.mirrorTokenSave": "保存 Token",
+  "updates.mirrorTokenHint":
+    "建议使用只读 Token，仅用于直连 api.github.com 的版本列表查询（提高限额）；不会发送给任何镜像下载源。",
   "updates.guide.docker": "# 在 docker-compose.yml 所在目录拉取新镜像并重建容器",
   "updates.guide.dockerAuto": "# 可选：写入 crontab，每天 04:00 自动更新",
   "updates.guide.git": "# 在仓库目录更新代码、依赖与 WebUI",
@@ -787,7 +793,7 @@ const en: Record<MessageKey, string> = {
   "updates.mirror": "Download source",
   "updates.mirrorCardHint": "Click to switch sources and test speed",
   "updates.mirrorDesc":
-    "Mirrors only serve release downloads; releases are still listed from the GitHub API, and mirrored archives must match GitHub's digest before installing.",
+    "Mirrors only serve release downloads; releases are still listed from the GitHub API. Installs prefer the chosen source, fall back through the rest automatically, and every source is verified against GitHub's digest.",
   "updates.mirrorDirect": "GitHub (direct)",
   "updates.mirrorCustomSlot": "Custom source",
   "updates.mirrorCustomPlaceholder": "Mirror prefix, e.g. https://example.com/",
@@ -801,6 +807,12 @@ const en: Record<MessageKey, string> = {
   "updates.mirrorUse": "Use",
   "updates.mirrorLocked":
     "The download source is locked by the CLI or CODEBUDDY2API_UPDATE_MIRROR.",
+  "updates.mirrorToken": "GitHub token (optional)",
+  "updates.mirrorTokenPlaceholder": "Paste a token; save empty to clear",
+  "updates.mirrorTokenSet": "Set — paste a new value to replace it",
+  "updates.mirrorTokenSave": "Save token",
+  "updates.mirrorTokenHint":
+    "A read-only token is recommended. It is only used for release listings from api.github.com over a direct connection (higher rate limit) and is never sent to any download mirror.",
   "updates.guide.docker":
     "# Pull the new image and recreate the container next to docker-compose.yml",
   "updates.guide.dockerAuto": "# Optional: crontab entry that updates daily at 04:00",

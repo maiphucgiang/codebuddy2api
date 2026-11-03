@@ -44,6 +44,7 @@ type UpdateState = {
   mirrors: string[];
   mirrorCustom: string;
   mirrorLocked: boolean;
+  githubToken: boolean;
   build: Build | null;
 };
 // Where the running code came from: a git checkout against its tag, or an image's channel.
@@ -104,6 +105,7 @@ function normalize(value: unknown): UpdateState {
       : [],
     mirrorCustom: typeof d.mirror_custom === "string" ? d.mirror_custom : "",
     mirrorLocked: d.mirror_locked === true,
+    githubToken: d.github_token === true,
     build: d.build && typeof d.build === "object" ? build(object(d.build)) : null,
   };
 }
@@ -386,6 +388,7 @@ export function Updates() {
                 mirrors={d.mirrors}
                 custom={d.mirrorCustom}
                 locked={d.mirrorLocked}
+                githubToken={d.githubToken}
                 onSaved={reload}
                 onClose={() => setMirrorOpen(false)}
               />

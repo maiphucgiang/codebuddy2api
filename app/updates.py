@@ -116,13 +116,22 @@ class Updater:
     def custom_mirror(self):
         return self.config.get("update_mirror_custom") or ""
 
-    def _client(self, timeout=30):
-        return httpx.Client(transport=self._transport, timeout=timeout, follow_redirects=True,
-                            headers={"User-Agent": f"codebuddy2api/{self.current}",
-                                     "Accept": "application/vnd.github+json"})
+    @property
+    def github_token(self):
+        return self.config.get("update_github_token") or ""
 
-    def _get(self, url, limit):
-        with self._client() as client, client.stream("GET", url) as response:
+    def _client(self, timeout=30, token=""):
+        headers = {"User-Agent": f"codebuddy2api/{self.current}",
+                   "Accept": "application/vnd.github+json"}
+        if token:
+            # Release listings only: api.github.com is never mirrored, and asset downloads
+            # go out without credentials so no mirror ever observes the token.
+            headers["Authorization"] = f"Bearer {token}"
+        return httpx.Client(transport=self._transport, timeout=timeout, follow_redirects=True,
+                            headers=headers)
+
+    def _get(self, url, limit, *, token=""):
+        with self._client(token=token) as client, client.stream("GET", url) as response:
             response.raise_for_status()
             data = bytearray()
             for chunk in response.iter_bytes():
@@ -162,7 +171,7 @@ class Updater:
                 return self.view()
             self._attempted_at = now
             try:
-                payload = json.loads(self._get(RELEASES_API, MAX_API_BYTES))
+                payload = json.loads(self._get(RELEASES_API, MAX_API_BYTES, token=self.github_token))
                 if not isinstance(payload, list):
                     raise ValueError("unexpected releases payload")
                 releases = sorted((release for release in map(self._release, payload) if release),
@@ -240,6 +249,7 @@ class Updater:
                     "update_available": bool(latest and _version(latest["version"]) > _version(self.current)),
                     "releases": [dict(release) for release in self._releases], "job": dict(self._job),
                     "mirror": self.mirror, "mirrors": list(MIRRORS), "mirror_custom": self.custom_mirror,
+                    "github_token": bool(self.github_token),
                     "mirror_locked": self.config.get("settings_sources", {}).get("update_mirror")
                     in ("cli", "environment", "dotenv"),
                     "build": self._build or None}

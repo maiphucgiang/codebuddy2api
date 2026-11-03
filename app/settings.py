@@ -167,6 +167,9 @@ SCHEMA = {
     # The WebUI's own slot for one custom mirror, remembered even while another source is in use.
     "update_mirror_custom": _item("", "string", "自定义 GitHub 下载镜像", allow_empty=True, max_length=200,
                                   validator=normalize_update_mirror, hidden=True, env_scope="none"),
+    # Optional read-only GitHub API token for release listings; api.github.com only, never mirrors.
+    "update_github_token": _item("", "string", "GitHub API Token（可选，建议只读）", env="CODEBUDDY2API_UPDATE_GITHUB_TOKEN",
+                                 allow_empty=True, max_length=255, hidden=True),
     # Scheduled configuration backups (app/backups.py); only scheduled ones are pruned to the limit.
     "backup_auto": _item(False, "boolean", "自动备份配置", env="CODEBUDDY2API_BACKUP_AUTO"),
     "backup_interval_hours": _item(24, "integer", "自动备份间隔（小时）", env="CODEBUDDY2API_BACKUP_INTERVAL_HOURS",
