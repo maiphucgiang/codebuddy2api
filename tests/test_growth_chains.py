@@ -7,7 +7,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct exe
 
 import json
 import unittest
-from datetime import datetime
 from unittest.mock import patch
 
 import httpx
@@ -27,10 +26,7 @@ def raw_task(code, *, current=0, target=1, accept="accepted", locked=False):
 def default_tasks():
     return [raw_task("chat_5", current=3, target=5),
             raw_task("RichMeow_Chat", current=0, target=1),
-            raw_task("Library_read", current=0, target=1),
-            raw_task("black_cat", current=0, target=2),
-            raw_task("Model_chat_GLM5.2", current=0, target=1, accept="not_accepted")]
-
+            raw_task("Library_read", current=0, target=1)]
 
 class ChainHarness(unittest.TestCase):
     def setUp(self):
@@ -187,23 +183,14 @@ class OrchestrationTests(ChainHarness):
         self.assertIn("没有此任务", result["message"])
 
     def test_claimable_after_chain_auto_claims(self):
-        def real_chat(base, headers, expert_id="", model=growth_events.FAST_MODEL, prompt=""):
-            return "wb2api-conv-x", "cmb-" + "a" * 32
-
-        self.tasks_table = [raw_task("Model_chat_GLM5.2", current=1, target=1, accept="not_accepted")]
-        # accept 之后回读即可领奖：claim mock 返回到账。
-        self.claims["Model_chat_GLM5.2"] = {"already_claimed": False, "credit": 100, "energy": 5}
-        result = self.run_chain("Model_chat_GLM5.2", real_chat=real_chat)
+        self.tasks_table = [raw_task("automation_1", current=1, target=1)]
+        result = self.run_chain("automation_1")
         self.assertTrue(result["ok"], result)
         self.assertTrue(result.get("claimed"))
         self.assertIn("已自动领奖 +100c +5e", result["message"])
-        accept_posts = [post for post in self.posts if post["path"] == growth_tasks.ACCEPT_PATH]
-        self.assertEqual(len(accept_posts), 1)
-        self.assertEqual(accept_posts[0]["body"], {"task_codes": ["Model_chat_GLM5.2"]})
-        claims = [post for post in self.posts if post["path"].endswith("/Model_chat_GLM5.2/claim")]
+        claims = [post for post in self.posts if post["path"].endswith("/automation_1/claim")]
         self.assertEqual(len(claims), 1)
         self.assertEqual(claims[0]["headers"]["x-client-platform"], "web")
-
     def test_busy_account_is_skipped(self):
         self.assertTrue(growth_chains.try_lock("acct"))
         try:
@@ -268,18 +255,6 @@ class NamedExpertTests(ChainHarness):
         self.assertEqual(actual["cost"], 0)
 
 
-class NightWindowTests(ChainHarness):
-    def test_window_boundaries(self):
-        for hour, expected in ((22, False), (23, True), (0, True), (7, True), (8, False)):
-            with self.subTest(hour=hour):
-                self.assertEqual(growth_chains.in_night_window(datetime(2026, 10, 19, hour)), expected)
-
-    def test_black_cat_outside_window_is_reported_not_run(self):
-        with patch.object(growth_chains, "in_night_window", return_value=False):
-            result = self.run_chain("black_cat")
-        self.assertTrue(result["ok"], result)
-        self.assertIn("23:00–08:00", result["message"])
-        self.assertEqual([post for post in self.posts if post["path"] == "/v2/report"], [])
 
 
 class MiniProgramTests(ChainHarness):
@@ -291,12 +266,11 @@ class MiniProgramTests(ChainHarness):
         self.enterContext(patch.object(growth_chains, "ACCEPT_VERIFY_GAP_S", 0))
 
     def mp_tasks(self):
-        return [raw_task("school_season", current=0, target=1, accept="not_accepted")]
+        return [raw_task("Sequential_Tasks_1", current=0, target=1, accept="not_accepted")]
 
-    def test_school_season_accepts_and_reports_activity_id(self):
+    def test_sequential_1_accepts_and_reports_mp_chat(self):
         self.tasks_table = self.mp_tasks()
-        self.claims["school_season"] = {"already_claimed": False, "credit": 100, "energy": 5}
-        result = self.run_chain("school_season")
+        result = self.run_chain("Sequential_Tasks_1")
         self.assertTrue(result["ok"], result)
         accept = [post for post in self.posts if post["path"] == growth_tasks.ACCEPT_PATH]
         self.assertEqual(accept[-1]["headers"]["x-client-platform"], growth_tasks.MP_PLATFORM)
@@ -305,9 +279,7 @@ class MiniProgramTests(ChainHarness):
         self.assertEqual(report["headers"]["x-client-platform"], "mp-weixin")
         event = report["body"][0]
         self.assertEqual(event["eventCode"], "chat_request_send")
-        self.assertEqual(event["activityId"], growth_chains.SCHOOL_ACTIVITY_ID)
         self.assertEqual(event["platform"], "mini_program")
-
     def test_accept_not_registered_waits_for_next_round(self):
         self.tasks_table = self.mp_tasks()
         original = self.transport
@@ -316,11 +288,11 @@ class MiniProgramTests(ChainHarness):
             response = original(request)
             if request.url.path == growth_tasks.ACCEPT_PATH:
                 # accept 永不落账：回读仍为 not_accepted。
-                self.tasks_table = [raw_task("school_season", current=0, target=1, accept="not_accepted")]
+                self.tasks_table = [raw_task("Sequential_Tasks_1", current=0, target=1, accept="not_accepted")]
             return response
 
         self.transport = stale_accept
-        result = self.run_chain("school_season")
+        result = self.run_chain("Sequential_Tasks_1")
         self.assertTrue(result["ok"], result)
         self.assertIn("accept 未登记生效", result["message"])
         self.assertEqual([post for post in self.posts if post["path"] == "/v2/report"], [])

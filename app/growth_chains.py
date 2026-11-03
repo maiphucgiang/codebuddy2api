@@ -11,7 +11,6 @@ from __future__ import annotations
 import secrets
 import threading
 import time
-from datetime import datetime
 
 from . import growth_events, growth_tasks
 
@@ -23,7 +22,6 @@ MP_PLATFORM = growth_tasks.MP_PLATFORM
 MP_CHAT_GAP_S = 45.0
 EXPERT_SUMMON_GAP_S = 6.0
 ACCEPT_VERIFY_GAP_S = 2.0
-APPEARANCE_SETTLE_S = 2.0
 POLL_ATTEMPTS = 4
 POLL_GAP_S = 3.0
 CLAIMED_INCOMPLETE = "reward_already_claimed"
@@ -31,7 +29,6 @@ CLAIMED_INCOMPLETE = "reward_already_claimed"
 _LOCKS_GUARD = threading.Lock()
 _BUSY: set[str] = set()
 
-SCHOOL_ACTIVITY_ID = "school_open_day_2026"
 LIBRARY_URL = "https://www.workbuddy.cn/space/d/o0KWYeynteVv06UnAZqIFm"
 QQ_BUDDY_ID = "cb_y5Dy46tPQGGWtueMxXbe"
 QQ_BUDDY_NAME = "企鹅教师助手"
@@ -60,7 +57,6 @@ NAMED_EXPERT_TASKS = {
 }
 SKILL_NAME = "润泽小馆·日报撰写"
 SKILL_ID = "skill_2097350077599879168"
-THEME_KEY = "theme-tkmw7j"
 DEFAULT_CHAT_MODEL = "glm-5.2"
 
 
@@ -77,9 +73,6 @@ def unlock(account_key):
         _BUSY.discard(account_key)
 
 
-def in_night_window(now=None):
-    hour = (now or datetime.now()).hour
-    return hour >= 23 or hour < 8
 
 
 class Context:
@@ -140,14 +133,6 @@ def _claim_if_ready(ctx, code, task, message):
     return message + f"；已领奖 +{credit}c +{energy}e"
 
 
-def _ensure_accepted(ctx, task, code):
-    if task["locked"]:
-        return "任务未解锁（按官方节奏逐日开放），已跳过"
-    if task["accept_status"] in ("", "not_accepted"):
-        platform = MP_PLATFORM if growth_tasks.GROUPS.get(code) == "miniprogram" else growth_tasks.WEB_PLATFORM
-        growth_tasks.accept_tasks(ctx.token, [code], ctx.uid, ctx.domain, platform=platform)
-        return None
-    return None
 
 
 def _need(task, default_target):
@@ -181,7 +166,7 @@ def run_rich_meow(ctx, task):
 
 def run_buddy_app(ctx, task):
     _report_desktop(ctx, growth_events.buddy_app_sequence(QQ_BUDDY_ID, QQ_BUDDY_NAME))
-    return "已上报 Buddy 应用进入五连事件（同时覆盖 Buddy_App 与 Buddy_App_QQ）"
+    return "已上报 Buddy 应用进入五连事件"
 
 
 def run_automation_1(ctx, task):
@@ -220,18 +205,8 @@ def run_playbook_prompt(ctx, task):
     return "已上报灵感案例做同款事件组"
 
 
-def run_create_canvas(ctx, task):
-    stamp = int(time.time() * 1000)
-    _report_desktop(ctx, growth_events.design_canvas_sequence(
-        f"wb2api-canvas-{stamp}", f"wb2api-canvas-req-{stamp}"))
-    return "已上报设计画布创建事件组"
 
 
-def run_hp_appearance(ctx, task):
-    growth_events.set_appearance_theme(ctx.base, ctx.token, ctx.uid, THEME_KEY)
-    time.sleep(APPEARANCE_SETTLE_S)
-    _report_desktop(ctx, [growth_events.appearance_apply_event(THEME_KEY)])
-    return "已设置主题并上报皮肤生效事件"
 
 
 # ---------------------------------------------------------------------------
@@ -243,17 +218,6 @@ def _real_chat(ctx, expert_id="", model=DEFAULT_CHAT_MODEL):
     return growth_events.desktop_chat(ctx.base, headers, expert_id=expert_id, model=model)
 
 
-def run_model_chat_glm(ctx, task):
-    message = _ensure_accepted(ctx, task, "Model_chat_GLM5.2") if task else None
-    if message:
-        return message
-    _conversation, request_id = _real_chat(ctx, model="glm-5.2")
-    time.sleep(growth_events.REPORT_GAP_S)
-    growth_events.report_chat_activity(ctx.base, ctx.token, ctx.uid,
-                                       f"wb2api-glm52-{int(time.time() * 1000)}",
-                                       request_id, "glm-5.2", "GLM-5.2",
-                                       nickname=ctx.nickname, domain=ctx.domain)
-    return "已完成 glm-5.2 真实对话并上报"
 
 
 def run_skill_1(ctx, task):
@@ -353,26 +317,6 @@ def run_expert_shangjia_xuanchuan(ctx, task):
     return _run_named_expert(ctx, NAMED_EXPERT_TASKS["expert_use_shangjia_xuanchuan"])
 
 
-def run_black_cat(ctx, task):
-    if not in_night_window():
-        return "当前不在 23:00–08:00 计数窗口，行为不计分；窗口内自动补足"
-    need, _target = _need(task, 1)
-    if need <= 0:
-        return "进度已达标，无需补足"
-    done = 0
-    for index in range(need):
-        try:
-            _real_chat(ctx, model="glm-5.2", prompt="1+1等于几？直接回答。")
-            growth_events.report_chat_activity(ctx.base, ctx.token, ctx.uid,
-                                               f"wb2api-night-{int(time.time() * 1000)}-{index}",
-                                               "", "glm-5.2", "GLM-5.2",
-                                               nickname=ctx.nickname, domain=ctx.domain)
-        except growth_events.Failure as error:
-            return f"完成 {done}/{need} 次后中断: {error}"
-        done += 1
-        if index < need - 1:
-            time.sleep(4)
-    return f"已完成 {done} 次夜间对话并上报"
 
 
 # ---------------------------------------------------------------------------
@@ -476,111 +420,23 @@ def _run_mp_mini_chat(ctx, code, *, activity_id=None, model=None):
     return f"任务点亮并领取奖励（+{credit}c +{energy}e）"
 
 
-def _run_mp_event_task(ctx, code, events_builder):
-    task = _mp_task(ctx, code)
-    if task is None:
-        return "mp 口径未下发该任务（活动可能已结束）"
-    if task["claimed"]:
-        return "已领取"
-    locked = task["locked"]
-    if not locked and task["accept_status"] in ("", "not_accepted"):
-        verified = _accept_with_verify_mp(ctx, code)
-        if verified is None:
-            return "accept 未登记生效（上游 200+OK 但未落账形态），待下次重试"
-    elif locked:
-        return "任务未解锁（按官方节奏逐日开放），已跳过"
-    target = task["target"] or 1
-    if task["current"] >= target or task["accept_status"] == "completed":
-        credit, energy, _ = growth_tasks.claim_reward(ctx.token, code, ctx.uid, ctx.domain,
-                                                      platform=MP_PLATFORM)
-        return f"已领取奖励（+{credit}c +{energy}e）"
-    _report_mp(ctx, events_builder())
-    task = _mp_task(ctx, code) or task
-    for _ in range(2):
-        time.sleep(POLL_GAP_S)
-        task = _mp_task(ctx, code) or task
-        if task["claimable"] or task["claimed"] or task["current"] >= target:
-            break
-    if task["claimable"] or task["accept_status"] == "completed":
-        credit, energy, _ = growth_tasks.claim_reward(ctx.token, code, ctx.uid, ctx.domain,
-                                                      platform=MP_PLATFORM)
-        return f"任务点亮并领取奖励（+{credit}c +{energy}e）"
-    return f"已上报但进度 {task['current']}/{target}（异步计分未归账，下次重试）"
-
-
-def run_school_season(ctx, task):
-    return _run_mp_mini_chat(ctx, "school_season", activity_id=SCHOOL_ACTIVITY_ID)
-
-
 def run_sequential_1(ctx, task):
     return _run_mp_mini_chat(ctx, "Sequential_Tasks_1")
 
 
-def run_sequential_2(ctx, task):
-    def events():
-        experts = growth_events.market_expert_list(ctx.base, ctx.token, ctx.uid, "agent",
-                                                   domain=ctx.domain)
-        if not experts:
-            raise growth_events.Failure("protocol", message="专家市场不可用")
-        expert = experts[0]
-        name = expert.get("display_name_zh") or expert.get("profession_zh") or expert["expert_id"]
-        return [{"eventCode": "expert_actual_use", "reportDelay": 0, "extVersion": "2.2.8",
-                 "source": "mini_program", "id": expert["expert_id"], "name": expert["expert_id"],
-                 "expertTitle": name, "type": "send_message", "characterCount": 12,
-                 "expertType": expert.get("expert_type") or "agent"}]
-    return _run_mp_event_task(ctx, "Sequential_Tasks_2", events)
-
-
-def run_sequential_3(ctx, task):
-    return _run_mp_mini_chat(ctx, "Sequential_Tasks_3")
-
-
-def run_sequential_4(ctx, task):
-    def events():
-        return [_mini_chat_event(f"wb2api-mp-auto-{int(time.time() * 1000)}"),
-                growth_events.automation_create_event("wb2api 自动化")]
-    return _run_mp_event_task(ctx, "Sequential_Tasks_4", events)
-
-
-def run_sequential_5(ctx, task):
-    return _run_mp_mini_chat(ctx, "Sequential_Tasks_5", model="glm-5.2")
-
-
-def run_sequential_6(ctx, task):
-    return _run_mp_mini_chat(ctx, "Sequential_Tasks_6")
-
-
-def run_sequential_7(ctx, task):
-    def events():
-        payload = {"id": "pm-gtm-launch-plan", "name": "新产品上市 GTM 发布计划一页纸",
-                   "type": "document", "categoryId": "", "categoryName": "",
-                   "skills": "", "skillNames": ""}
-        return [{"eventCode": "playbook_cta_click", "source": "discover", "position": 1,
-                 "extVersion": "2.2.8", **payload},
-                {"eventCode": "playbook_prompt_send", "source": "discover", "promptLength": 96,
-                 "isOfficial": 1, "conversationId": "wb2api-mp-pb-" + secrets_token(),
-                 "extVersion": "2.2.8", **payload}]
-    return _run_mp_event_task(ctx, "Sequential_Tasks_7", events)
-
-
 RUNNERS = {
     "chat_5": run_chat_5, "RichMeow_Chat": run_rich_meow, "Buddy_App": run_buddy_app,
-    "Buddy_App_QQ": run_buddy_app, "automation_1": run_automation_1,
+    "automation_1": run_automation_1,
     "Library_read": run_library_read, "template_5": run_template_5,
-    "playbook_prompt": run_playbook_prompt, "create_canvas": run_create_canvas,
-    "Hp_Appearance": run_hp_appearance,
-    "Model_chat_GLM5.2": run_model_chat_glm, "skill_1": run_skill_1, "expert_5": run_expert_5,
+    "playbook_prompt": run_playbook_prompt,
+    "skill_1": run_skill_1, "expert_5": run_expert_5,
     "Expert_team_use_3": run_expert_team_3, "Expert_lighthouse": run_expert_lighthouse,
     "WorkBuddy_Valorant": run_workbuddy_valorant,
     "expert_use_bowangwang": run_expert_bowangwang,
     "expert_use_douyinyin": run_expert_douyinyin,
     "expert_use_maidehao": run_expert_maidehao,
     "expert_use_shangjia_xuanchuan": run_expert_shangjia_xuanchuan,
-    "black_cat": run_black_cat,
-    "school_season": run_school_season, "Sequential_Tasks_1": run_sequential_1,
-    "Sequential_Tasks_2": run_sequential_2, "Sequential_Tasks_3": run_sequential_3,
-    "Sequential_Tasks_4": run_sequential_4, "Sequential_Tasks_5": run_sequential_5,
-    "Sequential_Tasks_6": run_sequential_6, "Sequential_Tasks_7": run_sequential_7,
+    "Sequential_Tasks_1": run_sequential_1,
 }
 
 

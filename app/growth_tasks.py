@@ -25,18 +25,14 @@ WEB_PLATFORM = "web"
 # 任务分组与中文标签（存储键=上游 task_code；UI 改名只动这里）。
 GROUPS = {
     "chat_5": "behavior", "RichMeow_Chat": "behavior", "Buddy_App": "behavior",
-    "Buddy_App_QQ": "behavior", "automation_1": "behavior", "Library_read": "behavior",
-    "template_5": "behavior", "playbook_prompt": "behavior", "create_canvas": "behavior",
-    "Hp_Appearance": "behavior",
-    "Model_chat_GLM5.2": "chat", "skill_1": "chat", "expert_5": "chat",
-    "Expert_team_use_3": "chat", "Expert_lighthouse": "chat", "black_cat": "chat",
+    "automation_1": "behavior", "Library_read": "behavior",
+    "template_5": "behavior", "playbook_prompt": "behavior",
+    "skill_1": "chat", "expert_5": "chat",
+    "Expert_team_use_3": "chat", "Expert_lighthouse": "chat",
     "WorkBuddy_Valorant": "chat", "expert_use_bowangwang": "chat",
     "expert_use_douyinyin": "chat", "expert_use_maidehao": "chat",
     "expert_use_shangjia_xuanchuan": "chat",
-    "school_season": "miniprogram", "Sequential_Tasks_1": "miniprogram",
-    "Sequential_Tasks_2": "miniprogram", "Sequential_Tasks_3": "miniprogram",
-    "Sequential_Tasks_4": "miniprogram", "Sequential_Tasks_5": "miniprogram",
-    "Sequential_Tasks_6": "miniprogram", "Sequential_Tasks_7": "miniprogram",
+    "Sequential_Tasks_1": "miniprogram",
 }
 KNOWN_TASK_CODES = frozenset(GROUPS)
 GROUP_LABELS = {"behavior": "行为上报", "chat": "真实对话", "miniprogram": "小程序"}

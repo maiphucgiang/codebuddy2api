@@ -19,7 +19,6 @@ DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) WorkBuddyDesktop/5.9.3 
 WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
 REPORT_PATH = "/v2/report"
-APPEARANCE_PATH = "/v2/user-asset/appearance/set"
 MARKET_PATH = "/portal/operation-platform/market/expert/list"
 FAST_MODEL = "fast-model"
 REPORT_GAP_S = 1.05
@@ -165,7 +164,7 @@ def chat_sequence(conversation_id, request_id, message_id, model_id=FAST_MODEL,
 
 
 def buddy_app_sequence(buddy_id, buddy_name):
-    """Five-event Buddy-app entry chain (covers Buddy_App and Buddy_App_QQ together)."""
+    """Five-event Buddy-app entry chain (covers the Buddy_App entry task)."""
     def event(code, extra=None):
         return {"eventCode": code, "mode": "LOCAL", "buddyId": buddy_id, "buddyName": buddy_name,
                 **(extra or {})}
@@ -204,27 +203,6 @@ def playbook_prompt_sequence(conversation_id, request_id, case_id, case_name):
     return events
 
 
-def design_canvas_sequence(conversation_id, request_id):
-    events = chat_sequence(conversation_id, request_id, "msg-canvas")
-    events += [{"eventCode": "wbx_design_canvas_task_create", "conversationId": conversation_id,
-                "requestId": request_id, "source": "summon_keyword", "cost": 12000,
-                "isSuccessful": True},
-               {"eventCode": "wbx_design_canvas_open", "conversationId": conversation_id,
-                "requestId": request_id, "id": "ardot-file-" + request_id[len(request_id) - 8:],
-                "source": "summon_keyword", "type": "page", "cost": 13000, "isSuccessful": True}]
-    return events
-
-
-def appearance_apply_event(theme_key):
-    return {"eventCode": "appearance_skin_apply", "action": "apply", "source": "settings_close",
-            "id": theme_key, "vipLevel": 0, "series": "", "type": "unknown"}
-
-
-def set_appearance_theme(base, token, uid, resource_key):
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/plain, */*",
-               "Content-Type": "application/json;charset=UTF-8", "User-Agent": DESKTOP_UA,
-               "X-Product": "SaaS", "X-User-Id": uid}
-    _post_json(base, APPEARANCE_PATH, headers, {"kind": "theme", "resource_key": resource_key})
 
 
 def skill_info_event(conversation_id, request_id, message_id, skill_name, skill_id,

@@ -120,7 +120,7 @@ class UpstreamTests(Isolated):
         summary = growth_tasks.sweep_account(token, uid, domain)
         self.assertTrue(summary["ok"])
         self.assertEqual(summary["claimed"], ["template_5"])
-        self.assertIn("school_season", summary["accepted"])
+        self.assertIn("Sequential_Tasks_1", summary["accepted"])
         self.assertNotIn("skill_1", summary["accepted"])
 
     def test_trial_claims_once(self):
