@@ -45,10 +45,11 @@ MAX_MEMBERS = 20000
 MAX_NOTES = 64 * 1024
 TAG = re.compile(r"v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))")
 # Public prefix proxies for github.com downloads. None of them proxies api.github.com, so
+# Public prefix proxies for github.com downloads. None of them proxies api.github.com, so
 # releases are always listed directly, and mirrored bytes are only trusted once they match
 # the digest the GitHub API reports.
 MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://ghproxy.net/", "https://gh-proxy.org/",
-           "https://gh.llkk.cc/", "https://ghproxy.cc/", "https://hub.gitmirror.com/")
+           "https://gh.ddlc.top/", "https://ghproxy.cc/", "https://github.akams.cn/", "https://hub.gitmirror.com/")
 PROBE_BYTES = 512 * 1024
 PROBE_SECONDS = 8
 # Written into images at build time with the channel (edge for main, stable for tags) and commit.
@@ -282,19 +283,9 @@ class Updater:
             mirror = self.mirror
             if mirror and not release["digest"]:
                 raise UpdateError("通过镜像下载需要 GitHub 提供的文件摘要；该版本没有摘要，请切换为直连")
-            base = f"{mirror}{REPOSITORY_URL}/releases/download/{release['tag']}"
             archive = work / name
-            try:
-                sums = self._get(f"{base}/SHA256SUMS", 64 * 1024).decode("utf-8", "replace")
-                digest = self._download(f"{base}/{name}", archive)
-            except (httpx.HTTPError, UpdateError):
-                raise UpdateError("通过镜像下载失败，请测速后更换镜像或切换为直连" if mirror
-                                  else "下载发布包失败，请检查网络或代理设置（HTTPS_PROXY）") from None
+            digest = self._fetch_release(release, name, archive)
             self._step("verify")
-            expected = {parts[1].lstrip("*"): parts[0].lower()
-                        for parts in (line.split() for line in sums.splitlines()) if len(parts) == 2}
-            if expected.get(name) != digest or release["digest"] not in (None, f"sha256:{digest}"):
-                raise UpdateError("发布包校验失败，已放弃更新")
             self._step("extract")
             staged = self._extract(archive, work / "staged", release["version"])
             names = sorted(entry.name for entry in staged.iterdir())
@@ -343,6 +334,40 @@ class Updater:
                 handle.write(chunk)
                 self._step("download", received=size)
         return digest.hexdigest()
+
+    def _fetch_release(self, release, name, archive):
+        """Download from the chosen source first, then fall back through the rest.
+
+        Every candidate must reproduce both checksums; a source serving other bytes is
+        skipped, so a poisoned mirror cannot block the update while direct still works.
+        """
+        mirror = self.mirror
+        # Mirrored bytes are only trusted against the API digest; without one, direct is the only source.
+        if release["digest"]:
+            rest = [item for item in MIRRORS if item != mirror]
+            candidates = [mirror, "", *rest] if mirror else ["", *rest]
+        else:
+            candidates = [""]
+        failure, verification_failed = None, False
+        for candidate in candidates:
+            base = f"{candidate}{REPOSITORY_URL}/releases/download/{release['tag']}"
+            try:
+                sums = self._get(f"{base}/SHA256SUMS", 64 * 1024).decode("utf-8", "replace")
+                archive.unlink(missing_ok=True)
+                digest = self._download(f"{base}/{name}", archive)
+                self._step("verify")
+            except (httpx.HTTPError, UpdateError) as error:
+                failure = error
+                continue
+            expected = {parts[1].lstrip("*"): parts[0].lower()
+                        for parts in (line.split() for line in sums.splitlines()) if len(parts) == 2}
+            if expected.get(name) == digest and release["digest"] in (None, f"sha256:{digest}"):
+                return digest
+            verification_failed = True
+        reason = "发布包校验失败" if verification_failed else failure
+        raise UpdateError(f"下载发布包失败，已尝试全部下载源（{reason}）；请测速更换镜像或检查网络"
+                          if mirror else
+                          f"下载发布包失败（{reason}）；请检查网络或代理设置（HTTPS_PROXY）")
 
     @staticmethod
     def _extract(archive, destination, version):
@@ -494,7 +519,7 @@ class Updater:
 
     def _probe(self, mirror, url):
         result = {"mirror": mirror, "ok": False, "latency_ms": None, "speed": None, "error": None}
-        started = time.monotonic()
+        started = first = time.monotonic()
         received, head = 0, b""
         try:
             with self._client(httpx.Timeout(PROBE_SECONDS, connect=5)) as client, \
@@ -504,7 +529,9 @@ class Updater:
                     return result
                 for chunk in response.iter_bytes():
                     if result["latency_ms"] is None:
-                        result["latency_ms"] = round((time.monotonic() - started) * 1000)
+                        # Throughput excludes connection setup; time-to-first-byte is reported separately.
+                        first = time.monotonic()
+                        result["latency_ms"] = round((first - started) * 1000)
                     head += chunk[:max(0, 2 - len(head))]
                     received += len(chunk)
                     if received >= PROBE_BYTES or time.monotonic() - started > PROBE_SECONDS:
@@ -519,5 +546,5 @@ class Updater:
             # Some mirrors answer 200 with an HTML page instead of the file.
             result["error"] = "返回的不是发布包"
             return result
-        result.update(ok=True, speed=round(received / max(time.monotonic() - started, 0.001) / 1024, 1))
+        result.update(ok=True, speed=round(received / max(time.monotonic() - first, 0.001) / 1024, 1))
         return result

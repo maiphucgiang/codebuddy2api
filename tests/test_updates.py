@@ -337,6 +337,43 @@ class InstallTests(UpdaterFixture):
         self.assertIn("校验失败", self.wait(updater)["message"])
         self.assert_untouched()
 
+    def test_a_dead_mirror_falls_back_to_direct(self):
+        # The configured mirror answers nothing; the install still completes over direct.
+        self.config["update_mirror"] = "https://mirror.example/"
+        updater = self.updater()
+        updater.check()
+        updater.install("v1.1.0")
+        self.assertEqual(self.wait(updater)["status"], "restarting")
+        downloads = [url for url in self.requests if "releases/download" in url]
+        self.assertTrue(any(url.startswith("https://github.com/") for url in downloads))
+
+    def test_a_poisoned_mirror_falls_back_to_direct_bytes(self):
+        self.config["update_mirror"] = "https://mirror.example/"
+        real = self.archive
+        evil = tarball(release_files("1.1.0", requirements="evil==1\n"), prefix="codebuddy2api-1.1.0")
+        fixture = self
+        sums = f"{hashlib.sha256(real).hexdigest()}  codebuddy2api-1.1.0.tar.gz\n"
+        base = f"{REPOSITORY_URL}/releases/download/v1.1.0/"
+
+        def handler(request):
+            url = str(request.url)
+            if url.startswith("https://api.github.com/"):
+                return httpx.Response(200, json=fixture.releases())
+            mirrored = url.startswith("https://mirror.example/")
+            if url.endswith(base + "SHA256SUMS"):
+                return httpx.Response(200, text=(hashlib.sha256(evil).hexdigest() + "  codebuddy2api-1.1.0.tar.gz\n"
+                                                 if mirrored else sums))
+            if url.endswith(base + "codebuddy2api-1.1.0.tar.gz"):
+                return httpx.Response(200, content=evil if mirrored else real)
+            return httpx.Response(404)
+
+        updater = Updater(self.config, root=self.root, data_dir=self.data, version="1.0.0",
+                          deployment="archive", transport=httpx.MockTransport(handler))
+        updater.check()
+        updater.install("v1.1.0")
+        self.assertEqual(self.wait(updater)["status"], "restarting")
+        self.assertNotIn("evil", (self.root / "requirements.txt").read_text())
+
     def test_container_layers_fall_back_to_copying_directories(self):
         updater = self.updater("docker")
         updater.check()
