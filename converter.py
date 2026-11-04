@@ -5016,6 +5016,14 @@ def _check_upstream_status(status, raw, cred, model, *, headers=None, from_chann
                                 from_channel_fallback=from_channel_fallback)
 
 
+def _origin_replay_safe(raw: bytes) -> bool:
+    """Preserve filter, channel and model-specific errors before origin replay."""
+    if is_filter_error(raw):
+        return False
+    code, _, _ = _upstream_diagnostic(raw)
+    return code not in NO_FAILOVER_UPSTREAM_CODES and code not in MODEL_SCOPED_ERROR_CODES
+
+
 @asynccontextmanager
 async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred,
                                on_channel_body=None):
@@ -5026,11 +5034,11 @@ async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred,
     from_channel_fallback = False
     channel_body_retried = False
 
-    def switch_origin(**fields):
+    def switch_origin(*, cost_note="", **fields):
         nonlocal url, origin_url
         target = origin_url
         observe_attempt("origin_fallback", profile=profile, upstream_model=body.get("model"), **fields)
-        _log(f"[{rid}] 上游入口不可用，切换 WorkBuddy 备份源站重试 | {model_name}")
+        _log(f"[{rid}] 上游入口不可用，切换 WorkBuddy 备份源站重试 | {model_name}{cost_note}")
         url, origin_url = target, None
 
     while True:
@@ -5043,8 +5051,9 @@ async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred,
                     yield response
                     return
                 raw = await read_bounded_error(response)
-                if should_origin_fallback(origin_url, response.status_code):
-                    switch_origin(status_code=response.status_code)
+                if should_origin_fallback(origin_url, response.status_code) and _origin_replay_safe(raw):
+                    switch_origin(status_code=response.status_code,
+                                  cost_note=_replay_cost_note(response.status_code))
                     continue
                 if should_channel_fallback(fallback_url, response.status_code, raw):
                     observe_attempt("channel_check_fallback", status_code=response.status_code,
@@ -5074,7 +5083,7 @@ async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred,
         except httpx.HTTPError as error:
             if response_started or origin_url is None or not _failover_safe(error):
                 raise
-            switch_origin(error_code=type(error).__name__)
+            switch_origin(error_code=type(error).__name__, cost_note=_replay_cost_note(error))
 
 def _upstream_failure(error, model_name, t0, rid):
     """Normalize failure logs and payloads before endpoint-specific error wrapping."""
@@ -5314,6 +5323,8 @@ POSSIBLY_CHARGED_CODES = frozenset({502, 504})
 
 def _replay_cost_note(error) -> str:
     """Label replays that may duplicate already billed work."""
+    if isinstance(error, int) and error in POSSIBLY_CHARGED_CODES:
+        return " | 上游可能已处理该请求"
     if isinstance(error, UpstreamHTTPError) and error.status in POSSIBLY_CHARGED_CODES:
         return " | 上游可能已处理该请求"
     if isinstance(error, WRITE_TIMEOUT_TRANSPORT):

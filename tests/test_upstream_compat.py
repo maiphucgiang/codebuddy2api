@@ -197,6 +197,7 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.channel_mode = None
         self.channel_uid = None
         self.origin_mode = None
+        self.origin_error = None
 
     def record(self, request):
         uid = request.headers.get("x-user-id")
@@ -217,6 +218,8 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         if self.origin_mode and path == "/v2/chat/completions":
             self.record(request)
             if request.url.host == "www.workbuddy.cn":
+                if self.origin_mode == "protected":
+                    return httpx.Response(503, json=self.origin_error)
                 if self.origin_mode == "transport":
                     raise httpx.ConnectError("synthetic connect failure", request=request)
                 return httpx.Response(502, json={"error": {"message": "synthetic unavailable"}})
@@ -342,6 +345,31 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual([request.url.host for request in self.requests],
                          ["www.workbuddy.cn", "www.workbuddy.cn", "wb.tencentbuddy.com"])
+
+    def test_cn_work_origin_fallback_preserves_protected_errors(self):
+        self.configure_profiles("cn-work")
+        self.origin_mode = "protected"
+        cases = {
+            "filter": {"error": {"code": "content_filter", "message": "filtered"}},
+            "channel": {"code": 11128, "msg": "channel rejected"},
+            "model": {"code": 11102, "msg": "model [shared-model] service info not found"},
+        }
+        for label, payload in cases.items():
+            for stream in (False, True):
+                with self.subTest(label=label, stream=stream):
+                    self.origin_error = payload
+                    self.requests.clear()
+                    response = self.client.post("/v1/chat/completions", json=self.payload(stream=stream))
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertEqual([request.url.host for request in self.requests], ["www.workbuddy.cn"])
+
+    def test_cn_work_origin_fallback_logs_possible_billing(self):
+        self.configure_profiles("cn-work")
+        self.origin_mode = "http"
+        with patch.object(converter, "_log") as log:
+            response = self.client.post("/v1/chat/completions", json=self.payload())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(any("上游可能已处理该请求" in call.args[0] for call in log.call_args_list))
 
     def test_channel_rejection_moves_system_to_user_once_on_same_account(self):
         self.configure_profiles("intl-work")
