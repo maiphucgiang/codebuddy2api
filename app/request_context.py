@@ -105,8 +105,11 @@ def build_attempt_headers(headers, profile, *, root, message_id, request_id, tra
                 "traceparent": f"00-{trace_id}-{span}-01", "b3": f"{trace_id}-{span}-1-{parent}",
                 "X-B3-TraceId": trace_id, "X-B3-SpanId": span, "X-B3-ParentSpanId": parent,
                 "X-B3-Sampled": "1"}
-    if profile == "cn-work":
+    if profile in _WORKBUDDY_PROFILES:
         outgoing["X-Agent-Runtime"] = "local-agent"
+    elif profile == "intl-cli":
+        outgoing["X-Agent-Runtime"] = "other"
+    if profile == "cn-work":
         if conversation_id:
             outgoing["X-Session-ID"] = conversation_id
             outgoing["X-Root-Request-ID"] = _stable_uuid7(["root", conversation_id]).replace("-", "")

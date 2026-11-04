@@ -11,9 +11,9 @@ from .site_routing import domain_for_auth, profile_for_auth, profile_product, pr
 CLI_VERSION = "2.165.0"
 WORKBUDDY_VERSION = "5.9.3"
 WORKBUDDY_CLI_VERSION = CLI_VERSION
-INTL_CLI_VERSION = "2.161.0"
-INTL_WORKBUDDY_VERSION = "5.8.4"
-INTL_WORKBUDDY_CLI_VERSION = INTL_CLI_VERSION
+INTL_CLI_VERSION = "2.179.3"
+INTL_WORKBUDDY_VERSION = "5.9.4"
+INTL_WORKBUDDY_CLI_VERSION = "2.165.0"
 CLI_USER_AGENT = f"CLI/{CLI_VERSION} CodeBuddy/{CLI_VERSION}"
 
 SDK_HEADERS = {
@@ -118,7 +118,14 @@ def _identity_claim_headers(auth: dict, account: dict) -> dict:
 
 
 def credential_headers(auth: dict, account: dict) -> dict:
-    return {**SDK_HEADERS, **_auth_headers(auth, account), **_identity_claim_headers(auth, account)}
+    profile = profile_for_auth(auth)
+    headers = {**SDK_HEADERS, **_auth_headers(auth, account), **_identity_claim_headers(auth, account)}
+    if profile == "intl-cli":
+        headers["x-stainless-package-version"] = "7.39.0"
+        headers["X-Agent-Runtime"] = "other"
+    elif profile == "intl-work":
+        headers["X-Agent-Runtime"] = "local-agent"
+    return headers
 
 
 def _cn_work_nonchat_headers(headers: dict, profile: str) -> dict:
