@@ -35,6 +35,12 @@ GROUPS = {
     "Sequential_Tasks_1": "miniprogram",
 }
 KNOWN_TASK_CODES = frozenset(GROUPS)
+# 上游名单轮换后下线的任务码：旧库里可能残留对应开关，读取时丢弃而不是判定损坏。
+RETIRED_TASK_CODES = frozenset({
+    "Buddy_App_QQ", "Hp_Appearance", "Model_chat_GLM5.2", "black_cat", "create_canvas",
+    "school_season", "Sequential_Tasks_2", "Sequential_Tasks_3", "Sequential_Tasks_4",
+    "Sequential_Tasks_5", "Sequential_Tasks_6", "Sequential_Tasks_7",
+})
 GROUP_LABELS = {"behavior": "行为上报", "chat": "真实对话", "miniprogram": "小程序"}
 
 

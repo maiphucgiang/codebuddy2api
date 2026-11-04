@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Test growth-center task listing, claiming and the automation switch surface."""
 import sys
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
@@ -249,6 +250,15 @@ class StoreSwitchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ControlStore(self.path)
 
+    def test_retired_growth_codes_are_dropped(self):
+        # 下线任务码残留在旧库里不能阻断启动：读取时丢弃，下一次写入后库里不再保留。
+        self.store._update(None, lambda state: state["credentials"].setdefault(
+            "acct", {"enabled": True}).update(growth_auto={"chat_5": True, "Sequential_Tasks_5": True}))
+        reopened = ControlStore(self.path)
+        self.assertEqual(reopened.snapshot()["credentials"]["acct"]["growth_auto"], {"chat_5": True})
+        reopened.set_growth_auto("acct", {"chat_5": True})
+        row = reopened._db.execute("SELECT payload FROM control WHERE id=1").fetchone()
+        self.assertEqual(json.loads(row[0])["credentials"]["acct"]["growth_auto"], {"chat_5": True})
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

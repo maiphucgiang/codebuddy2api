@@ -14,7 +14,7 @@ import uuid
 
 from .settings import validate_settings
 from .audit_store import _secure_path, safe_label
-from .growth_tasks import KNOWN_TASK_CODES as GROWTH_TASK_CODES
+from .growth_tasks import KNOWN_TASK_CODES as GROWTH_TASK_CODES, RETIRED_TASK_CODES
 
 
 class ConflictError(ValueError):
@@ -241,8 +241,11 @@ class ControlStore:
             validate_model(source, rule, data["models"], legacy_scopes=True)  # Preserve legacy scope intersections.
         for identity, metadata in data["credentials"].items():
             _identifier(identity, "账号指纹")
-            growth = metadata.get("growth_auto")
-            growth = metadata.get("growth_auto")
+            growth = metadata.get("growth_auto") if isinstance(metadata, dict) else None
+            if isinstance(growth, dict):
+                # 任务码下线后旧库仍会残留对应开关：只丢弃 RETIRED_TASK_CODES，其它未知码仍报错。
+                growth = {code: on for code, on in growth.items() if code not in RETIRED_TASK_CODES}
+                metadata["growth_auto"] = growth
             if (not isinstance(metadata, dict)
                     or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel",
                                         "auto_daily_chat", "auto_growth", "growth_auto",
