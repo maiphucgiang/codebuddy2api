@@ -470,7 +470,7 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
                     self.poison_with_status(status, body)
                     response, sent = self.stream_post()
                 self.assertEqual(response.status_code, status, response.text)
-                self.assertEqual(len(sent), 2 if code == 11128 else 1)
+                self.assertEqual(len(sent), 1)
                 self.assertEqual(len(set(self.uids(sent))), 1, "限制响应不得扩散到其他账号")
                 self.assertEqual(self.failover_lines(), [])
 

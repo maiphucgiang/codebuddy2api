@@ -124,12 +124,16 @@ class ChannelResponseTests(unittest.TestCase):
         self.assertTrue(is_channel_check_error(json.dumps({"message": inner})))
         self.assertTrue(is_channel_check_error(json.dumps({"message": json.dumps({"message": inner})})))
 
-    def test_only_primary_chat_url_has_console_fallback(self):
-        self.assertEqual(channel_fallback_url("https://synthetic.invalid/v2/chat/completions"),
-                         "https://synthetic.invalid/console/chat/completions")
-        for url in ("https://synthetic.invalid/console/chat/completions",
-                    "https://synthetic.invalid/v2/chat/completions/extra",
-                    "https://synthetic.invalid/agenttool/v1/search"):
+    def test_console_fallback_requires_international_primary_chat(self):
+        for host in ("www.codebuddy.ai", "www.workbuddy.ai"):
+            self.assertEqual(channel_fallback_url(f"https://{host}/v2/chat/completions"),
+                             f"https://{host}/console/chat/completions")
+        for url in ("https://copilot.tencent.com/v2/chat/completions",
+                    "https://www.workbuddy.cn/v2/chat/completions",
+                    "https://synthetic.invalid/v2/chat/completions",
+                    "https://www.codebuddy.ai/console/chat/completions",
+                    "https://www.codebuddy.ai/v2/chat/completions/extra",
+                    "https://www.codebuddy.ai/agenttool/v1/search"):
             self.assertIsNone(channel_fallback_url(url))
 
 
@@ -214,7 +218,7 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
                 self.assertEqual(schema["properties"]["runId"]["pattern"], "^agent_run_")
 
     def test_channel_check_falls_back_for_every_protocol_and_stream_mode(self):
-        self.configure_profiles("cn-cli")
+        self.configure_profiles("intl-cli")
         self.channel_mode = "primary"
         for endpoint in fixtures.GENERATIONS:
             for stream in (False, True):
@@ -225,6 +229,16 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
                     self.assertEqual([request.url.path for request in self.requests],
                                      ["/v2/chat/completions", "/console/chat/completions"])
 
+    def test_domestic_channel_rejection_never_tries_console(self):
+        for profile in ("cn-cli", "cn-work"):
+            with self.subTest(profile=profile):
+                self.configure_profiles(profile)
+                self.channel_mode = "always"
+                response = self.client.post("/v1/chat/completions", json=self.payload())
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn("11128", response.text)
+                self.assertEqual([request.url.path for request in self.requests], ["/v2/chat/completions"])
+
     def test_regular_400_never_tries_console(self):
         self.configure_profiles("cn-cli")
         self.response_status = 400
@@ -233,7 +247,7 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual([request.url.path for request in self.requests], ["/v2/chat/completions"])
 
     def test_rejection_on_both_endpoints_does_not_cool_the_account_or_fail_over(self):
-        self.configure_profiles("cn-cli", "cn-work")
+        self.configure_profiles("intl-cli", "intl-work")
         self.channel_mode = "always"
         with patch.dict(converter.CONFIG, {"failover_max": 2}):
             response = self.client.post("/v1/chat/completions", json=self.payload(stream=True))
@@ -245,7 +259,7 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
 
     def test_channel_rejection_moves_system_to_user_once_on_same_account(self):
-        self.configure_profiles("cn-cli")
+        self.configure_profiles("intl-work")
         self.channel_mode = "always"
         body = self.payload()
         body["messages"].insert(0, {"role": "system", "content": "private system instructions"})
@@ -260,18 +274,18 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertIn("<instructions>\nprivate system instructions", moved["messages"][1]["content"])
         self.assertLessEqual(self.current_entry(self.requests[0].headers["x-user-id"])["fail_until"], time.time())
     def test_console_model_missing_cools_only_this_account_model(self):
-        self.configure_profiles("cn-cli")
+        self.configure_profiles("intl-cli")
         self.channel_mode = "model_missing"
         response = self.client.post("/v1/chat/completions", json=self.payload())
         self.assertEqual(response.status_code, 400, response.text)
-        entry = self.current_entry("cn-cli")
+        entry = self.current_entry("intl-cli")
         self.assertLessEqual(entry["fail_until"], time.time())
         self.assertFalse(self.pool._model_healthy(entry, "shared-model"))
-        # The shared domestic endpoint block stays clear for accounts that still reach v2.
+        # The shared endpoint block stays clear for accounts that still reach v2.
         self.assertTrue(self.pool._model_servable(entry, "shared-model"))
 
     def test_console_model_missing_can_fail_over_without_cooling_the_account(self):
-        self.configure_profiles("cn-cli", "cn-work")
+        self.configure_profiles("intl-cli", "intl-work")
         self.channel_mode = "model_missing"
         with patch.dict(converter.CONFIG, {"failover_max": 1}):
             response = self.client.post("/v1/chat/completions", json=self.payload(stream=True))
@@ -307,14 +321,13 @@ class AutomationCompatTests(unittest.TestCase):
 
         return calls, httpx.MockTransport(handle)
 
-    def test_buddy_chat_uses_console_after_channel_rejection(self):
+    def test_buddy_chat_never_uses_console_after_channel_rejection(self):
         calls, transport = self.transport()
         with httpx.Client(transport=transport) as client:
-            total = buddy_task._chat(client, {}, {"conversation_id": "conv", "request_id": "req"},
-                                     {"id": "shared-model", "name": "Shared"})
-        self.assertEqual(total, 3)
-        self.assertEqual([request.url.path for request in calls],
-                         ["/v2/chat/completions", "/console/chat/completions"])
+            with self.assertRaises(buddy_task.TaskFailure):
+                buddy_task._chat(client, {}, {"conversation_id": "conv", "request_id": "req"},
+                                 {"id": "shared-model", "name": "Shared"})
+        self.assertEqual([request.url.path for request in calls], ["/v2/chat/completions"])
 
     def test_growth_chat_never_falls_back_so_the_reported_id_stays_valid(self):
         calls = []
@@ -349,7 +362,7 @@ class AutomationCompatTests(unittest.TestCase):
         real_client = rate_measurement.httpx.Client
         with patch.object(rate_measurement.httpx, "Client",
                           side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)):
-            result = rate_measurement.probe_once("https://synthetic.invalid/v2/chat/completions", {},
+            result = rate_measurement.probe_once("https://www.codebuddy.ai/v2/chat/completions", {},
                                                  "shared", timeout=5)
         self.assertEqual(result["credit"], 0.5)
         self.assertEqual([request.url.path for request in calls],
@@ -361,7 +374,7 @@ class AutomationCompatTests(unittest.TestCase):
                           side_effect=lambda **kwargs: real_client(transport=httpx.MockTransport(handle),
                                                                    **kwargs)):
             with self.assertRaises(rate_measurement.ProbeError) as caught:
-                rate_measurement.probe_once("https://synthetic.invalid/v2/chat/completions", {}, "shared",
+                rate_measurement.probe_once("https://www.codebuddy.ai/v2/chat/completions", {}, "shared",
                                             timeout=5)
         return caught.exception
 
@@ -390,7 +403,7 @@ class AutomationCompatTests(unittest.TestCase):
                           side_effect=lambda **kwargs: real_client(transport=httpx.MockTransport(handle),
                                                                    **kwargs)):
             with self.assertRaises(rate_measurement.ProbeError) as caught:
-                rate_measurement.probe_once("https://synthetic.invalid/v2/chat/completions", {}, "shared",
+                rate_measurement.probe_once("https://www.codebuddy.ai/v2/chat/completions", {}, "shared",
                                             timeout=5)
         self.assertEqual(caught.exception.status_code, 400)
         self.assertEqual(caught.exception.code, "11102")

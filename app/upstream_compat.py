@@ -6,6 +6,8 @@ import json
 import re
 from urllib.parse import urlsplit, urlunsplit
 
+from .site_routing import DOMAIN_PROFILES, profile_region
+
 _SCHEMA_MAPS = frozenset(("properties", "patternProperties", "$defs", "definitions",
                           "dependentSchemas", "dependencies"))
 _SCHEMA_ARRAYS = frozenset(("allOf", "anyOf", "oneOf", "prefixItems", "items"))
@@ -189,11 +191,14 @@ def should_channel_fallback(fallback_url, status: int, raw: bytes | str) -> bool
 
 
 def channel_fallback_url(url: str) -> str | None:
-    """Return the console chat endpoint only for the primary v2 chat endpoint."""
+    """Return the console chat endpoint only for international primary chat URLs."""
     try:
         parts = urlsplit(url)
     except ValueError:
         return None
     if parts.path != "/v2/chat/completions":
+        return None
+    profile = DOMAIN_PROFILES.get(parts.hostname)
+    if profile is None or profile_region(profile) != "intl":
         return None
     return urlunsplit(parts._replace(path="/console/chat/completions"))
