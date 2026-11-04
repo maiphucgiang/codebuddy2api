@@ -166,7 +166,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(baggage["codebuddy.session_id"], conversation)
         self.assertEqual(baggage["codebuddy.conversation_request_id"], headers["X-Conversation-Request-ID"])
 
-        for profile, runtime in (("cn-cli", None), ("intl-cli", "other"), ("intl-work", "local-agent")):
+        for profile, runtime in (("cn-cli", "other"), ("intl-cli", "other"), ("intl-work", "local-agent")):
             with self.subTest(profile=profile):
                 other = first.attempt_headers(base, first.start_attempt(), profile=profile)
                 if runtime is None:
@@ -200,7 +200,8 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
                 self.assertEqual(headers["X-Session-ID"], headers["X-Conversation-ID"])
             else:
                 self.assertEqual(headers["X-Root-Request-ID"], root)
-            runtime = {"cn-work": "local-agent", "intl-work": "local-agent", "intl-cli": "other"}.get(profile)
+            runtime = {"cn-cli": "other", "cn-work": "local-agent",
+                       "intl-cli": "other", "intl-work": "local-agent"}.get(profile)
             if runtime is None:
                 self.assertNotIn("X-Agent-Runtime", headers)
             else:
@@ -293,8 +294,8 @@ class EndpointContextTests(fixtures.GatewayFixture, unittest.TestCase):
         self.assertEqual(twice, once)
         self.assertEqual(original, {"messages": [{"role": "user", "content": "hi"}]})
 
-    def test_legacy_international_runtime_headers(self):
-        for profile, runtime in (("intl-cli", "other"), ("intl-work", "local-agent")):
+    def test_legacy_runtime_headers(self):
+        for profile, runtime in (("cn-cli", "other"), ("intl-cli", "other"), ("intl-work", "local-agent")):
             with self.subTest(profile=profile):
                 self.fx.configure(profiles=(profile,))
                 with patch.dict(gateway.CONFIG, {"request_context_mode": "legacy"}):

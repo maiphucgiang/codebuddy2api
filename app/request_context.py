@@ -107,7 +107,7 @@ def build_attempt_headers(headers, profile, *, root, message_id, request_id, tra
                 "X-B3-Sampled": "1"}
     if profile in _WORKBUDDY_PROFILES:
         outgoing["X-Agent-Runtime"] = "local-agent"
-    elif profile == "intl-cli":
+    elif profile in ("cn-cli", "intl-cli"):
         outgoing["X-Agent-Runtime"] = "other"
     if profile == "cn-work":
         if conversation_id:

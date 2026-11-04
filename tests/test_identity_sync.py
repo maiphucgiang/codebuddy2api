@@ -92,9 +92,9 @@ class IdentitySyncTests(unittest.TestCase):
 
     def test_official_versions_and_private_data_are_profile_scoped(self):
         expected = {
-            "cn-cli": ("CLI/2.165.0 CodeBuddy/2.165.0", "2.165.0", "false", "2.165.0"),
+            "cn-cli": ("CLI/2.179.3 CodeBuddy/2.179.3", "2.179.3", "false", "2.179.3"),
             "intl-cli": ("CLI/2.179.3 CodeBuddy/2.179.3", "2.179.3", "false", "2.179.3"),
-            "cn-work": ("WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0", "5.9.3", "false", "5.9.3:2.165.0"),
+            "cn-work": ("WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.179.3", "5.9.3", "false", "5.9.3:2.179.3"),
             "intl-work": ("WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/2.165.0", "5.9.4", "true", "5.9.4:2.165.0"),
         }
         for profile, (user_agent, ide_version, private_data, revision) in expected.items():
@@ -105,9 +105,9 @@ class IdentitySyncTests(unittest.TestCase):
                 self.assertEqual(headers["X-IDE-Version"], ide_version)
                 self.assertEqual(headers["X-Private-Data"], private_data)
                 self.assertEqual(client_profiles.catalog_cache_key(profile), f"{profile}:{revision}")
-                sdk_version = "7.39.0" if profile == "intl-cli" else "6.25.0"
+                sdk_version = "7.39.0" if profile in ("cn-cli", "intl-cli") else "6.25.0"
                 self.assertEqual(headers["x-stainless-package-version"], sdk_version)
-                runtime = {"intl-cli": "other", "intl-work": "local-agent"}.get(profile)
+                runtime = {"cn-cli": "other", "intl-cli": "other", "intl-work": "local-agent"}.get(profile)
                 if runtime is None:
                     self.assertNotIn("X-Agent-Runtime", headers)
                 else:
