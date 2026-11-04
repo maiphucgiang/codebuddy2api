@@ -10,7 +10,7 @@ from .site_routing import domain_for_auth, profile_for_auth, profile_product, pr
 
 CLI_VERSION = "2.179.3"
 WORKBUDDY_VERSION = "5.9.3"
-WORKBUDDY_CLI_VERSION = CLI_VERSION
+WORKBUDDY_CLI_VERSION = "2.165.0"
 INTL_CLI_VERSION = "2.179.3"
 INTL_WORKBUDDY_VERSION = "5.9.4"
 INTL_WORKBUDDY_CLI_VERSION = "2.165.0"

@@ -6,7 +6,7 @@ import json
 import re
 from urllib.parse import urlsplit, urlunsplit
 
-from .site_routing import DOMAIN_PROFILES, profile_region
+from .site_routing import DOMAIN_PROFILES, WORKBUDDY_CN_BACKUP_ENDPOINT, profile_region
 
 _SCHEMA_MAPS = frozenset(("properties", "patternProperties", "$defs", "definitions",
                           "dependentSchemas", "dependencies"))
@@ -202,3 +202,22 @@ def channel_fallback_url(url: str) -> str | None:
     if profile is None or profile_region(profile) != "intl":
         return None
     return urlunsplit(parts._replace(path="/console/chat/completions"))
+
+
+def workbuddy_origin_fallback_url(url: str, profile: str) -> str | None:
+    """Return the official backup origin for domestic WorkBuddy chat."""
+    if profile != "cn-work":
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if (parts.scheme != "https" or parts.path != "/v2/chat/completions"
+            or parts.netloc not in ("www.workbuddy.cn", "copilot.tencent.com")):
+        return None
+    return urlunsplit(parts._replace(netloc=urlsplit(WORKBUDDY_CN_BACKUP_ENDPOINT).netloc))
+
+
+def should_origin_fallback(fallback_url: str | None, status: int) -> bool:
+    """Replay only official transient gateway statuses on the backup origin."""
+    return bool(fallback_url) and status in (408, 502, 503, 504)

@@ -94,7 +94,7 @@ class IdentitySyncTests(unittest.TestCase):
         expected = {
             "cn-cli": ("CLI/2.179.3 CodeBuddy/2.179.3", "2.179.3", "false", "2.179.3"),
             "intl-cli": ("CLI/2.179.3 CodeBuddy/2.179.3", "2.179.3", "false", "2.179.3"),
-            "cn-work": ("WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.179.3", "5.9.3", "false", "5.9.3:2.179.3"),
+            "cn-work": ("WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0", "5.9.3", "false", "5.9.3:2.165.0"),
             "intl-work": ("WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/2.165.0", "5.9.4", "true", "5.9.4:2.165.0"),
         }
         for profile, (user_agent, ide_version, private_data, revision) in expected.items():

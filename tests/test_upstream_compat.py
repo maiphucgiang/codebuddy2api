@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
+from contextlib import asynccontextmanager
 from copy import deepcopy
 import gzip
 import json
@@ -16,7 +17,8 @@ import httpx
 
 import converter
 from app import buddy_task, growth_events, rate_measurement
-from app.upstream_compat import channel_fallback_url, is_channel_check_error, normalize_tool_schemas
+from app.upstream_compat import (channel_fallback_url, is_channel_check_error, normalize_tool_schemas,
+                                 workbuddy_origin_fallback_url)
 from tests import test_region_routing as fixtures
 
 CHANNEL_ERROR = {
@@ -137,11 +139,64 @@ class ChannelResponseTests(unittest.TestCase):
             self.assertIsNone(channel_fallback_url(url))
 
 
+    def test_cn_work_origin_fallback_targets_official_backup(self):
+        for host in ("www.workbuddy.cn", "copilot.tencent.com"):
+            url = f"https://{host}/v2/chat/completions"
+            self.assertEqual(workbuddy_origin_fallback_url(url, "cn-work"),
+                             "https://wb.tencentbuddy.com/v2/chat/completions")
+        for url, profile in (("https://copilot.tencent.com/v2/chat/completions", "cn-cli"),
+                             ("https://wb.tencentbuddy.com/v2/chat/completions", "cn-work"),
+                             ("https://www.workbuddy.ai/v2/chat/completions", "intl-work"),
+                             ("https://www.workbuddy.cn/agenttool/v1/search", "cn-work")):
+            self.assertIsNone(workbuddy_origin_fallback_url(url, profile))
+
+
+class OriginStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_origin_never_replays_after_response_started(self):
+        calls = []
+
+        @asynccontextmanager
+        async def backend(url, headers, body, **kwargs):
+            calls.append(url)
+            yield httpx.Response(200)
+
+        headers = {"X-Domain": "www.workbuddy.cn"}
+        with patch.object(converter, "_backend_stream", backend):
+            with self.assertRaises(httpx.ReadError):
+                async with converter._checked_chat_stream(
+                        "https://www.workbuddy.cn/v2/chat/completions", headers,
+                        {"model": "shared-model"}, rid="test", model_name="shared-model", cred=None):
+                    raise httpx.ReadError("midstream failure")
+        self.assertEqual(calls, ["https://www.workbuddy.cn/v2/chat/completions"])
+
+    async def test_origin_rejects_ambiguous_transport_by_default(self):
+        headers = {"X-Domain": "www.workbuddy.cn"}
+        for error in (httpx.WriteTimeout("partial write"), httpx.ReadTimeout("accepted request")):
+            with self.subTest(error=type(error).__name__):
+                calls = []
+
+                @asynccontextmanager
+                async def backend(url, headers, body, **kwargs):
+                    calls.append(url)
+                    raise error
+                    yield
+
+                with (patch.object(converter, "_backend_stream", backend),
+                      patch.dict(converter.CONFIG, {"retry_write_timeout": False})):
+                    with self.assertRaises(type(error)):
+                        async with converter._checked_chat_stream(
+                                "https://www.workbuddy.cn/v2/chat/completions", headers,
+                                {"model": "shared-model"}, rid="test", model_name="shared-model", cred=None):
+                            self.fail("unreachable")
+                self.assertEqual(calls, ["https://www.workbuddy.cn/v2/chat/completions"])
+
+
 class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
     def setUp(self):
         super().setUp()
         self.channel_mode = None
         self.channel_uid = None
+        self.origin_mode = None
 
     def record(self, request):
         uid = request.headers.get("x-user-id")
@@ -159,6 +214,16 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
                                              "results": [{"title": "t", "url": "https://example.com/",
                                                           "snippet": "s", "site": "example.com"}],
                                              "total_results": 1, "response_time_ms": 1})
+        if self.origin_mode and path == "/v2/chat/completions":
+            self.record(request)
+            if request.url.host == "www.workbuddy.cn":
+                if self.origin_mode == "transport":
+                    raise httpx.ConnectError("synthetic connect failure", request=request)
+                return httpx.Response(502, json={"error": {"message": "synthetic unavailable"}})
+            self.assertEqual(request.url.host, "wb.tencentbuddy.com")
+            self.assertEqual(request.headers["x-domain"], "www.workbuddy.cn")
+            return httpx.Response(200, content=fixtures.success_sse(),
+                                  headers={"Content-Type": "text/event-stream"})
         if self.channel_mode and path in ("/v2/chat/completions", "/console/chat/completions"):
             uid = self.record(request)
             if self.channel_mode in ("first", "model_missing") and self.channel_uid is None:
@@ -257,6 +322,26 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         first_uid = self.requests[0].headers["x-user-id"]
         self.assertEqual(self.requests[1].headers["x-user-id"], first_uid)
         self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
+
+    def test_cn_work_origin_fallback_covers_protocols_and_stream_modes(self):
+        self.configure_profiles("cn-work")
+        self.origin_mode = "http"
+        for endpoint in fixtures.GENERATIONS:
+            for stream in (False, True):
+                with self.subTest(endpoint=endpoint, stream=stream):
+                    self.requests.clear()
+                    response = self.client.post("/v1/" + endpoint, json=self.payload(endpoint, stream=stream))
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual([request.url.host for request in self.requests],
+                                     ["www.workbuddy.cn", "wb.tencentbuddy.com"])
+
+    def test_cn_work_transport_failure_uses_backup_after_local_retry(self):
+        self.configure_profiles("cn-work")
+        self.origin_mode = "transport"
+        response = self.client.post("/v1/chat/completions", json=self.payload(stream=True))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([request.url.host for request in self.requests],
+                         ["www.workbuddy.cn", "www.workbuddy.cn", "wb.tencentbuddy.com"])
 
     def test_channel_rejection_moves_system_to_user_once_on_same_account(self):
         self.configure_profiles("intl-work")

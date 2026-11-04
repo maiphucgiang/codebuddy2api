@@ -137,7 +137,7 @@ WebUI 系统设置可配置这两项；环境变量为 `CODEBUDDY2API_UPSTREAM_K
 scoped 模式可选传入 `X-Codebuddy-Session-ID`、`metadata.conversation_id` / `metadata.conversationId` 或顶层 `conversation_id` / `conversationId`。多处值须一致；冲突、非字符串、控制字符或超过 512 UTF-8 字节时返回 400。空值回退为协议适配后的指令与首条用户输入指纹，包含图片引用但不抓取 URL；缺少可靠输入时使用临时会话。无显式 ID 的相同输入仍无法区分；`user`、`metadata.user_id`、`prompt_cache_key` 不是会话 ID。原始标识不记录、不转发上游。
 
 设回 `legacy` 即恢复新请求的旧行为，在途请求保留入口模式。
-国内 CodeBuddy 与 WorkBuddy 5.9.3 共用 CLI 2.179.3 身份；国际 CodeBuddy 使用 2.179.3，WorkBuddy 5.9.4 保留内嵌 CLI 2.165.0。CLI 均发送 `X-Agent-Runtime: other`，国际 WorkBuddy 发送 `local-agent`。国内 WorkBuddy 使用会话稳定的 UUIDv7 会话 ID、逐次请求／追踪头，并在 JSON 请求体达到 1024 字节时使用 gzip；CLI 与国际 WorkBuddy 保持原有 ID 关系，聊天 JSON 始终使用 gzip。所有身份头均在本地生成，不读取硬件 ID。
+国内、国际 CodeBuddy 均使用 CLI 2.179.3；国内 WorkBuddy 5.9.3 与国际 WorkBuddy 5.9.4 的内嵌 CLI 均保持 2.165.0。CLI 均发送 `X-Agent-Runtime: other`，国际 WorkBuddy 发送 `local-agent`。国内 WorkBuddy 使用会话稳定的 UUIDv7 会话 ID、逐次请求／追踪头，并在 JSON 请求体达到 1024 字节时使用 gzip；CLI 与国际 WorkBuddy 保持原有 ID 关系，聊天 JSON 始终使用 gzip。国内 WorkBuddy 在响应开始前遇到 408/502/503/504 或建连失败时，以同账号和原 `X-Domain` 在 `wb.tencentbuddy.com` 重试一次；渠道错误不触发域名回退。所有身份头均在本地生成，不读取硬件 ID。
 
 ## 自动化与奖励
 

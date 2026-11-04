@@ -102,7 +102,7 @@ from app.api_keys import ApiKeyError, api_principal
 from app.admin_auth import SessionStoreError
 from app.content_filter import ContentFilterDetector, is_filter_error
 from app.upstream_compat import (channel_fallback_url, is_channel_check_error, normalize_tool_schemas,
-                                 should_channel_fallback)
+                                 should_channel_fallback, should_origin_fallback, workbuddy_origin_fallback_url)
 from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
 from app import perf_metrics
@@ -5019,43 +5019,62 @@ def _check_upstream_status(status, raw, cred, model, *, headers=None, from_chann
 @asynccontextmanager
 async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred,
                                on_channel_body=None):
-    """Open a chat stream with one same-account console and role fallback."""
+    """Open a chat stream with same-account channel and WorkBuddy origin fallback."""
+    profile = profile_for_headers(headers)
     fallback_url = channel_fallback_url(url)
+    origin_url = workbuddy_origin_fallback_url(url, profile)
     from_channel_fallback = False
     channel_body_retried = False
-    while True:
-        async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
-            if response.status_code == 200:
-                _note_cred_model_ok(cred, body.get("model"))
-                yield response
-                return
-            raw = await read_bounded_error(response)
-            if should_channel_fallback(fallback_url, response.status_code, raw):
-                observe_attempt("channel_check_fallback", status_code=response.status_code,
-                                profile=profile_for_headers(headers), upstream_model=body.get("model"))
-                _log(f"[{rid}] 上游渠道校验，切换 /console 端点重试 | {model_name}")
-                url, fallback_url, from_channel_fallback = fallback_url, None, True
-                continue
-            if (from_channel_fallback and not channel_body_retried
-                    and response.status_code == 400 and is_channel_check_error(raw)):
-                transformed = system_as_user_body(body)
-                if transformed != body:
-                    try:
-                        _guard_request_size(transformed)
-                    except HTTPException:
-                        transformed = body
-                    if transformed != body:
-                        channel_body_retried = True
-                        body = transformed
-                        if on_channel_body is not None:
-                            on_channel_body(transformed)
-                        observe_attempt("channel_system_as_user_retry", status_code=response.status_code,
-                                        profile=profile_for_headers(headers), upstream_model=body.get("model"))
-                        _log(f"[{rid}] 渠道拒绝，system 指令降级为 user 后同账号重试 | {model_name}")
-                        continue
-            _check_upstream_status(response.status_code, raw, cred, body.get("model"),
-                                   headers=response.headers, from_channel_fallback=from_channel_fallback)
 
+    def switch_origin(**fields):
+        nonlocal url, origin_url
+        target = origin_url
+        observe_attempt("origin_fallback", profile=profile, upstream_model=body.get("model"), **fields)
+        _log(f"[{rid}] 上游入口不可用，切换 WorkBuddy 备份源站重试 | {model_name}")
+        url, origin_url = target, None
+
+    while True:
+        response_started = False
+        try:
+            async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
+                if response.status_code == 200:
+                    response_started = True
+                    _note_cred_model_ok(cred, body.get("model"))
+                    yield response
+                    return
+                raw = await read_bounded_error(response)
+                if should_origin_fallback(origin_url, response.status_code):
+                    switch_origin(status_code=response.status_code)
+                    continue
+                if should_channel_fallback(fallback_url, response.status_code, raw):
+                    observe_attempt("channel_check_fallback", status_code=response.status_code,
+                                    profile=profile, upstream_model=body.get("model"))
+                    _log(f"[{rid}] 上游渠道校验，切换 /console 端点重试 | {model_name}")
+                    url, fallback_url, from_channel_fallback = fallback_url, None, True
+                    continue
+                if (from_channel_fallback and not channel_body_retried
+                        and response.status_code == 400 and is_channel_check_error(raw)):
+                    transformed = system_as_user_body(body)
+                    if transformed != body:
+                        try:
+                            _guard_request_size(transformed)
+                        except HTTPException:
+                            transformed = body
+                        if transformed != body:
+                            channel_body_retried = True
+                            body = transformed
+                            if on_channel_body is not None:
+                                on_channel_body(transformed)
+                            observe_attempt("channel_system_as_user_retry", status_code=response.status_code,
+                                            profile=profile, upstream_model=body.get("model"))
+                            _log(f"[{rid}] 渠道拒绝，system 指令降级为 user 后同账号重试 | {model_name}")
+                            continue
+                _check_upstream_status(response.status_code, raw, cred, body.get("model"),
+                                       headers=response.headers, from_channel_fallback=from_channel_fallback)
+        except httpx.HTTPError as error:
+            if response_started or origin_url is None or not _failover_safe(error):
+                raise
+            switch_origin(error_code=type(error).__name__)
 
 def _upstream_failure(error, model_name, t0, rid):
     """Normalize failure logs and payloads before endpoint-specific error wrapping."""
