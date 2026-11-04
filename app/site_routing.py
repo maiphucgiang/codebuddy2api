@@ -16,6 +16,7 @@ PROFILE_ENDPOINTS = {
     "intl-cli": INTERNATIONAL_ENDPOINT,
     "intl-work": "https://www.workbuddy.ai",
 }
+WORKBUDDY_CN_BACKUP_ENDPOINT = "https://wb.tencentbuddy.com"
 # The paid bge-m3 endpoint is verified on WorkBuddy CN for both domestic products.
 EMBEDDING_ENDPOINTS = {"cn-cli": "https://www.workbuddy.cn", "cn-work": "https://www.workbuddy.cn"}
 DOMAIN_PROFILES = {

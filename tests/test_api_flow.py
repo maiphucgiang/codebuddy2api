@@ -82,7 +82,13 @@ class RetryAfterEndpointTests(GatewayFixture, unittest.TestCase):
                             self.assertEqual(response.headers.get("Retry-After"), "17")
                             self.assertNotIn("X-Private", response.headers)
                             self.assertEqual(response.json()["error"]["code"], "quota")
-                            self.assertEqual(len(seen), 1, "A retry hint must not enable replay")
+                            expected_attempts = 2 if profile == "cn-work" and status == 503 else 1
+                            self.assertEqual(len(seen), expected_attempts,
+                                             "Only domestic WorkBuddy may replay 503 on its backup origin")
+                            if expected_attempts == 2:
+                                self.assertEqual([request.url.host for request in seen],
+                                                 ["www.workbuddy.cn", "wb.tencentbuddy.com"])
+                                self.assertEqual(len({request.headers["x-user-id"] for request in seen}), 1)
                             entry = self.fx.entries[profile]
                             self.assertEqual(entry["fail_until"], 0)
                             if status == 429:
