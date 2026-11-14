@@ -74,6 +74,7 @@ from app.credential_cooldowns import CredentialCooldowns
 from app.model_blocks import ModelBlocks
 from app.usage_snapshots import UsageSnapshots
 from app.client_hangup import ClientHungUp, await_or_hangup
+from app.tool_delta_normalize import ToolDeltaNormalizer
 from app.observability import (observe_recovery, observe_route, observe_stream_mode,
                                observe_responses_projection, observe_usage, observe_attempt,
                                observe_failure, observe_failure_seq, observe_discard,
@@ -5003,7 +5004,8 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
 
 
-def _check_upstream_status(status, raw, cred, model, *, headers=None, from_channel_fallback=False):
+def _check_upstream_status(status, raw, cred, model, *, headers=None, from_channel_fallback=False,
+                           channel_downgraded=False):
     if status != 200:
         retry_after = parse_retry_after((headers or {}).get("Retry-After"))
         code, message, error_body = _upstream_diagnostic(raw)
@@ -5013,7 +5015,8 @@ def _check_upstream_status(status, raw, cred, model, *, headers=None, from_chann
             _note_cred_status(cred, status, model=model, raw=raw, retry_after=retry_after,
                               from_channel_fallback=from_channel_fallback)
         raise UpstreamHTTPError(status, raw, retry_after=retry_after,
-                                from_channel_fallback=from_channel_fallback)
+                                from_channel_fallback=from_channel_fallback,
+                                channel_downgraded=channel_downgraded)
 
 
 def _origin_replay_safe(raw: bytes) -> bool:
@@ -5061,7 +5064,10 @@ async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred,
                     _log(f"[{rid}] 上游渠道校验，切换 /console 端点重试 | {model_name}")
                     url, fallback_url, from_channel_fallback = fallback_url, None, True
                     continue
-                if (from_channel_fallback and not channel_body_retried
+                # Channel refusal is request-scoped, so the system→user downgrade is worth one
+                # retry on any profile; gating it behind the international /console fallback left
+                # domestic accounts failing where the same downgrade is known to succeed.
+                if (not channel_body_retried
                         and response.status_code == 400 and is_channel_check_error(raw)):
                     transformed = system_as_user_body(body)
                     if transformed != body:
@@ -5079,7 +5085,8 @@ async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred,
                             _log(f"[{rid}] 渠道拒绝，system 指令降级为 user 后同账号重试 | {model_name}")
                             continue
                 _check_upstream_status(response.status_code, raw, cred, body.get("model"),
-                                       headers=response.headers, from_channel_fallback=from_channel_fallback)
+                                       headers=response.headers, from_channel_fallback=from_channel_fallback,
+                                       channel_downgraded=channel_body_retried)
         except httpx.HTTPError as error:
             if response_started or origin_url is None or not _failover_safe(error):
                 raise
@@ -5232,19 +5239,24 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
     budget = 0 if policy.realtime else (
         CONFIG["log_body_limit"] if CONFIG.get("log_path") else 0)
     repairer = dsml.SSERepairer(dsml.tool_name_allowlist(body))
+    tool_deltas = ToolDeltaNormalizer()
     try:
         async with _checked_chat_stream(url, headers, body, rid=rid, model_name=model_name,
                                         cred=cred) as response:
             async for line in response.aiter_lines():
                 broken = False
                 for out_line in repairer.feed(line):
+                    # Validate the upstream line as-is: a repaired name must never reach the
+                    # tracker, which rejects a tool identity declared twice.
                     tracker.feed_line(out_line)
                     if tracker.done or tracker.finish_reason:
                         completed()  # Never expose a success marker before terminal validation.
-                    remaining = budget - len(preview)
-                    if remaining > 0:
-                        preview.extend((out_line[:remaining] + "\n").encode("utf-8")[:remaining])
-                    yield out_line
+                    # Realtime fragments are forwarded as they arrive; only a missing name is repaired.
+                    for emitted in tool_deltas.feed(out_line):
+                        remaining = budget - len(preview)
+                        if remaining > 0:
+                            preview.extend((emitted[:remaining] + "\n").encode("utf-8")[:remaining])
+                        yield emitted
                     if tracker.done:
                         yield ""
                         broken = True
@@ -5253,7 +5265,8 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
         for out_line in repairer.flush():   # 上游未发 DONE 就断流时，残留字节同样交还
             if not (tracker.done or tracker.finish_reason):
                 tracker.feed_line(out_line)
-            yield out_line
+            for emitted in tool_deltas.feed(out_line):
+                yield emitted
         merged = completed()
     finally:
         if tracker.usage:
@@ -5342,6 +5355,12 @@ def _failover_safe(error, raw=b"") -> bool:
         return (isinstance(error, UpstreamHTTPError) and error.from_channel_fallback
                 and _parse_not_servable(raw, error.status) is not None)
     if code in NO_FAILOVER_UPSTREAM_CODES:
+        # A channel refusal is request-scoped, so replaying it on another account is pointless
+        # until the body was already downgraded once: then the surviving refusal can only mean
+        # this account's channel is gone, and one bounded cross-account replay is worth trying.
+        if code == "11128" and isinstance(error, UpstreamHTTPError) \
+                and getattr(error, "channel_downgraded", False):
+            return error.status == 400
         return False
     if isinstance(error, UpstreamHTTPError):
         if error.status in FAILOVER_CODES:

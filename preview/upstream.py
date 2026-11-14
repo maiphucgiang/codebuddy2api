@@ -402,6 +402,25 @@ class Upstream:
         if "429" in directive:
             reset = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 120))
             return fail(429, f"请求过于频繁，额度将于 {reset} UTC+0 恢复")
+        if "channelfail" in directive:
+            # Refuse this account for good, so the gateway's cross-account replay is observable.
+            # dispatch() already holds the lock, so touch the set directly.
+            failed = getattr(self, "_channel_failed", None)
+            if failed is None:
+                # Poison only the first account; later candidates stay healthy so the replay is visible.
+                failed = self._channel_failed = {state.account.uid}
+                return fail(400, "Illegal API invocation from an unapproved channel", code=11128)
+        failed_accounts = getattr(self, "_channel_failed", set())
+        if state.account.uid in failed_accounts:
+            return fail(400, "Illegal API invocation from an unapproved channel", code=11128)
+        if "channel" in directive:
+            # Refuse the first attempt only, so the gateway's one-shot system→user retry is
+            # observable end to end instead of looping on a permanent channel refusal.
+            # dispatch() already holds the lock, so touch the flag directly.
+            refused = getattr(self, "_channel_refused", False)
+            self._channel_refused = not refused
+            if not refused:
+                return fail(400, "Illegal API invocation from an unapproved channel", code=11128)
         if "500" in directive:
             return fail(500, "预览环境模拟的上游错误")
         model = str(body.get("model") or "")

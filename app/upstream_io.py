@@ -28,10 +28,14 @@ class UpstreamResponseError(Exception):
 class UpstreamHTTPError(UpstreamResponseError):
     """Distinguish actual upstream HTTP errors from failures synthesized while collecting a response."""
 
-    def __init__(self, status, raw, *, retry_after=None, from_channel_fallback=False):
+    def __init__(self, status, raw, *, retry_after=None, from_channel_fallback=False,
+                 channel_downgraded=False):
         super().__init__(status, raw)
         self.retry_after = retry_after
         self.from_channel_fallback = from_channel_fallback
+        # Set when the request already retried once with the system prompt demoted to a user
+        # message, which is the only evidence that a channel refusal may be account-specific.
+        self.channel_downgraded = channel_downgraded
         self.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
 
 

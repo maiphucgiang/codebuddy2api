@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
+import gzip
 import json
 import unittest
 from contextlib import contextmanager
@@ -473,6 +474,76 @@ class StreamFailoverTests(fixtures.RegionRoutingTests):
                 self.assertEqual(len(sent), 1)
                 self.assertEqual(len(set(self.uids(sent))), 1, "限制响应不得扩散到其他账号")
                 self.assertEqual(self.failover_lines(), [])
+
+    def test_channel_refusal_downgrades_system_on_domestic_accounts(self):
+        """Every profile gets the one-shot system→user retry, not only /console fallbacks."""
+        self.configure(profiles=("cn-cli",))
+        self.allowed_profiles = {"cn-cli"}
+        before = len(self.requests)
+        with allow_failover(0):
+            self.poison_with_status(400, {"code": 11128,
+                                          "msg": "Illegal API invocation from an unapproved channel"})
+            body = self.payload(stream=True, system="synthetic gateway instructions")
+            response = self.client.post("/v1/chat/completions", json=body)
+        sent = self.requests[before:]
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(len(sent), 2, "渠道拒绝应当同账号降级重试一次")
+        self.assertEqual(len(set(self.uids(sent))), 1, "降级重试不得换账号")
+        raw = sent[1].content
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        retried = json.loads(raw)["messages"]
+        self.assertIn("synthetic gateway instructions",
+                      json.dumps(retried, ensure_ascii=False), "指令内容必须保留")
+        self.assertFalse([m for m in retried[1:] if m.get("role") == "system"], retried)
+        self.assertTrue(any("合成网关" not in str(m.get("content", ""))
+                            for m in retried if m.get("role") == "user"), retried)
+
+    def test_system_downgrade_happens_only_once(self):
+        """A second channel refusal must not replay the downgraded body again."""
+        self.configure(profiles=("cn-cli",))
+        self.allowed_profiles = {"cn-cli"}
+        before = len(self.requests)
+        with allow_failover(0):
+            self.poison_with_status(400, {"code": 11128,
+                                          "msg": "Illegal API invocation from an unapproved channel"})
+            body = self.payload(stream=True, system="synthetic gateway instructions")
+            response = self.client.post("/v1/chat/completions", json=body)
+        sent = self.requests[before:]
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(len(sent), 2, "降级重试只允许一次")
+
+    def test_downgraded_channel_refusal_replays_once_on_another_account(self):
+        """After the system downgrade fails, the refusal may be account-specific: retry once."""
+        self.configure(profiles=("cn-cli", "cn-work"))
+        self.allowed_profiles = set(fixtures.PROFILES)
+        before = len(self.requests)
+        with allow_failover(1):
+            self.poison_with_status(400, {"code": 11128,
+                                          "msg": "Illegal API invocation from an unapproved channel"})
+            body = self.payload(stream=True, system="synthetic gateway instructions")
+            response = self.client.post("/v1/chat/completions", json=body)
+        sent = self.requests[before:]
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(sent), 3, "降级重试 + 换号重放，共三次上游调用")
+        first, second, third = self.uids(sent)
+        self.assertEqual(first, second, "前两次必须同账号（首次 + 降级）")
+        self.assertNotEqual(second, third, "降级后仍被拒时必须换账号")
+        self.assertEqual(len(self.failover_lines()), 1, self.failover_lines())
+
+    def test_channel_refusal_without_downgrade_never_replays(self):
+        """Without a system prompt there is nothing to downgrade, so no account is tried twice."""
+        self.configure(profiles=("cn-cli", "cn-work"))
+        self.allowed_profiles = set(fixtures.PROFILES)
+        before = len(self.requests)
+        with allow_failover(2):
+            self.poison_with_status(400, {"code": 11128,
+                                          "msg": "Illegal API invocation from an unapproved channel"})
+            response = self.client.post("/v1/chat/completions", json=self.payload(stream=True))
+        sent = self.requests[before:]
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(len(sent), 1, "无 system 可降级时不得重放")
+        self.assertFalse(self.failover_lines(), self.failover_lines())
 
     def test_model_scoped_error_codes_are_not_replayed(self):
         cases = ((500, 11134), (503, 11134), (400, 11102), (503, 11102),
